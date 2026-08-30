@@ -1,6 +1,13 @@
 Changelog
 =========
 
+Every user-visible change lands here in the same commit that makes it,
+newest version first. Entries are written from measurements rather than
+intentions: what was observed, and why it mattered. A reader a year from
+now needs the evidence, not the plan -- "two consecutive runs differed in
+exactly one path" is worth more than "improved caching". Prose, hard-
+wrapped at 72 columns, US English.
+
 0.2.0
 -----
 - The cloud backend never worked. Probed against the live service for the
