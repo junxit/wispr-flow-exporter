@@ -19,6 +19,7 @@ ignore the exit code -- and then to ignore code 4, which actually matters.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -328,6 +329,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"  no Wispr Flow database at {resolved.db}")
         return EXIT_SOURCE_UNREACHABLE
 
+    try:
+        entities = _entities(args)
+    except ValueError as error:
+        print(f"  {error}")
+        return EXIT_FAILURE
+
     archive = Archive(root=config.archive_dir)
     options = SyncOptions(
         full=getattr(args, "full", False),
@@ -370,6 +377,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 source,
                 resolved,
                 options,
+                entities=entities,
                 policy=config_state.policy,
                 config=config_state,
                 session=read_session(
@@ -382,9 +390,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"  source unreadable: {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE
 
-    if config.source in (SOURCE_CLOUD, SOURCE_BOTH) or (
-        config.source == SOURCE_AUTO and _cloud_available(resolved, config)
-    ):
+    # Only ever on an explicit request. "auto" means the local store and
+    # nothing else: a backup tool that starts calling an undocumented private
+    # API because a session happens to exist is doing something the operator
+    # did not ask for, and this default was changed after exactly that
+    # happened during development.
+    if config.source in (SOURCE_CLOUD, SOURCE_BOTH):
         exit_code = _run_cloud(archive, resolved, config, options, result) or exit_code
         archive.save()
 
@@ -404,31 +415,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if options.dry_run:
         _say("", "dry run: nothing was written")
     return exit_code
-
-
-def _cloud_available(resolved: object, config: Config) -> bool:
-    """Report whether a cloud pass could run without prompting for anything.
-
-    Used only by ``--source auto``, which adds the cloud backend when a valid
-    session already exists and stays silent when it does not. A backup tool
-    should not start demanding credentials on its own.
-
-    Args:
-        resolved: Resolved source paths.
-        config: This run's configuration.
-
-    Returns:
-        ``True`` when a usable token is already available.
-    """
-    if os.environ.get("WISPR_ACCESS_TOKEN", "").strip():
-        return True
-    path = (
-        Path(config.session_file).expanduser()
-        if config.session_file
-        else resolved.session  # type: ignore[attr-defined]
-    )
-    info = read_session(path)
-    return info.present and not info.is_expired
 
 
 def _run_cloud(
@@ -475,6 +461,101 @@ def _run_cloud(
             _say("", f"cloud {name}: {redact(reason)}")
     result.counts["cloud"] = counts  # type: ignore[attr-defined]
     return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+
+
+def _entities(args: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve which entity passes this run should perform.
+
+    An unknown name is a usage error rather than a silent no-op: asking for
+    "meeting" and getting an empty archive would be the worst possible
+    outcome for a backup command.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        The entities to run, in the canonical order.
+
+    Raises:
+        ValueError: An entity name was not recognized.
+    """
+    chosen = set(ENTITIES)
+    only = (getattr(args, "only", None) or "").strip()
+    skip = (getattr(args, "skip", None) or "").strip()
+
+    if only:
+        requested = {name.strip() for name in only.split(",") if name.strip()}
+        unknown = requested - set(ENTITIES)
+        if unknown:
+            raise ValueError(f"unknown entities: {', '.join(sorted(unknown))}")
+        chosen = requested
+    if skip:
+        dropped = {name.strip() for name in skip.split(",") if name.strip()}
+        unknown = dropped - set(ENTITIES)
+        if unknown:
+            raise ValueError(f"unknown entities: {', '.join(sorted(unknown))}")
+        chosen -= dropped
+    return tuple(name for name in ENTITIES if name in chosen)
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    """Report the live schema against the declaration.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Process exit code.
+    """
+    config = _config(args)
+    resolved = paths.resolve(config.data_dir, config.db)
+    if not resolved.db.exists():
+        print(f"  no Wispr Flow database at {resolved.db}")
+        return EXIT_SOURCE_UNREACHABLE
+
+    with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
+        drift = source.detect_drift()
+        tables = source.tables()
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "pin": {
+                            "count": drift.live.count,
+                            "latest": drift.live.latest,
+                            "sha256": drift.live.sha256,
+                        },
+                        "declared_pin": {
+                            "count": MIGRATION_PIN.count,
+                            "sha256": MIGRATION_PIN.sha256,
+                        },
+                        "drift": drift.kind,
+                        "new_tables": list(drift.new_tables),
+                        "missing_tables": list(drift.missing_tables),
+                        "new_columns": {k: list(v) for k, v in drift.new_columns.items()},
+                        "missing_columns": {
+                            k: list(v) for k, v in drift.missing_columns.items()
+                        },
+                        "missing_required": {
+                            k: list(v) for k, v in drift.missing_required.items()
+                        },
+                    },
+                    indent=2,
+                )
+            )
+            return EXIT_OK
+
+        print("wispr-flow-exporter schema")
+        _say("tables", f"{len(tables)} live, {len(EXPECTED)} declared")
+        _say("migrations", f"{drift.live.count} (declared {MIGRATION_PIN.count})")
+        _say("pin", f"{drift.live.sha256[:12]} (declared {MIGRATION_PIN.sha256[:12]})")
+        _say("drift", drift.summary())
+
+    if drift.kind is DriftClass.BREAKING:
+        return EXIT_BREAKING_DRIFT
+    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+        return EXIT_ADDITIVE_DRIFT
+    return EXIT_OK
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -545,6 +626,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_selection(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--only",
+            metavar="A,B",
+            default=None,
+            help=f"comma list of entities to archive: {', '.join(ENTITIES)}",
+        )
+        target.add_argument(
+            "--skip",
+            metavar="A,B",
+            default=None,
+            help="comma list of entities to leave out",
+        )
+
     def add_source(target: argparse.ArgumentParser) -> None:
         target.add_argument(
             "--source",
@@ -576,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sync = sub.add_parser("sync", help="archive new and changed data")
     add_source(sync)
+    add_selection(sync)
     sync.add_argument(
         "--audio",
         choices=AUDIO_CHOICES,
@@ -619,6 +715,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     sync.add_argument("-v", "--verbose", action="store_true", help="per-record output")
     sync.set_defaults(func=cmd_sync)
+
+    schema_parser = sub.add_parser(
+        "schema", help="show the live schema against the declaration"
+    )
+    add_source(schema_parser)
+    schema_parser.add_argument(
+        "--strict-schema",
+        action="store_true",
+        help="exit 3 on additive drift instead of reporting it",
+    )
+    schema_parser.add_argument(
+        "--json", action="store_true", help="machine-readable output"
+    )
+    schema_parser.set_defaults(func=cmd_schema)
 
     verify = sub.add_parser(
         "verify", help="check integrity and reconcile against the database"

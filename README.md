@@ -129,7 +129,9 @@ uv run wispr-export render --force
 # Reconcile the archive against the database.
 uv run wispr-export verify --deep
 
-# Include the cloud backend explicitly.
+# Include the cloud backend. It is never reached otherwise, not even when a
+# valid session exists — it is an undocumented private API and calling it
+# should be a decision, not a default.
 uv run wispr-export sync --source both
 ```
 
@@ -177,7 +179,7 @@ See `.env.example` for the full set. Precedence is **CLI flag > environment >
 | --- | --- | --- |
 | `WISPR_DATA_DIR` | auto-detected | Wispr Flow application-support directory |
 | `WISPR_DB_PATH` | `<data dir>/flow.sqlite` | Database to read; point at a backup or Time Machine copy |
-| `WISPR_SYNC_SOURCE` | `auto` | `local`, `cloud`, `both`, `auto` |
+| `WISPR_SYNC_SOURCE` | `auto` | `local`, `cloud`, `both`, `auto`. `auto` is local-only; the cloud backend is never reached without asking |
 | `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written |
 | `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
 | `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures |
