@@ -259,7 +259,26 @@ class Archive:
     # --- index ------------------------------------------------------------
 
     def entries(self, entity: str) -> dict[str, Any]:
-        """Return the index namespace for one entity, creating it if needed.
+        """Return the index namespace for one entity, without creating it.
+
+        Deliberately non-mutating. Creating the namespace on read meant that
+        merely *looking* for notes in an account that has none added
+        ``"notes": {}`` to index.json -- so a pass that archived nothing still
+        changed the file, and the zero-bytes guarantee failed on the first run
+        that happened to look at an empty table.
+
+        Args:
+            entity: Archive directory name.
+
+        Returns:
+            The namespace, or an empty mapping when the entity has no records.
+            The empty case is a throwaway: write through :meth:`put`.
+        """
+        found = self.index["entities"].get(entity)
+        return found if isinstance(found, dict) else {}
+
+    def _namespace(self, entity: str) -> dict[str, Any]:
+        """Return the index namespace for one entity, creating it.
 
         Args:
             entity: Archive directory name.
@@ -319,7 +338,7 @@ class Archive:
         Returns:
             The stored entry.
         """
-        entry = self.entries(entity).setdefault(key, {})
+        entry = self._namespace(entity).setdefault(key, {})
         for name, value in fields.items():
             if value is None:
                 entry.pop(name, None)

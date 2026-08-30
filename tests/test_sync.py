@@ -14,11 +14,12 @@ from pathlib import Path
 import pytest
 
 from wispr_flow_exporter import paths
+from wispr_flow_exporter.normalize import calendar_key
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
 from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
 
-from conftest import MEETING_A, MEETING_B, OWNER, SECOND, TITLE_PLAIN
+from conftest import MEETING_A, MEETING_B, NOTE_A, OWNER, SECOND, TITLE_PLAIN
 
 REFINED = [
     {
@@ -83,10 +84,15 @@ def scene(tmp_path: Path, wispr_db: Callable[..., Path]) -> Callable[..., tuple]
         *,
         artifacts: bool = True,
         audio_bytes: bytes | None = None,
+        tables: dict[str, list[dict[str, object]]] | None = None,
     ) -> tuple[Archive, object, Path]:
         data_dir = tmp_path / "Wispr Flow"
         data_dir.mkdir(exist_ok=True)
-        built = wispr_db({"Meetings": rows if rows is not None else [_meeting_row()]})
+        payload: dict[str, object] = {
+            "Meetings": rows if rows is not None else [_meeting_row()]
+        }
+        payload.update(tables or {})
+        built = wispr_db(payload)
         built.replace(data_dir / "flow.sqlite")
 
         if artifacts:
@@ -431,3 +437,173 @@ def test_the_archive_is_owner_only_at_every_level(
         mode = stat_module.S_IMODE(path.stat().st_mode)
         expected = 0o700 if path.is_dir() else 0o600
         assert mode == expected, f"{path.relative_to(archive.root)} is {oct(mode)}"
+
+
+# --- notes, calendar, dictionary, todos -----------------------------------
+
+NOTE_ROW = {
+    "id": NOTE_A,
+    "title": "Whisper budget scratch",
+    "content": "- Ask Hush about the murmur quota",
+    "createdAt": "2026-05-18 10:00:00.000 +00:00",
+    "modifiedAt": "2026-05-18 10:05:00.000 +00:00",
+    "isDeleted": 0,
+}
+
+# 181 characters, the length actually observed for a Google calendar id.
+LONG_EXTERNAL_ID = "q" * 181
+
+CALENDAR_ROW = {
+    "externalId": LONG_EXTERNAL_ID,
+    "title": "Quarterly whisper budget",
+    "startAtUtc": 1787272400000,
+    "endAtUtc": 1787276000000,
+    "status": "confirmed",
+    "updatedAt": "2026-08-21T22:45:13.107782Z",
+    "participantNames": json.dumps([OWNER, SECOND]),
+}
+
+DICTIONARY_ROWS = [
+    {"id": "d-1", "phrase": "kubernetis", "replacement": "Kubernetes"},
+    {"id": "d-2", "phrase": "brb", "replacement": "be right back", "isSnippet": 1},
+    {"id": "d-3", "phrase": "gone", "replacement": "removed", "isDeleted": 1},
+]
+
+
+def test_notes_archive_as_markdown_beside_their_raw_payload(
+    scene: Callable[..., tuple],
+) -> None:
+    """A scratchpad note is a document, not a directory."""
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    result = _run(archive, resolved)
+
+    assert result.counts["notes"].written == 1
+    stem = archive.root / archive.entry("notes", NOTE_A)["path"]
+    assert (stem.parent / f"{stem.name}.md").is_file()
+    assert (stem.parent / f"{stem.name}.raw.json").is_file()
+    assert "murmur quota" in (stem.parent / f"{stem.name}.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_a_calendar_id_too_long_to_be_a_path_is_hashed(
+    scene: Callable[..., tuple],
+) -> None:
+    """The primary key is 181 characters of base32 and cannot be a filename.
+
+    Truncating it is not injective, so two events could collapse into one. The
+    full id is preserved inside the record.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"CalendarEvents": [CALENDAR_ROW]})
+    _run(archive, resolved)
+
+    key = calendar_key(LONG_EXTERNAL_ID)
+    entry = archive.entry("calendar", key)
+    assert len(key) == 12
+    assert entry["external_id"] == LONG_EXTERNAL_ID
+    assert key in entry["path"]
+    assert (archive.root / entry["path"]).is_file()
+
+
+def test_calendar_events_get_no_markdown_digest(
+    scene: Callable[..., tuple],
+) -> None:
+    """Events mutate constantly, so a rendered digest would churn every sync.
+
+    Both events on the development machine had already flipped to cancelled.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"CalendarEvents": [CALENDAR_ROW]})
+    _run(archive, resolved)
+
+    assert list((archive.root / "calendar").rglob("*.md")) == []
+
+
+def test_a_rescheduled_event_moves_to_its_new_shard(
+    scene: Callable[..., tuple],
+) -> None:
+    """The YYYY/MM directory derives from startAtUtc, which moves."""
+    archive, resolved, db = scene(rows=[], tables={"CalendarEvents": [CALENDAR_ROW]})
+    _run(archive, resolved)
+    key = calendar_key(LONG_EXTERNAL_ID)
+    original = archive.root / archive.entry("calendar", key)["path"]
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            'UPDATE "CalendarEvents" SET startAtUtc = ?, updatedAt = ? '
+            "WHERE externalId = ?",
+            (1790000000000, "2026-09-01T10:00:00.000000Z", LONG_EXTERNAL_ID),
+        )
+
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved)
+
+    assert result.counts["calendar"].relocated == 1
+    assert not original.exists()
+    assert (fresh.root / fresh.entry("calendar", key)["path"]).is_file()
+
+
+def test_the_dictionary_keeps_deleted_entries(
+    scene: Callable[..., tuple],
+) -> None:
+    """What was removed from a vocabulary of names and codenames is a record."""
+    archive, resolved, _ = scene(rows=[], tables={"Dictionary": DICTIONARY_ROWS})
+    _run(archive, resolved)
+
+    entry = archive.entry("dictionary", "dictionary")
+    assert entry["records"] == 3
+    assert entry["deleted_records"] == 1
+
+    rendered = (archive.root / "dictionary" / "dictionary.md").read_text(
+        encoding="utf-8"
+    )
+    assert "~~gone~~" in rendered
+    assert "## Snippets" in rendered
+
+    lines = (archive.root / "dictionary" / "dictionary.ndjson").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(lines) == 3
+
+
+def test_a_snapshot_table_is_indexed_once_not_per_row(
+    scene: Callable[..., tuple],
+) -> None:
+    """The artifact already lists every row, tombstoned ones included.
+
+    Per-row entries would restate the file while making index.json grow with
+    records that have no separate location.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Dictionary": DICTIONARY_ROWS})
+    _run(archive, resolved)
+
+    assert list(archive.entries("dictionary")) == ["dictionary"]
+
+
+def test_an_empty_table_still_produces_its_artifact(
+    scene: Callable[..., tuple],
+) -> None:
+    """An empty file means "read, and empty"; an absent one means nothing."""
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved)
+
+    todos = archive.root / "todos" / "todos.ndjson"
+    assert todos.is_file()
+    assert todos.read_text(encoding="utf-8") == ""
+
+
+def test_an_account_with_no_records_creates_no_empty_namespaces(
+    scene: Callable[..., tuple],
+) -> None:
+    """Looking for notes must not add "notes": {} to the index.
+
+    Creating a namespace on read meant a pass that archived nothing still
+    changed index.json, which broke the zero-bytes guarantee on the first run
+    that happened to look at an empty table.
+    """
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved)
+
+    assert "notes" not in archive.index["entities"]
+    assert "calendar" not in archive.index["entities"]

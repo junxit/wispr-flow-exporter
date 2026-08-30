@@ -35,7 +35,12 @@ from typing import Any
 
 from . import files_source, render
 from .files_source import MEETING_DIR_RE, MeetingArtifacts, read_transcript
-from .normalize import SpeakerMap, resolve_speaker_tokens, to_instant
+from .normalize import (
+    SpeakerMap,
+    calendar_key,
+    resolve_speaker_tokens,
+    to_instant,
+)
 from .paths import WisprPaths
 from .schema import EXPECTED, TimestampKind
 from .secure_io import (
@@ -43,16 +48,20 @@ from .secure_io import (
     file_digest,
     secure_mkdir,
     write_json_if_changed,
+    write_ndjson_if_changed,
     write_text_if_changed,
 )
 from .sqlite_source import Record, SqliteSource
-from .store import Archive, content_hash
+from .store import Archive, content_hash, entity_name
 
 SOURCE_LOCAL = "wispr-local"
 
 AUDIO_COPY = "copy"
 AUDIO_LINK = "link"
 AUDIO_SKIP = "skip"
+
+# Every local pass, in the order a run walks them.
+ENTITIES = ("meetings", "notes", "calendar", "dictionary", "todos")
 
 
 @dataclass(slots=True)
@@ -544,7 +553,7 @@ def sync_local(
     source: SqliteSource,
     wispr: WisprPaths,
     options: SyncOptions,
-    entities: Sequence[str] = ("meetings",),
+    entities: Sequence[str] = ENTITIES,
 ) -> SyncResult:
     """Run every requested entity pass against the local store.
 
@@ -564,9 +573,307 @@ def sync_local(
             result.counts["meetings"] = sync_meetings(
                 archive, source, wispr, options
             )
+        if "notes" in entities:
+            result.counts["notes"] = sync_notes(archive, source, options)
+        if "calendar" in entities:
+            result.counts["calendar"] = sync_calendar(archive, source, options)
+        if "dictionary" in entities:
+            result.counts["dictionary"] = sync_snapshot(
+                archive, source, "Dictionary", options, render_markdown=True
+            )
+        if "todos" in entities:
+            result.counts["todos"] = sync_snapshot(
+                archive, source, "Todos", options
+            )
     except KeyboardInterrupt:
         result.interrupted = True
     finally:
         if not options.dry_run:
             archive.save()
     return result
+
+
+def _document_paths(stem: Path, suffix: str) -> Path:
+    """Return a sibling file for a document-layout record.
+
+    ``Path.with_suffix`` is deliberately not used: a slug can end in something
+    that looks like an extension, and replacing it would silently truncate the
+    name.
+
+    Args:
+        stem: The record's path stem.
+        suffix: Extension to append, including the dot.
+
+    Returns:
+        The file path.
+    """
+    return stem.parent / f"{stem.name}{suffix}"
+
+
+def sync_notes(
+    archive: Archive, source: SqliteSource, options: SyncOptions
+) -> SyncCounts:
+    """Archive scratchpad notes as Markdown beside their raw payloads.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        options: What this run was asked to do.
+
+    Returns:
+        What the pass did.
+    """
+    spec = EXPECTED["Notes"]
+    counts = SyncCounts()
+    now = _now()
+    since = None if options.full else archive.watermark(SOURCE_LOCAL, "notes")
+    seen: list[str] = []
+    failed = False
+
+    try:
+        for record in source.records(
+            "Notes", since=since, since_column="modifiedAt"
+        ):
+            counts.scanned += 1
+            key = record.key
+            if not MEETING_DIR_RE.match(key):
+                counts.failed += 1
+                failed = True
+                continue
+            seen.append(key)
+            data = record.data
+            created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
+            title = data.get("title") if isinstance(data.get("title"), str) else ""
+            stem = archive.record_path("Notes", spec, key, when=created, title=title)
+            digest = content_hash(spec, data)
+            entry = archive.entry("notes", key)
+
+            archive.mark_seen("notes", key, soft_deleted=record.soft_deleted, when=now)
+            if (
+                entry is not None
+                and entry.get("content_hash") == digest
+                and not options.full
+                and archive.existing_path("notes", key) == stem
+                and _document_paths(stem, ".md").is_file()
+            ):
+                counts.unchanged += 1
+                continue
+            if options.dry_run:
+                counts.written += 1
+                continue
+
+            if archive.relocate("notes", key, stem):
+                counts.relocated += 1
+
+            wrote = write_json_if_changed(_document_paths(stem, ".raw.json"), data)
+            wrote |= write_text_if_changed(
+                _document_paths(stem, ".md"),
+                render.render_note(
+                    note_id=key,
+                    title=title,
+                    content=data.get("content") or "",
+                    created_at=created,
+                    modified_at=to_instant(
+                        TimestampKind.SEQUELIZE, data.get("modifiedAt")
+                    ),
+                    pinned=bool(data.get("pinned")),
+                    soft_deleted=record.soft_deleted,
+                ),
+            )
+            fields: dict[str, Any] = {
+                "path": archive.relative(stem),
+                "title": title or None,
+                "created_at": created.isoformat() if created else None,
+                "content_hash": digest,
+                "source": SOURCE_LOCAL,
+            }
+            if wrote:
+                fields["archived_at"] = now
+            archive.put("notes", key, **fields)
+            counts.written += 1 if wrote else 0
+            counts.unchanged += 0 if wrote else 1
+    except KeyboardInterrupt:
+        if not options.dry_run:
+            archive.save()
+        raise
+
+    if options.full and not failed:
+        counts.absent = len(archive.mark_absent("notes", seen, when=now))
+    if not failed:
+        archive.set_watermark(
+            SOURCE_LOCAL, "notes", "modifiedAt", source.max_value("Notes", "modifiedAt")
+        )
+    return counts
+
+
+def sync_calendar(
+    archive: Archive, source: SqliteSource, options: SyncOptions
+) -> SyncCounts:
+    """Archive calendar events as JSON only.
+
+    Deliberately no Markdown digest. Events mutate -- both events on the
+    development machine had flipped to ``status = cancelled`` -- and a rendered
+    digest would be rewritten on every sync, churning a file the operator may
+    have open.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        options: What this run was asked to do.
+
+    Returns:
+        What the pass did.
+    """
+    spec = EXPECTED["CalendarEvents"]
+    counts = SyncCounts()
+    now = _now()
+    since = None if options.full else archive.watermark(SOURCE_LOCAL, "calendar")
+    seen: list[str] = []
+
+    try:
+        for record in source.records(
+            "CalendarEvents", since=since, since_column="updatedAt"
+        ):
+            counts.scanned += 1
+            data = record.data
+            external_id = record.key
+            # The primary key runs to 181 characters of base32 in practice, so
+            # it cannot be a path component and truncating it is not
+            # injective. A hash prefix is the only stable short name.
+            key = calendar_key(external_id)
+            seen.append(key)
+
+            starts = to_instant(TimestampKind.EPOCH_MS, data.get("startAtUtc"))
+            title = data.get("title") if isinstance(data.get("title"), str) else ""
+            stem = archive.record_path(
+                "CalendarEvents", spec, key, when=starts, title=title
+            )
+            destination = _document_paths(stem, ".json")
+            digest = content_hash(spec, data)
+            entry = archive.entry("calendar", key)
+
+            archive.mark_seen(
+                "calendar", key, soft_deleted=record.soft_deleted, when=now
+            )
+            if (
+                entry is not None
+                and entry.get("content_hash") == digest
+                and not options.full
+                and destination.is_file()
+            ):
+                counts.unchanged += 1
+                continue
+            if options.dry_run:
+                counts.written += 1
+                continue
+
+            # The YYYY/MM shard derives from startAtUtc, which moves when an
+            # event is rescheduled, so calendar records relocate too.
+            previous = archive.existing_path("calendar", key)
+            if previous is not None and previous != destination and previous.exists():
+                secure_mkdir(destination.parent)
+                previous.replace(destination)
+                counts.relocated += 1
+
+            wrote = write_json_if_changed(destination, data)
+            fields: dict[str, Any] = {
+                "path": archive.relative(destination),
+                "external_id": external_id,
+                "title": title or None,
+                "starts_at": starts.isoformat() if starts else None,
+                "status": data.get("status"),
+                "content_hash": digest,
+                "source": SOURCE_LOCAL,
+            }
+            if wrote:
+                fields["archived_at"] = now
+            archive.put("calendar", key, **fields)
+            counts.written += 1 if wrote else 0
+            counts.unchanged += 0 if wrote else 1
+    except KeyboardInterrupt:
+        if not options.dry_run:
+            archive.save()
+        raise
+
+    if options.full:
+        counts.absent = len(archive.mark_absent("calendar", seen, when=now))
+    archive.set_watermark(
+        SOURCE_LOCAL,
+        "calendar",
+        "updatedAt",
+        source.max_value("CalendarEvents", "updatedAt"),
+    )
+    return counts
+
+
+def sync_snapshot(
+    archive: Archive,
+    source: SqliteSource,
+    table: str,
+    options: SyncOptions,
+    *, 
+    render_markdown: bool = False,
+) -> SyncCounts:
+    """Archive a small mutable table as one NDJSON snapshot.
+
+    Snapshot tables are indexed once for the whole table rather than once per
+    row. The file already contains every row including the tombstoned ones, so
+    per-row index entries would restate what the artifact says while making
+    ``index.json`` grow with data that has no separate location.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        table: Source table name.
+        options: What this run was asked to do.
+        render_markdown: Also write a readable rendering.
+
+    Returns:
+        What the pass did.
+    """
+    spec = EXPECTED[table]
+    entity = entity_name(table)
+    counts = SyncCounts()
+    now = _now()
+
+    rows = sorted(
+        (record.data for record in source.records(table)),
+        key=lambda row: str(row.get(spec.pk, "")),
+    )
+    counts.scanned = len(rows)
+
+    destination = archive.record_path(table, spec, "")
+    digest = content_hash(spec, {"rows": [content_hash(spec, row) for row in rows]})
+    entry = archive.entry(entity, entity)
+
+    if (
+        entry is not None
+        and entry.get("content_hash") == digest
+        and not options.full
+        and destination.is_file()
+    ):
+        counts.unchanged = len(rows)
+        return counts
+    if options.dry_run:
+        counts.written = len(rows)
+        return counts
+
+    wrote = write_ndjson_if_changed(destination, rows)
+    if render_markdown and table == "Dictionary":
+        wrote |= write_text_if_changed(
+            destination.with_name("dictionary.md"), render.render_dictionary(rows)
+        )
+
+    fields: dict[str, Any] = {
+        "path": archive.relative(destination),
+        "records": len(rows),
+        "deleted_records": sum(1 for row in rows if spec.is_soft_deleted(row)),
+        "content_hash": digest,
+        "source": SOURCE_LOCAL,
+    }
+    if wrote:
+        fields["archived_at"] = now
+    archive.put(entity, entity, **fields)
+    counts.written = len(rows) if wrote else 0
+    counts.unchanged = 0 if wrote else len(rows)
+    return counts

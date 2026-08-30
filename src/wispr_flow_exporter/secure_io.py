@@ -197,6 +197,23 @@ def write_json_if_changed(path: Path, payload: Any) -> bool:
     )
 
 
+def write_ndjson_if_changed(path: Path, records: Iterable[Any]) -> bool:
+    """Write NDJSON only when it differs from what is already there.
+
+    Args:
+        path: Destination file.
+        records: JSON-serializable values, one per output line.
+
+    Returns:
+        ``True`` when the file was written.
+    """
+    body = "".join(
+        json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        for record in records
+    )
+    return write_text_if_changed(path, body)
+
+
 def copy_file_secure(src: Path, dest: Path) -> str:
     """Copy a file into the archive with owner-only permissions.
 
