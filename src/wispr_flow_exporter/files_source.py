@@ -16,10 +16,22 @@ fault. Anything that assumed four files would be wrong about every meeting.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
+
+from .normalize import label_live_speaker, parse_clock
+
+# These files are written by another application and are untrusted input.
+# Reading a line at a time under a cap means a corrupted or hostile file costs
+# a skipped record rather than the process.
+MAX_LINE_BYTES = 2 * 1024 * 1024
+MAX_FILE_BYTES = 512 * 1024 * 1024
+MAX_LINES = 2_000_000
 
 REFINED_NAME = "refined.ndjson"
 LIVE_NAME = "live.ndjson"
@@ -145,6 +157,219 @@ def discover_meetings(meetings_dir: Path) -> Iterator[MeetingArtifacts]:
             observations=_artifact(entry, OBSERVATIONS_NAME),
             audio=_artifact(entry, AUDIO_NAME),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Turn:
+    """One spoken turn from a transcript.
+
+    Attributes:
+        turn_id: The line's own id.
+        text: What was said.
+        offset: Time from the start of the recording, when the line carried a
+            parseable ``MM:SS`` offset.
+        speaker_id: Diarization id, meaningful only within ``speaker_source``.
+        speaker_source: ``"refined"``, ``"mic"`` or ``"system"``.
+        label: A mechanical label for the live pass. Empty for refined turns,
+            which are named from the meeting's speaker map instead.
+        start_epoch_ms: Absolute start, present on live turns only.
+        end_epoch_ms: Absolute end, present on live turns only.
+        segment: Recording segment index, present on live turns only.
+    """
+
+    turn_id: str
+    text: str
+    offset: timedelta | None = None
+    speaker_id: int | None = None
+    speaker_source: str | None = None
+    label: str = ""
+    start_epoch_ms: int | None = None
+    end_epoch_ms: int | None = None
+    segment: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Marker:
+    """A recording-state change, such as a pause.
+
+    Attributes:
+        marker: The state, for example ``"paused"``.
+        epoch_ms: When it happened.
+        raw: The line as parsed, since marker shapes are undocumented.
+    """
+
+    marker: str
+    epoch_ms: int | None
+    raw: dict[str, Any]
+
+
+@dataclass(slots=True)
+class Transcript:
+    """The result of reading one NDJSON transcript.
+
+    Attributes:
+        turns: Spoken turns, in file order.
+        markers: Recording-state changes.
+        meta: The header object, when the file had one.
+        others: Lines that parsed but are neither a turn nor a marker --
+            observation and participant records, kept so the archive is
+            lossless even where this tool has no renderer.
+        malformed: Lines that could not be parsed. Counted rather than
+            ignored: for an archival tool, quietly reading less than exists is
+            the failure that matters.
+        truncated_tail: Whether the final line was cut off mid-write, which is
+            what an interrupted recording looks like on disk.
+        lines: Total non-empty lines seen.
+    """
+
+    turns: list[Turn] = field(default_factory=list)
+    markers: list[Marker] = field(default_factory=list)
+    meta: dict[str, Any] | None = None
+    others: list[dict[str, Any]] = field(default_factory=list)
+    malformed: int = 0
+    truncated_tail: bool = False
+    lines: int = 0
+
+    @property
+    def is_clean(self) -> bool:
+        """Report whether every line was understood.
+
+        Returns:
+            ``True`` when nothing was skipped or truncated.
+        """
+        return self.malformed == 0 and not self.truncated_tail
+
+
+def _as_turn(payload: dict[str, Any]) -> Turn:
+    """Build a turn from a parsed transcript line.
+
+    The live pass carries a ``speaker.name`` taken from the meeting platform's
+    active-speaker marker, and that marker lags: in the development dataset,
+    141 of one meeting's 366 live lines carry a name, and a verified line
+    attributes one participant's words to the other. It is therefore read for
+    provenance and never used as an attribution -- live turns get a mechanical
+    label instead, and names come only from the refined pass.
+
+    Args:
+        payload: A parsed line.
+
+    Returns:
+        The turn.
+    """
+    speaker = payload.get("speaker")
+    speaker = speaker if isinstance(speaker, dict) else {}
+    source = speaker.get("source")
+    raw_id = speaker.get("id")
+    speaker_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) else None
+
+    return Turn(
+        turn_id=str(payload.get("id", "")),
+        text=payload.get("text") if isinstance(payload.get("text"), str) else "",
+        offset=parse_clock(payload.get("timestamp")),
+        speaker_id=speaker_id,
+        speaker_source=source if isinstance(source, str) else None,
+        # Refined turns resolve to real names via the meeting's speaker map,
+        # so they carry no mechanical label.
+        label="" if source == "refined" else label_live_speaker(speaker),
+        start_epoch_ms=_as_int(payload.get("startEpochMs")),
+        end_epoch_ms=_as_int(payload.get("endEpochMs")),
+        segment=_as_int(payload.get("segment")),
+    )
+
+
+def _as_int(value: Any) -> int | None:
+    """Coerce a value to an integer, or report that it is not one.
+
+    Args:
+        value: Any parsed JSON value.
+
+    Returns:
+        The integer, or ``None``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def read_transcript(path: Path | None) -> Transcript:
+    """Read one NDJSON transcript, surviving every defect seen on disk.
+
+    One reader handles all three artifact kinds, because their line shapes are
+    distinguishable rather than positional: ``refined.ndjson`` has no header
+    and every line is a turn, ``live.ndjson`` opens with a ``meta`` object and
+    mixes in ``marker`` lines, and the observations stream is entirely
+    ``meta``, ``obs`` and ``participant`` records. Dispatching on the keys
+    present means none of them needs a separate parser, and a fourth shape
+    added upstream is preserved rather than dropped.
+
+    A marker line puts a **wall clock** in the same ``timestamp`` field a turn
+    uses for an ``MM:SS`` offset, which is what makes a naive parser crash
+    here. ``parse_clock`` returns ``None`` for it and the line is classified by
+    its ``marker`` key instead.
+
+    Args:
+        path: The file, or ``None`` when the artifact is absent.
+
+    Returns:
+        The parsed transcript. An absent file yields an empty result rather
+        than an error: two of three meetings on the development machine were
+        missing at least one artifact.
+    """
+    result = Transcript()
+    if path is None or not path.is_file():
+        return result
+    try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            result.malformed = 1
+            return result
+        raw = path.read_bytes()
+    except OSError:
+        result.malformed = 1
+        return result
+
+    ends_newline = raw.endswith(b"\n")
+    # Decoded with replacement rather than strictly: a single bad byte in a
+    # 16 MB transcript should cost one character, not the whole meeting.
+    lines = raw.decode("utf-8", errors="replace").split("\n")
+    if ends_newline and lines:
+        lines.pop()
+
+    for number, line in enumerate(lines):
+        if not line.strip():
+            continue
+        result.lines += 1
+        if result.lines > MAX_LINES or len(line) > MAX_LINE_BYTES:
+            result.malformed += 1
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            result.malformed += 1
+            # A final unparseable line with no trailing newline is an
+            # interrupted write, not corruption, and is worth distinguishing.
+            if number == len(lines) - 1 and not ends_newline:
+                result.truncated_tail = True
+            continue
+        if not isinstance(payload, dict):
+            result.malformed += 1
+            continue
+
+        if "meta" in payload and len(payload) == 1:
+            result.meta = payload["meta"] if isinstance(payload["meta"], dict) else None
+        elif "marker" in payload:
+            result.markers.append(
+                Marker(
+                    marker=str(payload.get("marker")),
+                    epoch_ms=_as_int(payload.get("epochMs")),
+                    raw=payload,
+                )
+            )
+        elif isinstance(payload.get("text"), str):
+            result.turns.append(_as_turn(payload))
+        else:
+            result.others.append(payload)
+
+    return result
 
 
 def inventory(meetings_dir: Path) -> dict[str, object]:
