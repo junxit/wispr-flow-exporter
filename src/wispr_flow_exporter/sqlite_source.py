@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import Any, Self
 
 from .normalize import decode_json
-from .schema import EXPECTED, MIGRATION_PIN, SchemaPin, TableSpec, pin_from_migrations
+from .schema import (
+    EXPECTED,
+    MIGRATION_PIN,
+    Layout,
+    SchemaPin,
+    TableSpec,
+    pin_from_migrations,
+)
 
 # A single value large enough to be a problem in memory. Meeting audio blobs
 # and screenshots are the realistic cases.
@@ -368,6 +375,30 @@ class SqliteSource:
 
     # --- reading ----------------------------------------------------------
 
+    def spec_for(self, table: str) -> TableSpec:
+        """Return a table's declaration, synthesizing one when undeclared.
+
+        A table introduced by a future migration has no entry in
+        ``schema.EXPECTED``, and refusing to read it would defeat the point of
+        a PRAGMA-driven reader. It gets a minimal spec built from what the
+        database reports, so it is archived generically rather than skipped --
+        or worse, raising and taking the whole run with it.
+
+        Args:
+            table: Table name, which must come from :meth:`tables`.
+
+        Returns:
+            The declared spec, or a synthesized one.
+        """
+        declared = EXPECTED.get(table)
+        if declared is not None:
+            return declared
+        return TableSpec(
+            pk=self.primary_key(table) or "rowid",
+            layout=Layout.SNAPSHOT,
+            columns=self.columns(table),
+        )
+
     def records(
         self,
         table: str,
@@ -396,11 +427,7 @@ class SqliteSource:
         Yields:
             One :class:`Record` per row.
         """
-        spec = EXPECTED.get(table) or TableSpec(
-            pk=self.primary_key(table) or "rowid",
-            layout=EXPECTED["SequelizeMeta"].layout,
-            columns=self.columns(table),
-        )
+        spec = self.spec_for(table)
         available = self.columns(table)
         projected = spec.projection(
             available, include_screen_context=include_screen_context

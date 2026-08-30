@@ -35,7 +35,7 @@ from typing import Any
 
 from . import files_source, render
 from .files_source import MEETING_DIR_RE, MeetingArtifacts, read_transcript
-from .local_config import Policy
+from .local_config import LocalConfig, Policy, SessionInfo, account_profile
 from .normalize import (
     SpeakerMap,
     calendar_key,
@@ -44,7 +44,7 @@ from .normalize import (
     to_instant,
 )
 from .paths import WisprPaths
-from .schema import EXPECTED, TimestampKind
+from .schema import EXPECTED, Layout, TimestampKind
 from .secure_io import (
     copy_file_secure,
     file_digest,
@@ -64,7 +64,16 @@ AUDIO_LINK = "link"
 AUDIO_SKIP = "skip"
 
 # Every local pass, in the order a run walks them.
-ENTITIES = ("meetings", "notes", "calendar", "dictionary", "todos", "dictation")
+ENTITIES = (
+    "meetings",
+    "notes",
+    "calendar",
+    "dictionary",
+    "todos",
+    "dictation",
+    "tables",
+    "account",
+)
 
 
 @dataclass(slots=True)
@@ -561,6 +570,8 @@ def sync_local(
     options: SyncOptions,
     entities: Sequence[str] = ENTITIES,
     policy: Policy | None = None,
+    config: LocalConfig | None = None,
+    session: SessionInfo | None = None,
 ) -> SyncResult:
     """Run every requested entity pass against the local store.
 
@@ -572,6 +583,8 @@ def sync_local(
         entities: Which passes to run.
         policy: The observed storage preferences, recorded alongside the
             dictation pass so an archive empty by preference can prove it.
+        config: Parsed config.json, for the account pass.
+        session: The session summary, for the account pass. Carries no token.
 
     Returns:
         The outcome.
@@ -600,6 +613,12 @@ def sync_local(
                 source,
                 options,
                 policy or Policy(None, None, datetime.now(tz=UTC)),
+            )
+        if "tables" in entities:
+            result.counts["tables"] = sync_tables(archive, source, options)
+        if "account" in entities and config is not None:
+            result.counts["account"] = sync_account(
+                archive, config, session or SessionInfo(present=False), options
             )
     except KeyboardInterrupt:
         result.interrupted = True
@@ -847,7 +866,7 @@ def sync_snapshot(
     Returns:
         What the pass did.
     """
-    spec = EXPECTED[table]
+    spec = source.spec_for(table)
     entity = entity_name(table)
     counts = SyncCounts()
     now = _now()
@@ -1059,4 +1078,188 @@ def sync_dictation(
     )
     if highest is not None:
         archive.set_watermark(SOURCE_LOCAL, "dictation", "timestamp", highest)
+    return counts
+
+
+# Tables with a dedicated pass. Everything else is archived generically, which
+# is what makes a table shipped in a future migration cost no code change.
+HANDLED_TABLES = frozenset(
+    {"Meetings", "Notes", "CalendarEvents", "Dictionary", "Todos", "History"}
+)
+
+
+def sync_sharded(
+    archive: Archive, source: SqliteSource, table: str, options: SyncOptions
+) -> SyncCounts:
+    """Archive an append-mostly table as date-sharded NDJSON.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        table: Source table name.
+        options: What this run was asked to do.
+
+    Returns:
+        What the pass did.
+    """
+    spec = EXPECTED[table]
+    entity = entity_name(table)
+    counts = SyncCounts()
+    now = _now()
+    date_column = spec.date_column
+    kind = spec.timestamps.get(date_column or "", TimestampKind.SEQUELIZE)
+
+    days: dict[str, list[dict[str, Any]]] = {}
+    for record in source.records(
+        table,
+        include_screen_context=options.include_screen_context,
+        include_blobs=options.include_blobs,
+    ):
+        counts.scanned += 1
+        when = to_instant(kind, record.data.get(date_column)) if date_column else None
+        days.setdefault(f"{when:%Y-%m-%d}" if when else "undated", []).append(
+            record.data
+        )
+
+    if options.dry_run:
+        counts.written = counts.scanned
+        return counts
+
+    if not days:
+        # A sharded table with no rows produces no shard, so without this the
+        # archive could not distinguish "read, and empty" from "never read".
+        archive.put(
+            "tables",
+            f"{entity}:empty",
+            table=table,
+            records=0,
+            content_hash=content_hash(spec, {"rows": []}),
+            source=SOURCE_LOCAL,
+        )
+        return counts
+
+    for day, rows in sorted(days.items()):
+        when = to_instant(kind, rows[0].get(date_column)) if date_column else None
+        shard = archive.record_path(table, spec, "", when=when)
+        digest = content_hash(spec, {"rows": [content_hash(spec, r) for r in rows]})
+        key = f"{entity}:{day}"
+        entry = archive.entry("tables", key)
+        if (
+            entry is not None
+            and entry.get("content_hash") == digest
+            and not options.full
+            and shard.is_file()
+        ):
+            counts.unchanged += len(rows)
+            continue
+
+        wrote = write_ndjson_if_changed(shard, rows)
+        fields: dict[str, Any] = {
+            "path": archive.relative(shard),
+            "table": table,
+            "records": len(rows),
+            "content_hash": digest,
+            "source": SOURCE_LOCAL,
+        }
+        if wrote:
+            fields["archived_at"] = now
+            counts.written += len(rows)
+        else:
+            counts.unchanged += len(rows)
+        archive.put("tables", key, **fields)
+    return counts
+
+
+def sync_tables(
+    archive: Archive, source: SqliteSource, options: SyncOptions
+) -> SyncCounts:
+    """Archive every table without a dedicated pass.
+
+    Driven by what the database actually has rather than by what is declared,
+    so a table introduced in a future migration is archived on the next run
+    with no code change here. That is the whole reason this pass is generic:
+    Wispr Flow ships roughly twenty migrations a month, and an archive that
+    could only hold tables someone had thought of would fall behind by design.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        options: What this run was asked to do.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    for table in source.tables():
+        if table in HANDLED_TABLES:
+            continue
+        spec = EXPECTED.get(table)
+        if spec is not None and spec.layout is Layout.SHARD:
+            pass_counts = sync_sharded(archive, source, table, options)
+        else:
+            pass_counts = sync_snapshot(archive, source, table, options)
+        counts.scanned += pass_counts.scanned
+        counts.written += pass_counts.written
+        counts.unchanged += pass_counts.unchanged
+    return counts
+
+
+def sync_account(
+    archive: Archive,
+    config: LocalConfig,
+    session: SessionInfo,
+    options: SyncOptions,
+) -> SyncCounts:
+    """Archive the account's own state, minus anything that is a credential.
+
+    The voice profile, saved writing samples and rewrite prompts live only in
+    ``config.json`` -- there is no table for them -- so an archive that read
+    only the database would miss them entirely. Wispr Flow's own per-entity
+    watermark map is archived too, as provenance: it records what the app
+    believed it had synced at the moment this archive was taken.
+
+    Args:
+        archive: The destination archive.
+        config: Parsed ``config.json``.
+        session: The session summary, which carries no token.
+        options: What this run was asked to do.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    if options.dry_run:
+        counts.scanned = 1
+        counts.written = 1
+        return counts
+
+    root = archive.resolve("account")
+    wrote = False
+    # Identity and expiry only. The token itself is never handed to anything
+    # that writes, so no file this tool creates can carry one.
+    wrote |= write_json_if_changed(root / "profile.json", account_profile(session))
+    wrote |= write_json_if_changed(root / "preferences.json", config.preferences)
+    wrote |= write_json_if_changed(
+        root / "sync_coordinator.json", config.sync_coordinator
+    )
+    if config.voice_profile is not None:
+        wrote |= write_json_if_changed(
+            root / "voice_profile.json", config.voice_profile
+        )
+    for name, value in (
+        ("writing_samples.md", config.writing_samples),
+        ("polish_prompts.md", config.polish_prompts),
+    ):
+        if not value:
+            continue
+        body = (
+            "\n\n".join(str(item) for item in value)
+            if isinstance(value, list)
+            else str(value)
+        )
+        wrote |= write_text_if_changed(root / name, body + "\n")
+
+    counts.scanned = 1
+    counts.written = 1 if wrote else 0
+    counts.unchanged = 0 if wrote else 1
     return counts

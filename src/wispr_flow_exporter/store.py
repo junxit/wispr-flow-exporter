@@ -243,7 +243,14 @@ class Archive:
             return self.resolve(base, dated_prefix(when), record_dir_name(when, title, key))
         if spec.layout is Layout.SHARD:
             return self.resolve(base, f"{shard_name(when)}.ndjson")
-        return self.resolve(base, f"{Path(base).name}.ndjson")
+        # A snapshot is a single file. Entities that already live under a
+        # parent directory ("tables/Automations") become a file in it rather
+        # than a directory of their own -- otherwise the name doubles into
+        # tables/Automations/Automations.ndjson.
+        parts = base.split("/")
+        if len(parts) > 1:
+            return self.resolve(*parts[:-1], f"{parts[-1]}.ndjson")
+        return self.resolve(base, f"{base}.ndjson")
 
     def relative(self, path: Path) -> str:
         """Express an archive path relative to the root, for the index.

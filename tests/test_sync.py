@@ -15,13 +15,15 @@ from pathlib import Path
 import pytest
 
 from wispr_flow_exporter import paths
-from wispr_flow_exporter.local_config import Policy
+from wispr_flow_exporter.local_config import LocalConfig, Policy, SessionInfo
 from wispr_flow_exporter.normalize import calendar_key
+from wispr_flow_exporter.schema import EXPECTED
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
 from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
 
 from conftest import (
+    FAKE_JWT,
     HISTORY_A,
     HISTORY_B,
     HISTORY_C,
@@ -30,6 +32,7 @@ from conftest import (
     MEETING_B,
     NOTE_A,
     OWNER,
+    OWNER_EMAIL,
     SECOND,
     TITLE_PLAIN,
 )
@@ -884,3 +887,160 @@ def test_dictation_re_runs_write_nothing(scene: Callable[..., tuple]) -> None:
     _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
 
     assert _snapshot(archive.root) == before
+
+
+# --- misc tables and account ----------------------------------------------
+
+
+def test_every_table_is_reachable(scene: Callable[..., tuple]) -> None:
+    """All 26 tables are archived, not only the ones with a renderer."""
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved)
+
+    snapshots = {path.stem for path in (archive.root / "tables").glob("*.ndjson")}
+    empties = {
+        key.split(":")[0].split("/")[-1]
+        for key in archive.entries("tables")
+        if key.endswith(":empty")
+    }
+    covered = snapshots | empties | {
+        "Meetings", "Notes", "CalendarEvents", "Dictionary", "Todos", "History",
+    }
+    assert set(EXPECTED) <= covered
+
+
+def test_a_table_from_a_future_migration_is_archived(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """An undeclared table costs no code change.
+
+    Wispr Flow ships roughly twenty migrations a month; an archive that could
+    only hold tables someone had thought of would fall behind by design.
+    """
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    built = wispr_db(extra_tables={"WhisperQuota": ("id", "amount")})
+    import sqlite3
+
+    with sqlite3.connect(built) as writer:
+        writer.execute('INSERT INTO "WhisperQuota" VALUES (?, ?)', ("q1", 7))
+    built.replace(data_dir / "flow.sqlite")
+    resolved = paths.resolve(data_dir=data_dir)
+    archive = Archive(root=tmp_path / "archive")
+
+    _run(archive, resolved)
+
+    shard = archive.root / "tables" / "WhisperQuota.ndjson"
+    assert shard.is_file()
+    assert json.loads(shard.read_text(encoding="utf-8").strip()) == {
+        "id": "q1",
+        "amount": 7,
+    }
+
+
+def test_a_snapshot_file_is_not_nested_under_its_own_name(
+    scene: Callable[..., tuple],
+) -> None:
+    """tables/Automations.ndjson, not tables/Automations/Automations.ndjson."""
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved)
+
+    assert (archive.root / "tables" / "Automations.ndjson").is_file()
+    assert not (archive.root / "tables" / "Automations").is_dir()
+
+
+def test_an_empty_sharded_table_is_still_recorded(
+    scene: Callable[..., tuple],
+) -> None:
+    """A sharded table with no rows produces no shard, so the index says so.
+
+    Without it the archive could not tell "read, and empty" from "never read".
+    """
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved)
+
+    assert archive.entry("tables", "tables/Polish:empty")["records"] == 0
+
+
+def test_the_account_pass_captures_what_no_table_holds(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """The voice profile, writing samples and prompts live only in config.json.
+
+    An archive that read only the database would miss them entirely.
+    """
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    wispr_db().replace(data_dir / "flow.sqlite")
+    config = LocalConfig(
+        policy=Policy("store_normally", "never_delete", datetime.now(tz=UTC)),
+        preferences={"localDataPolicy": "store_normally"},
+        sync_coordinator={"timestamps": {"meetings": "2026-08-20T00:00:00Z"}},
+        voice_profile={"persona": "brisk"},
+        writing_samples=["a whisper budget memo"],
+        polish_prompts=["make it terser"],
+    )
+    archive = Archive(root=tmp_path / "archive")
+    resolved = paths.resolve(data_dir=data_dir)
+
+    with open_source(resolved.db) as source:
+        sync_local(
+            archive,
+            source,
+            resolved,
+            SyncOptions(),
+            entities=("account",),
+            config=config,
+            session=SessionInfo(present=False),
+        )
+
+    root = archive.root / "account"
+    assert json.loads((root / "voice_profile.json").read_text(encoding="utf-8")) == {
+        "persona": "brisk"
+    }
+    assert "whisper budget memo" in (root / "writing_samples.md").read_text(
+        encoding="utf-8"
+    )
+    assert "make it terser" in (root / "polish_prompts.md").read_text(encoding="utf-8")
+    assert json.loads((root / "sync_coordinator.json").read_text(encoding="utf-8"))[
+        "timestamps"
+    ]["meetings"]
+
+
+def test_the_archived_profile_carries_no_credential(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """This is the file that would otherwise carry a live token into a backup."""
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    wispr_db().replace(data_dir / "flow.sqlite")
+    archive = Archive(root=tmp_path / "archive")
+    resolved = paths.resolve(data_dir=data_dir)
+    session = SessionInfo(
+        present=True,
+        project_ref="aaaaaaaaaaaaaaaaaaaa",
+        user_id="user-1",
+        email=OWNER_EMAIL,
+        expires_at=datetime.now(tz=UTC),
+    )
+
+    with open_source(resolved.db) as source:
+        sync_local(
+            archive,
+            source,
+            resolved,
+            SyncOptions(),
+            entities=("account",),
+            config=LocalConfig(
+                policy=Policy("never_store", None, datetime.now(tz=UTC))
+            ),
+            session=session,
+        )
+
+    body = (archive.root / "account" / "profile.json").read_text(encoding="utf-8")
+    assert FAKE_JWT not in body
+    # access_token_expires_at legitimately contains that substring, so the
+    # assertion is on the key that would carry a credential, not on the word.
+    assert '"access_token"' not in body
+    assert "refresh_token" not in body
+    assert OWNER_EMAIL in body

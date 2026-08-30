@@ -365,7 +365,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
             }
 
             result = sync_local(
-                archive, source, resolved, options, policy=config_state.policy
+                archive,
+                source,
+                resolved,
+                options,
+                policy=config_state.policy,
+                config=config_state,
+                session=read_session(
+                    Path(config.session_file).expanduser()
+                    if config.session_file
+                    else resolved.session
+                ),
             )
     except SourceError as error:
         print(f"  source unreadable: {redact(str(error))}")
