@@ -52,13 +52,26 @@ MEETING_A = "0f2b6cf1-6d3a-4a5c-9d21-2f4e7b8c0a11"
 MEETING_B = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
 NOTE_A = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 HISTORY_A = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+HISTORY_B = "3f2504e0-4f89-41d3-9a0c-0305e82c3302"
+HISTORY_C = "3f2504e0-4f89-41d3-9a0c-0305e82c3303"
+HISTORY_D = "3f2504e0-4f89-41d3-9a0c-0305e82c3304"
 
 # Rejected on purpose: the archive-key validator demands canonical lowercase.
 UUID_UPPER = "0F2B6CF1-6D3A-4A5C-9D21-2F4E7B8C0A11"
 UUID_SHORT = "0f2b6cf1-6d3a-4a5c-9d21-2f4e7b8c0a1"
 
 APPROVED_UUIDS = frozenset(
-    {MEETING_A, MEETING_B, NOTE_A, HISTORY_A, UUID_UPPER.lower(), UUID_SHORT}
+    {
+        MEETING_A,
+        MEETING_B,
+        NOTE_A,
+        HISTORY_A,
+        HISTORY_B,
+        HISTORY_C,
+        HISTORY_D,
+        UUID_UPPER.lower(),
+        UUID_SHORT,
+    }
 )
 
 # --- credentials ----------------------------------------------------------

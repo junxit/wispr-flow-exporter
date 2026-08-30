@@ -336,6 +336,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         include_blobs=config.include_audio_blobs or config.include_images,
         verbose=getattr(args, "verbose", False),
         dry_run=getattr(args, "dry_run", False),
+        recheck_days=config.recheck_days,
     )
 
     exit_code = EXIT_OK
@@ -356,7 +357,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
             config_state = read_config(resolved.config)
             # Recorded on every run, so an archive that is empty because of a
             # preference can prove which preference, and when it was in force.
-            state["policy"] = config_state.policy.as_dict(state.get("policy"))
             state["sync_coordinator"] = config_state.sync_coordinator
             state["migration_pin"] = {
                 "count": drift.live.count,
@@ -364,7 +364,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 "sha256": drift.live.sha256,
             }
 
-            result = sync_local(archive, source, resolved, options)
+            result = sync_local(
+                archive, source, resolved, options, policy=config_state.policy
+            )
     except SourceError as error:
         print(f"  source unreadable: {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE

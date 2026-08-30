@@ -9,17 +9,30 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from wispr_flow_exporter import paths
+from wispr_flow_exporter.local_config import Policy
 from wispr_flow_exporter.normalize import calendar_key
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
 from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
 
-from conftest import MEETING_A, MEETING_B, NOTE_A, OWNER, SECOND, TITLE_PLAIN
+from conftest import (
+    HISTORY_A,
+    HISTORY_B,
+    HISTORY_C,
+    HISTORY_D,
+    MEETING_A,
+    MEETING_B,
+    NOTE_A,
+    OWNER,
+    SECOND,
+    TITLE_PLAIN,
+)
 
 REFINED = [
     {
@@ -123,8 +136,15 @@ def _run(archive: Archive, resolved: object, **kwargs: object) -> object:
     Returns:
         The sync result.
     """
+    policy = kwargs.pop("policy", None)
     with open_source(resolved.db) as source:  # type: ignore[attr-defined]
-        return sync_local(archive, source, resolved, SyncOptions(**kwargs))  # type: ignore[arg-type]
+        return sync_local(
+            archive,
+            source,
+            resolved,  # type: ignore[arg-type]
+            SyncOptions(**kwargs),  # type: ignore[arg-type]
+            policy=policy,  # type: ignore[arg-type]
+        )
 
 
 def _snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
@@ -607,3 +627,260 @@ def test_an_account_with_no_records_creates_no_empty_namespaces(
 
     assert "notes" not in archive.index["entities"]
     assert "calendar" not in archive.index["entities"]
+
+
+# --- dictation ------------------------------------------------------------
+
+
+def _history_row(**overrides: object) -> dict[str, object]:
+    """Build a History row.
+
+    Args:
+        **overrides: Columns to replace.
+
+    Returns:
+        The row.
+    """
+    row: dict[str, object] = {
+        "transcriptEntityId": HISTORY_A,
+        "timestamp": "2026-08-30 09:14:02.100 +00:00",
+        "asrText": "send the whisper budget to hush before friday",
+        "formattedText": "Send the whisper budget to Hush before Friday.",
+        "app": "com.example.NotepadApp",
+        "numWords": 8,
+        "isArchived": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _policy(value: str) -> Policy:
+    """Build an observed policy.
+
+    Args:
+        value: The localDataPolicy value.
+
+    Returns:
+        The policy.
+    """
+    return Policy(value, "never_delete", datetime.now(tz=UTC))
+
+
+def test_dictation_is_sharded_by_day(scene: Callable[..., tuple]) -> None:
+    """A heavy user produces thousands of dictations a day.
+
+    A document each would be a filesystem-hostile archive; the useful unit is
+    the day.
+    """
+    archive, resolved, _ = scene(
+        rows=[],
+        tables={
+            "History": [
+                _history_row(),
+                _history_row(
+                    transcriptEntityId=HISTORY_B,
+                    timestamp="2026-08-30 11:00:00.000 +00:00",
+                ),
+                _history_row(
+                    transcriptEntityId=HISTORY_C,
+                    timestamp="2026-08-31 09:00:00.000 +00:00",
+                ),
+            ]
+        },
+    )
+    result = _run(archive, resolved, policy=_policy("store_normally"))
+
+    assert result.counts["dictation"].scanned == 3
+    shard = archive.root / "dictation" / "2026" / "08" / "2026-08-30.ndjson"
+    assert len(shard.read_text(encoding="utf-8").splitlines()) == 2
+    assert (archive.root / "dictation" / "2026" / "08" / "2026-08-31.ndjson").is_file()
+
+
+def test_the_day_log_uses_the_most_processed_text(
+    scene: Callable[..., tuple],
+) -> None:
+    """The cascade picks the corrected text, and records which column it came from."""
+    archive, resolved, _ = scene(
+        rows=[],
+        tables={
+            "History": [
+                _history_row(
+                    editedText="Send the Q3 whisper budget to Hush before Friday."
+                )
+            ]
+        },
+    )
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    log = (archive.root / "dictation" / "2026" / "08" / "2026-08-30.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Send the Q3 whisper budget" in log
+    assert "com.example.NotepadApp" in log
+
+
+def test_a_whole_day_is_rewritten_not_appended(
+    scene: Callable[..., tuple],
+) -> None:
+    """A run that read only the newest rows must not drop the rest of the day.
+
+    History has no modification column, so a later run re-reads a trailing
+    window; if it wrote only what it read, the day's earlier dictations would
+    vanish from the shard.
+    """
+    archive, resolved, db = scene(rows=[], tables={"History": [_history_row()]})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            'INSERT INTO "History" ("transcriptEntityId", "timestamp", '
+            '"formattedText") VALUES (?, ?, ?)',
+            (
+                HISTORY_D,
+                "2026-08-30 15:00:00.000 +00:00",
+                "And the murmur quota.",
+            ),
+        )
+
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    shard = archive.root / "dictation" / "2026" / "08" / "2026-08-30.ndjson"
+    assert len(shard.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_an_in_place_edit_within_the_window_is_picked_up(
+    scene: Callable[..., tuple],
+) -> None:
+    """History rows are edited after creation and carry no modifiedAt.
+
+    A pure watermark would archive the first version and never see the
+    correction, so a trailing window is re-read every run.
+    """
+    archive, resolved, db = scene(rows=[], tables={"History": [_history_row()]})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            'UPDATE "History" SET editedText = ? WHERE transcriptEntityId = ?',
+            ("Corrected afterwards.", HISTORY_A),
+        )
+
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved, policy=_policy("store_normally"))
+
+    assert result.counts["dictation"].written == 1
+    log = (fresh.root / "dictation" / "2026" / "08" / "2026-08-30.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Corrected afterwards." in log
+
+
+def test_never_store_is_recorded_not_inferred(
+    scene: Callable[..., tuple],
+) -> None:
+    """An archive empty by preference must be able to prove which preference.
+
+    This is the one failure here that is silent, permanent, and only
+    discovered on the day the data is finally wanted -- so a zero row count
+    and a policy that forbids storage must not look the same.
+    """
+    archive, resolved, _ = scene(rows=[])
+    result = _run(archive, resolved, policy=_policy("never_store"))
+
+    assert result.counts["dictation"].scanned == 0
+    recorded = archive.source_state(SOURCE_LOCAL)["policy"]
+    assert recorded["local_data_policy"] == "never_store"
+    assert recorded["records_dictation"] is False
+    assert "observed_at" in recorded
+
+
+def test_an_empty_dictation_table_under_a_storing_policy_is_different(
+    scene: Callable[..., tuple],
+) -> None:
+    """Zero rows while storage is enabled means genuinely nothing dictated."""
+    archive, resolved, _ = scene(rows=[])
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    assert archive.source_state(SOURCE_LOCAL)["policy"]["records_dictation"] is True
+
+
+def test_screen_context_is_absent_from_the_shard_by_default(
+    scene: Callable[..., tuple],
+) -> None:
+    """The default export never selects a screen capture."""
+    archive, resolved, _ = scene(
+        rows=[],
+        tables={"History": [_history_row(axText="Untitled document — secrets")]},
+    )
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    shard = (archive.root / "dictation" / "2026" / "08" / "2026-08-30.ndjson").read_text(
+        encoding="utf-8"
+    )
+    assert "axText" not in shard
+    assert "secrets" not in shard
+
+
+def test_screen_context_appears_only_when_opted_in(
+    scene: Callable[..., tuple],
+) -> None:
+    """Two explicit flags widen the export; nothing else does."""
+    archive, resolved, _ = scene(
+        rows=[],
+        tables={"History": [_history_row(axText="Untitled document")]},
+    )
+    _run(
+        archive,
+        resolved,
+        include_screen_context=True,
+        policy=_policy("store_normally"),
+    )
+
+    shard = (archive.root / "dictation" / "2026" / "08" / "2026-08-30.ndjson").read_text(
+        encoding="utf-8"
+    )
+    assert "axText" in shard
+
+
+def test_dictation_blobs_are_written_as_sidecars(
+    scene: Callable[..., tuple],
+) -> None:
+    """raw payloads stay readable, so binary goes beside them, not inside."""
+    archive, resolved, _ = scene(
+        rows=[],
+        tables={"History": [_history_row(audio=b"OggS" + bytes(64))]},
+    )
+    _run(archive, resolved, include_blobs=True, policy=_policy("store_normally"))
+
+    sidecar = (
+        archive.root / "dictation" / "media" / "2026" / "08" / HISTORY_A / "audio.opus"
+    )
+    assert sidecar.is_file()
+    assert sidecar.read_bytes() == b"OggS" + bytes(64)
+
+
+def test_a_dictation_with_an_unparseable_date_is_still_archived(
+    scene: Callable[..., tuple],
+) -> None:
+    """Filing it under today would invent provenance; it gets its own shard."""
+    archive, resolved, _ = scene(
+        rows=[], tables={"History": [_history_row(timestamp="not a date")]}
+    )
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    assert archive.entry("dictation", "undated") is not None
+
+
+def test_dictation_re_runs_write_nothing(scene: Callable[..., tuple]) -> None:
+    """The invariant holds for sharded entities too."""
+    archive, resolved, _ = scene(rows=[], tables={"History": [_history_row()]})
+    _run(archive, resolved, policy=_policy("store_normally"))
+    before = _snapshot(archive.root)
+
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    assert _snapshot(archive.root) == before

@@ -291,3 +291,25 @@ def remove_stale_temp(directory: Path) -> int:
             continue
         removed += 1
     return removed
+
+
+def write_bytes_if_changed(path: Path, payload: bytes) -> bool:
+    """Write bytes only when they differ from what is already there.
+
+    Args:
+        path: Destination file.
+        payload: Contents to write.
+
+    Returns:
+        ``True`` when the file was written.
+    """
+    try:
+        if path.read_bytes() == payload:
+            return False
+    except OSError:
+        pass
+    secure_mkdir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    secure_write_bytes(tmp, payload)
+    tmp.replace(path)
+    return True

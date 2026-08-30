@@ -29,15 +29,17 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import files_source, render
 from .files_source import MEETING_DIR_RE, MeetingArtifacts, read_transcript
+from .local_config import Policy
 from .normalize import (
     SpeakerMap,
     calendar_key,
+    resolve_dictation_text,
     resolve_speaker_tokens,
     to_instant,
 )
@@ -46,6 +48,7 @@ from .schema import EXPECTED, TimestampKind
 from .secure_io import (
     copy_file_secure,
     file_digest,
+    write_bytes_if_changed,
     secure_mkdir,
     write_json_if_changed,
     write_ndjson_if_changed,
@@ -61,7 +64,7 @@ AUDIO_LINK = "link"
 AUDIO_SKIP = "skip"
 
 # Every local pass, in the order a run walks them.
-ENTITIES = ("meetings", "notes", "calendar", "dictionary", "todos")
+ENTITIES = ("meetings", "notes", "calendar", "dictionary", "todos", "dictation")
 
 
 @dataclass(slots=True)
@@ -76,6 +79,8 @@ class SyncOptions:
         include_blobs: Read binary columns.
         verbose: Report per record.
         dry_run: Report what would be written and touch nothing.
+        recheck_days: Trailing days re-read for tables with no modification
+            column, so an in-place edit is not missed forever.
         checkpoint_every: Records between index saves.
     """
 
@@ -86,6 +91,7 @@ class SyncOptions:
     include_blobs: bool = False
     verbose: bool = False
     dry_run: bool = False
+    recheck_days: int = 14
     checkpoint_every: int = 50
 
 
@@ -554,6 +560,7 @@ def sync_local(
     wispr: WisprPaths,
     options: SyncOptions,
     entities: Sequence[str] = ENTITIES,
+    policy: Policy | None = None,
 ) -> SyncResult:
     """Run every requested entity pass against the local store.
 
@@ -563,6 +570,8 @@ def sync_local(
         wispr: Resolved source paths.
         options: What this run was asked to do.
         entities: Which passes to run.
+        policy: The observed storage preferences, recorded alongside the
+            dictation pass so an archive empty by preference can prove it.
 
     Returns:
         The outcome.
@@ -584,6 +593,13 @@ def sync_local(
         if "todos" in entities:
             result.counts["todos"] = sync_snapshot(
                 archive, source, "Todos", options
+            )
+        if "dictation" in entities:
+            result.counts["dictation"] = sync_dictation(
+                archive,
+                source,
+                options,
+                policy or Policy(None, None, datetime.now(tz=UTC)),
             )
     except KeyboardInterrupt:
         result.interrupted = True
@@ -876,4 +892,171 @@ def sync_snapshot(
     archive.put(entity, entity, **fields)
     counts.written = len(rows) if wrote else 0
     counts.unchanged = 0 if wrote else len(rows)
+    return counts
+
+
+def _day_of(value: Any) -> str | None:
+    """Return the ``YYYY-MM-DD`` a Sequelize timestamp falls on.
+
+    Args:
+        value: A raw ``timestamp`` column value.
+
+    Returns:
+        The date, or ``None`` when it did not parse.
+    """
+    when = to_instant(TimestampKind.SEQUELIZE, value)
+    return f"{when:%Y-%m-%d}" if when else None
+
+
+def _recheck_floor(watermark: Any, days: int) -> Any:
+    """Compute how far back a run re-reads for in-place edits.
+
+    ``History`` rows are edited after creation -- the text cascade fills in
+    later -- and the table has no modification column at all. A pure watermark
+    would therefore archive the first version of a dictation and never see the
+    correction, so a trailing window is re-read every run.
+
+    Args:
+        watermark: The highest timestamp archived so far.
+        days: How many days to reach back.
+
+    Returns:
+        The lower bound to query from, or ``None`` for everything.
+    """
+    when = to_instant(TimestampKind.SEQUELIZE, watermark)
+    if when is None:
+        return None
+    # Formatted to match the column's own encoding, since the comparison
+    # happens in SQL against the stored text.
+    return f"{when - timedelta(days=days):%Y-%m-%d} 00:00:00.000 +00:00"
+
+
+def sync_dictation(
+    archive: Archive,
+    source: SqliteSource,
+    options: SyncOptions,
+    policy: Policy,
+) -> SyncCounts:
+    """Archive dictation history as one NDJSON and one log per day.
+
+    A document per dictation would be unusable: a heavy user produces
+    thousands in a day, and the useful unit of dictation history is the day.
+
+    Whole days are rewritten rather than appended to. A run that only read the
+    newest rows would otherwise replace a day's shard with just those rows and
+    silently drop the rest of the day.
+
+    When ``localDataPolicy`` is ``never_store`` this pass legitimately finds
+    nothing, and that is recorded rather than inferred. An archive that is
+    empty because of a preference must be able to prove which preference: it is
+    the one failure here that is silent, permanent, and only discovered on the
+    day the data is finally wanted.
+
+    Args:
+        archive: The destination archive.
+        source: An open database reader.
+        options: What this run was asked to do.
+        policy: The observed Wispr Flow storage preferences.
+
+    Returns:
+        What the pass did.
+    """
+    spec = EXPECTED["History"]
+    counts = SyncCounts()
+    now = _now()
+
+    since = (
+        None
+        if options.full
+        else _recheck_floor(
+            archive.watermark(SOURCE_LOCAL, "dictation"), options.recheck_days
+        )
+    )
+
+    days: dict[str, list[dict[str, Any]]] = {}
+    blobs: list[tuple[str, str, str, bytes]] = []
+    highest: Any = None
+
+    try:
+        for record in source.records(
+            "History",
+            since=since,
+            since_column="timestamp",
+            include_screen_context=options.include_screen_context,
+            include_blobs=options.include_blobs,
+        ):
+            counts.scanned += 1
+            data = record.data
+            day = _day_of(data.get("timestamp"))
+            if day is None:
+                # An unparseable timestamp still gets archived, under a name
+                # that says so rather than under today's date.
+                day = "undated"
+            days.setdefault(day, []).append(data)
+            raw = data.get("timestamp")
+            if isinstance(raw, str) and (highest is None or raw > highest):
+                highest = raw
+            for column, payload in record.blobs.items():
+                blobs.append((day, record.key, column, payload))
+    except KeyboardInterrupt:
+        if not options.dry_run:
+            archive.save()
+        raise
+
+    if options.dry_run:
+        counts.written = counts.scanned
+        return counts
+
+    for day, rows in sorted(days.items()):
+        when = to_instant(TimestampKind.SEQUELIZE, rows[0].get("timestamp"))
+        shard = archive.record_path("History", spec, "", when=when)
+        rows.sort(key=lambda row: str(row.get("timestamp", "")))
+
+        wrote = write_ndjson_if_changed(shard, rows)
+        entries = []
+        for row in rows:
+            text, provenance = resolve_dictation_text(row)
+            stamp = to_instant(TimestampKind.SEQUELIZE, row.get("timestamp"))
+            entries.append(
+                {
+                    "when": f"{stamp:%H:%M}" if stamp else "",
+                    "app": row.get("app"),
+                    "text": text,
+                    "words": row.get("numWords"),
+                    "provenance": provenance,
+                }
+            )
+        wrote |= write_text_if_changed(
+            shard.with_suffix(".md"), render.render_dictation_day(day, entries)
+        )
+
+        fields: dict[str, Any] = {
+            "path": archive.relative(shard),
+            "records": len(rows),
+            "content_hash": content_hash(
+                spec, {"rows": [content_hash(spec, row) for row in rows]}
+            ),
+            "source": SOURCE_LOCAL,
+        }
+        if wrote:
+            fields["archived_at"] = now
+            counts.written += len(rows)
+        else:
+            counts.unchanged += len(rows)
+        archive.put("dictation", day, **fields)
+
+    for day, key, column, payload in blobs:
+        suffix = {"audio": ".opus", "builtInAudio": ".opus", "screenshot": ".png"}
+        target = archive.resolve(
+            "dictation", "media", *day.split("-")[:2], key,
+            f"{column}{suffix.get(column, '.bin')}",
+        )
+        if write_bytes_if_changed(target, payload):
+            counts.bytes_copied += len(payload)
+
+    archive.source_state(SOURCE_LOCAL)["policy"] = policy.as_dict(
+        archive.source_state(SOURCE_LOCAL).get("policy")
+    )
+    if highest is not None:
+        archive.set_watermark(SOURCE_LOCAL, "dictation", "timestamp", highest)
     return counts
