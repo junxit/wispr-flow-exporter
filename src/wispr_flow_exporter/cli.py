@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,14 +37,46 @@ from .store import Archive
 # Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
 # sync's is the backend key "wispr-local" that namespaces sync state.
 from .sync import SOURCE_LOCAL as LOCAL_BACKEND
-from .sync import SyncOptions, rerender, sync_local
+from .sync import SyncOptions, SyncResult, rerender, sync_local
 from .verify import verify_archive
 
 SOURCE_AUTO = "auto"
 SOURCE_LOCAL = "local"
 SOURCE_CLOUD = "cloud"
 SOURCE_BOTH = "both"
-SOURCE_CHOICES = (SOURCE_AUTO, SOURCE_LOCAL, SOURCE_CLOUD, SOURCE_BOTH)
+SOURCE_MCP = "mcp"
+SOURCE_ALL = "all"
+SOURCE_CHOICES = (
+    SOURCE_ALL,
+    SOURCE_AUTO,
+    SOURCE_LOCAL,
+    SOURCE_CLOUD,
+    SOURCE_BOTH,
+    SOURCE_MCP,
+)
+
+# Which backends each choice runs. "auto" is retained as an explicit way to ask
+# for the old local-only behavior; "both" is retained as local + cloud.
+_BACKENDS: Mapping[str, frozenset[str]] = {
+    SOURCE_AUTO: frozenset({SOURCE_LOCAL}),
+    SOURCE_LOCAL: frozenset({SOURCE_LOCAL}),
+    SOURCE_CLOUD: frozenset({SOURCE_CLOUD}),
+    SOURCE_MCP: frozenset({SOURCE_MCP}),
+    SOURCE_BOTH: frozenset({SOURCE_LOCAL, SOURCE_CLOUD}),
+    SOURCE_ALL: frozenset({SOURCE_LOCAL, SOURCE_CLOUD, SOURCE_MCP}),
+}
+
+
+def _backends(source: str) -> frozenset[str]:
+    """Return which backends a ``--source`` choice runs.
+
+    Args:
+        source: A member of :data:`SOURCE_CHOICES`.
+
+    Returns:
+        The backend names.
+    """
+    return _BACKENDS.get(source, frozenset({SOURCE_LOCAL}))
 
 AUDIO_CHOICES = ("copy", "link", "skip")
 ENTITIES = (
@@ -59,6 +92,10 @@ ENTITIES = (
 
 DEFAULT_ARCHIVE = "./archive"
 DEFAULT_API_BASE = "https://api.wisprflow.ai"
+# Kept beside the REST base for symmetry; the canonical values live in
+# mcp_auth, which is imported lazily so a local run never loads it.
+DEFAULT_MCP_ENDPOINT = "https://api.wisprflow.ai/connect/mcp"
+MCP_ENDPOINT_ENV = "WISPR_MCP_ENDPOINT"
 DEFAULT_RECHECK_DAYS = 14
 DEFAULT_MAX_AUDIO_MB = 512
 
@@ -85,6 +122,7 @@ class Config:
     recheck_days: int
     strict_schema: bool
     api_base: str
+    mcp_endpoint: str
     session_file: str | None
 
 
@@ -149,8 +187,8 @@ def _config(args: argparse.Namespace) -> Config:
         .resolve(),
         source=(
             getattr(args, "source", None)
-            or os.environ.get("WISPR_SYNC_SOURCE", SOURCE_AUTO).strip()
-            or SOURCE_AUTO
+            or os.environ.get("WISPR_SYNC_SOURCE", SOURCE_ALL).strip()
+            or SOURCE_ALL
         ).lower(),
         audio=(
             getattr(args, "audio", None)
@@ -169,6 +207,8 @@ def _config(args: argparse.Namespace) -> Config:
         or _flag("WISPR_STRICT_SCHEMA"),
         api_base=os.environ.get("WISPR_API_BASE", DEFAULT_API_BASE).strip()
         or DEFAULT_API_BASE,
+        mcp_endpoint=os.environ.get(MCP_ENDPOINT_ENV, DEFAULT_MCP_ENDPOINT).strip()
+        or DEFAULT_MCP_ENDPOINT,
         session_file=os.environ.get("WISPR_SESSION_FILE", "").strip() or None,
     )
 
@@ -200,7 +240,9 @@ def _say(label: str, value: str) -> None:
         label: Left-hand label.
         value: Right-hand value.
     """
-    print(f"  {label:<13}: {redact(value)}")
+    # Flushed: an interactive flow prints a URL the operator has to act on,
+    # and a buffered stdout shows it only after the step it belongs to.
+    print(f"  {label:<13}: {redact(value)}", flush=True)
 
 
 def _defaults() -> Answers:
@@ -359,7 +401,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     """
     config = _config(args)
     resolved = paths.resolve(config.data_dir, config.db)
-    if not resolved.db.exists():
+    backends = _backends(config.source)
+    runs_local = SOURCE_LOCAL in backends
+    if runs_local and not resolved.db.exists():
         print(f"  no Wispr Flow database at {resolved.db}")
         return EXIT_SOURCE_UNREACHABLE
 
@@ -383,60 +427,31 @@ def cmd_sync(args: argparse.Namespace) -> int:
     )
 
     exit_code = EXIT_OK
+    result = SyncResult()
+    config_state = read_config(resolved.config)
+    # Said before anything is contacted. The default reaches two remote
+    # services, so which ones is never left to be inferred from the output.
+    _say("backends", ", ".join(sorted(backends)))
     try:
-        with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
-            drift = source.detect_drift()
-            if drift.kind is not DriftClass.OK:
-                _say("schema", drift.summary())
-            if drift.kind is DriftClass.BREAKING:
-                # Raw archiving still completes; only renderers are affected.
-                # For an archival tool, failing loud must never mean failing
-                # closed, so this is reported and the pass continues.
-                exit_code = EXIT_BREAKING_DRIFT
-            elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-                exit_code = EXIT_ADDITIVE_DRIFT
-
-            state = archive.source_state(LOCAL_BACKEND)
-            config_state = read_config(resolved.config)
-            # Recorded on every run, so an archive that is empty because of a
-            # preference can prove which preference, and when it was in force.
-            state["sync_coordinator"] = config_state.sync_coordinator
-            state["migration_pin"] = {
-                "count": drift.live.count,
-                "latest": drift.live.latest,
-                "sha256": drift.live.sha256,
-            }
-            # Which client build produced this archive. Recorded for both
-            # backends: a future reader looking at an archive cannot otherwise
-            # tell which Wispr Flow wrote the data it describes.
-            if config_state.app_version:
-                state["app_version"] = config_state.app_version
-
-            result = sync_local(
-                archive,
-                source,
-                resolved,
-                options,
-                entities=entities,
-                policy=config_state.policy,
-                config=config_state,
-                session=read_session(
-                    Path(config.session_file).expanduser()
-                    if config.session_file
-                    else resolved.session
-                ),
-            )
+        if runs_local:
+            exit_code = _run_local(
+                archive, resolved, config, options, entities, config_state, result
+            ) or exit_code
     except SourceError as error:
         print(f"  source unreadable: {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE
 
-    # Only ever on an explicit request. "auto" means the local store and
-    # nothing else: a backup tool that starts calling an undocumented private
-    # API because a session happens to exist is doing something the operator
-    # did not ask for, and this default was changed after exactly that
-    # happened during development.
-    if config.source in (SOURCE_CLOUD, SOURCE_BOTH):
-        exit_code = _run_cloud(archive, resolved, config, options, result) or exit_code
+    explicit = config.source not in (SOURCE_ALL, SOURCE_AUTO)
+    if SOURCE_CLOUD in backends:
+        exit_code = (
+            _run_cloud(archive, resolved, config, options, result, explicit=explicit)
+            or exit_code
+        )
+    if SOURCE_MCP in backends:
+        exit_code = (
+            _run_mcp(archive, config, options, result, explicit=explicit) or exit_code
+        )
+    if backends - {SOURCE_LOCAL}:
         archive.save()
 
     for entity, counts in result.counts.items():
@@ -446,7 +461,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         if counts.failed:
             exit_code = EXIT_FAILURE
 
-    if not config_state.policy.records_dictation:
+    if runs_local and not config_state.policy.records_dictation:
         _say("", "dictation: 0 records — localDataPolicy is never_store")
 
     if result.interrupted:
@@ -457,12 +472,88 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _run_local(
+    archive: Archive,
+    resolved: paths.WisprPaths,
+    config: Config,
+    options: SyncOptions,
+    entities: tuple[str, ...],
+    config_state: object,
+    result: object,
+) -> int:
+    """Run the local pass, recording schema drift and the app build.
+
+    Args:
+        archive: The destination archive.
+        resolved: Resolved source paths.
+        config: This run's configuration.
+        options: What this run was asked to do.
+        entities: Which entity passes to perform.
+        config_state: Parsed ``config.json``.
+        result: Mutated with the local counts.
+
+    Returns:
+        An exit code contribution, or 0.
+
+    Raises:
+        SourceError: The database could not be read.
+    """
+    exit_code = EXIT_OK
+    with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
+        drift = source.detect_drift()
+        if drift.kind is not DriftClass.OK:
+            _say("schema", drift.summary())
+        if drift.kind is DriftClass.BREAKING:
+            # Raw archiving still completes; only renderers are affected.
+            # For an archival tool, failing loud must never mean failing
+            # closed, so this is reported and the pass continues.
+            exit_code = EXIT_BREAKING_DRIFT
+        elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+            exit_code = EXIT_ADDITIVE_DRIFT
+
+        state = archive.source_state(LOCAL_BACKEND)
+        # Recorded on every run, so an archive that is empty because of a
+        # preference can prove which preference, and when it was in force.
+        state["sync_coordinator"] = config_state.sync_coordinator
+        state["migration_pin"] = {
+            "count": drift.live.count,
+            "latest": drift.live.latest,
+            "sha256": drift.live.sha256,
+        }
+        # Which client build produced this archive. Recorded for both
+        # backends: a future reader looking at an archive cannot otherwise
+        # tell which Wispr Flow wrote the data it describes.
+        if config_state.app_version:
+            state["app_version"] = config_state.app_version
+
+        local = sync_local(
+            archive,
+            source,
+            resolved,
+            options,
+            entities=entities,
+            policy=config_state.policy,
+            config=config_state,
+            session=read_session(
+                Path(config.session_file).expanduser()
+                if config.session_file
+                else resolved.session
+            ),
+        )
+    result.counts.update(local.counts)  # type: ignore[attr-defined]
+    result.failures.extend(local.failures)  # type: ignore[attr-defined]
+    result.interrupted = local.interrupted  # type: ignore[attr-defined]
+    return exit_code
+
+
 def _run_cloud(
     archive: Archive,
     resolved: object,
     config: Config,
     options: SyncOptions,
     result: object,
+    *,
+    explicit: bool = True,
 ) -> int:
     """Run the cloud pass, reporting rather than raising on failure.
 
@@ -475,6 +566,11 @@ def _run_cloud(
         config: This run's configuration.
         options: What this run was asked to do.
         result: The sync result, mutated with the cloud counts.
+        explicit: Whether the operator named this backend. A missing
+            credential is a failure when they asked for it by name and a
+            skipped line when it was merely included in ``all`` -- otherwise
+            the default reports a failure on every run for anyone who has not
+            signed in, which is how an operator learns to ignore failures.
 
     Returns:
         An exit code contribution, or 0.
@@ -494,7 +590,7 @@ def _run_cloud(
         credential = resolve_credential(session_path)
     except CloudAuthError as error:
         _say("cloud", redact(str(error)))
-        return EXIT_FAILURE if config.source in (SOURCE_CLOUD, SOURCE_BOTH) else EXIT_OK
+        return EXIT_FAILURE if explicit else EXIT_OK
 
     _say("cloud", f"using the token from {credential.origin}; never refreshing it")
     with CloudClient(credential, base_url=config.api_base) as client:
@@ -545,6 +641,127 @@ def _run_cloud(
     if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
         return EXIT_ADDITIVE_DRIFT
     return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+
+
+def _run_mcp(
+    archive: Archive,
+    config: Config,
+    options: SyncOptions,
+    result: object,
+    *,
+    explicit: bool = True,
+) -> int:
+    """Run the MCP pass, reporting rather than raising on failure.
+
+    Args:
+        archive: The destination archive.
+        config: This run's configuration.
+        options: What this run was asked to do.
+        result: The sync result, mutated with the MCP counts.
+        explicit: Whether the operator named this backend. Not being logged in
+            is an ordinary state, not an error, when MCP was merely included in
+            ``all``.
+
+    Returns:
+        An exit code contribution, or 0.
+    """
+    import httpx
+
+    from .mcp_api import McpClient, McpError
+    from .mcp_auth import McpAuthError, resolve_credential
+    from .mcp_schema import MCP_PIN, detect_mcp_drift, tool_shapes
+    from .sync_mcp import SOURCE_MCP as MCP_BACKEND
+    from .sync_mcp import sync_mcp
+
+    with httpx.Client(timeout=30.0) as auth_client:
+        try:
+            credential = resolve_credential(auth_client)
+        except McpAuthError as error:
+            _say("mcp", redact(str(error)))
+            return EXIT_FAILURE if explicit else EXIT_OK
+
+    _say("mcp", f"using the token from {credential.origin}")
+    try:
+        with McpClient(credential, endpoint=config.mcp_endpoint) as client:
+            counts = sync_mcp(archive, client, options)
+            failures = list(client.failures)
+            tools = list(client.tools)
+            server = dict(client.server)
+    except McpError as error:
+        _say("mcp", redact(str(error)))
+        return EXIT_FAILURE if explicit else EXIT_OK
+
+    state = archive.source_state(MCP_BACKEND)
+    drift = detect_mcp_drift(tools, server, state.get("tool_shapes"))
+    if not options.dry_run:
+        state["mcp_pin"] = {
+            "server": MCP_PIN.server,
+            "version": MCP_PIN.version,
+            "sha256": MCP_PIN.sha256,
+        }
+        state["tool_shapes"] = tool_shapes(tools)
+
+    for name, reason in failures:
+        _say("", f"mcp {name}: {redact(reason)}")
+    if drift.kind is not DriftClass.OK:
+        _say("mcp schema", drift.summary())
+
+    result.counts["mcp"] = counts  # type: ignore[attr-defined]
+    if drift.kind is DriftClass.BREAKING:
+        return EXIT_BREAKING_DRIFT
+    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+        return EXIT_ADDITIVE_DRIFT
+    return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """Authorize this tool against the MCP server.
+
+    The one command that mints a credential. Everything else in this tool
+    borrows the token Wispr Flow already holds; the MCP server is a separate
+    OAuth resource with a separate issuer that will not accept it.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Process exit code.
+    """
+    import httpx
+
+    from .mcp_auth import McpAuthError, login
+
+    print("wispr-export login", flush=True)
+    _say("server", _config(args).mcp_endpoint)
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            credential = login(client, announce=lambda line: print(line, flush=True))
+    except McpAuthError as error:
+        _say("failed", redact(str(error)))
+        return EXIT_FAILURE
+    _say("stored", str(paths.token_store_path()).replace(str(Path.home()), "~"))
+    _say("origin", credential.origin)
+    return EXIT_OK
+
+
+def cmd_logout(args: argparse.Namespace) -> int:
+    """Delete the stored MCP credential.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Process exit code.
+    """
+    from .mcp_auth import McpAuthError, forget
+
+    try:
+        removed = forget()
+    except McpAuthError as error:
+        _say("failed", redact(str(error)))
+        return EXIT_FAILURE
+    _say("logout", "credential removed" if removed else "nothing was stored")
+    return EXIT_OK
 
 
 def _entities(args: argparse.Namespace) -> tuple[str, ...]:
@@ -688,6 +905,95 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
     return EXIT_OK
 
 
+def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
+    """Handshake with the MCP server and report its tools against the pin.
+
+    The cheapest useful diagnostic this backend has: it completes the MCP
+    handshake, reads the advertised tool list, and calls nothing. Writes
+    nothing either -- not to the archive and not to Wispr Flow -- so it is safe
+    to run while diagnosing a broken archive.
+
+    Args:
+        args: Parsed arguments.
+        config: This run's configuration.
+
+    Returns:
+        Process exit code.
+    """
+    import httpx
+
+    from .mcp_api import READ_TOOLS, McpClient, McpError
+    from .mcp_auth import McpAuthError, resolve_credential
+    from .mcp_schema import MCP_PIN, detect_mcp_drift, pin_from_tools
+    from .sync_mcp import SOURCE_MCP as MCP_BACKEND
+
+    with httpx.Client(timeout=30.0) as auth_client:
+        try:
+            credential = resolve_credential(auth_client)
+        except McpAuthError as error:
+            print(f"  {redact(str(error))}")
+            return EXIT_SOURCE_UNREACHABLE
+
+    try:
+        with McpClient(credential, endpoint=config.mcp_endpoint) as client:
+            tools = list(client.tools)
+            server = dict(client.server)
+    except McpError as error:
+        print(f"  {redact(str(error))}")
+        return EXIT_SOURCE_UNREACHABLE
+
+    recorded = Archive(root=config.archive_dir).source_state(MCP_BACKEND)
+    drift = detect_mcp_drift(tools, server, recorded.get("tool_shapes"))
+    live = pin_from_tools(tools, server)
+    advertised = sorted(str(tool.get("name", "")) for tool in tools)
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "server": server,
+                    "pin": {
+                        "server": live.server,
+                        "version": live.version,
+                        "protocol_version": live.protocol_version,
+                        "tool_count": live.tool_count,
+                        "sha256": live.sha256,
+                    },
+                    "declared_pin": {
+                        "server": MCP_PIN.server,
+                        "version": MCP_PIN.version,
+                        "sha256": MCP_PIN.sha256,
+                    },
+                    "drift": drift.kind,
+                    "tools": advertised,
+                    "used": sorted(READ_TOOLS),
+                    "unavailable": list(drift.unavailable),
+                    "new_tools": list(drift.new_tools),
+                    "missing_tools": list(drift.missing_tools),
+                    "changed_schemas": list(drift.changed_schemas),
+                },
+                indent=2,
+            )
+        )
+        return EXIT_OK
+
+    print("wispr-flow-exporter schema (mcp)")
+    _say("server", f"{live.server or '?'} {live.version or ''}".strip())
+    _say("protocol", live.protocol_version or "?")
+    _say("pin", f"{live.sha256[:12]} (declared {MCP_PIN.sha256[:12]})")
+    _say("tools", f"{len(advertised)} advertised, {len(READ_TOOLS)} used")
+    for name in advertised:
+        mark = "use" if name in READ_TOOLS else "-- "
+        _say("", f"{mark} {name}")
+    _say("drift", drift.summary())
+
+    if drift.kind is DriftClass.BREAKING:
+        return EXIT_BREAKING_DRIFT
+    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+        return EXIT_ADDITIVE_DRIFT
+    return EXIT_OK
+
+
 def cmd_schema(args: argparse.Namespace) -> int:
     """Report the live schema against the declaration.
 
@@ -700,6 +1006,8 @@ def cmd_schema(args: argparse.Namespace) -> int:
     config = _config(args)
     if config.source == SOURCE_CLOUD:
         return _schema_cloud(args, config)
+    if config.source == SOURCE_MCP:
+        return _schema_mcp(args, config)
     resolved = paths.resolve(config.data_dir, config.db)
     if not resolved.db.exists():
         print(f"  no Wispr Flow database at {resolved.db}")
@@ -839,7 +1147,7 @@ def main(argv: list[str] | None = None) -> int:
             "--source",
             choices=SOURCE_CHOICES,
             default=None,
-            help="backend to use (default: auto — local, plus cloud when authorized)",
+            help="backend to use (default: all — local, cloud and mcp)",
         )
         target.add_argument(
             "--data-dir",
@@ -928,6 +1236,14 @@ def main(argv: list[str] | None = None) -> int:
         help="with --source cloud, also probe paths not yet adopted",
     )
     schema_parser.set_defaults(func=cmd_schema)
+
+    login_parser = sub.add_parser(
+        "login", help="authorize this tool against Wispr Flow's MCP server"
+    )
+    login_parser.set_defaults(func=cmd_login)
+
+    logout_parser = sub.add_parser("logout", help="delete the stored MCP credential")
+    logout_parser.set_defaults(func=cmd_logout)
 
     verify = sub.add_parser(
         "verify", help="check integrity and reconcile against the database"

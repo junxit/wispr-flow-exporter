@@ -14,9 +14,10 @@ This is a personal tool. Only the current `main` branch is supported.
 
 ## Scope and threat model
 
-`wispr-flow-exporter` is a read-only client for two Wispr Flow backends: the
-app's own store at `~/Library/Application Support/Wispr Flow/`, and the
-undocumented sync API at `api.wisprflow.ai`. It writes transcripts and dictation
+`wispr-flow-exporter` is a read-only client for three Wispr Flow backends: the
+app's own store at `~/Library/Application Support/Wispr Flow/`, the
+undocumented sync API at `api.wisprflow.ai`, and the remote MCP server at
+`api.wisprflow.ai/connect/mcp`. It writes transcripts and dictation
 history to disk, so the corpus it handles — rather than any protocol — is the
 thing worth defending.
 
@@ -40,8 +41,8 @@ spoke.
   top-level shape would miss it entirely.
 
   Only the cloud backend reads that file, lazily at the call site. The local
-  backend never opens it, and there is a regression test asserting that a
-  local-only export does not touch it.
+  backend never opens it, the MCP backend cannot reach it at all, and there
+  are regression tests asserting both.
 
   **Invariant:** no byte originating in `session.json` is ever written to a file
   this tool creates, printed to a stream it writes, or included in an exception
@@ -55,19 +56,58 @@ spoke.
   UUID cannot put an id into the state file. That is a privacy property first
   and a stability property second.
 
-- **The tool never refreshes the session.** Supabase GoTrue rotates refresh
-  tokens and detects reuse, so a second client calling the refresh endpoint with
-  the desktop app's token either revokes the app's session or races it. This
-  tool therefore reads the existing access token and **never calls
-  `/auth/v1/token`**. The honest cost is that cloud sync only works when the app
-  has refreshed recently; when the token has expired the correct behavior is to
-  stop and tell you to open Wispr Flow and re-run. No refresh code path exists
-  to be reached by accident.
+- **The tool never refreshes the *borrowed* session.** Supabase GoTrue rotates
+  refresh tokens and detects reuse, so a second client calling the refresh
+  endpoint with the desktop app's token either revokes the app's session or
+  races it. This tool therefore reads the existing access token and **never
+  calls `/auth/v1/token`**. The honest cost is that cloud sync only works when
+  the app has refreshed recently; when the token has expired the correct
+  behavior is to stop and tell you to open Wispr Flow and re-run. No refresh
+  code path exists to be reached by accident.
 
   The token is sent bare, as `Authorization: <token>`, with no `Bearer` scheme —
-  that is what the service accepts, measured against it. The redactor does not
-  depend on the scheme: it matches the JWT shape itself, so a bare token in a
-  log line or an exception is redacted exactly as a prefixed one was.
+  that is what the REST service accepts, measured against it. The redactor does
+  not depend on the scheme: it matches the JWT shape itself, so a bare token in
+  a log line or an exception is redacted exactly as a prefixed one was.
+
+- **One credential is minted, and it is not the app's.** The MCP backend is the
+  exception to "this tool never mints a credential", and the distinction is
+  worth stating precisely because it is what keeps the rule above intact.
+
+  `api.wisprflow.ai/connect/mcp` is an OAuth 2.0 protected resource whose
+  authorization server is `mcp-auth.wisprflow.com` — **a different issuer from
+  the desktop app's Supabase project**. Measured: it answers the borrowed token
+  with `401 invalid_token`, bare and as a Bearer. There is nothing to borrow, so
+  this backend registers a client of its own (dynamic registration, public
+  client, no secret) and holds its own token.
+
+  Refreshing *that* token cannot disturb the desktop app's session, because it
+  was never the app's session. So the invariant is restated rather than
+  abandoned:
+
+  > Never refresh a borrowed credential. A credential this tool minted for
+  > itself is its own to manage.
+
+  Enforced by test on both sides: `cloud_auth.py` still may not contain
+  `grant_type` or `/auth/v1/token`, and the four MCP modules may not reference
+  `read_access_token`, `cloud_auth`, the Supabase issuer, or `session.json` —
+  so the minting path cannot reach the borrowed one at all.
+
+- **Where the minted token lives.** `~/.config/wispr-flow-exporter/`
+  (`XDG_CONFIG_HOME` when set), file `0600` in a directory `0700`. Deliberately
+  **outside the archive**: an archive is the thing people copy to a backup drive
+  or hand to somebody else, and the property that it carries no credential is
+  the one that mattered when there was no token store at all. `wispr-export
+  logout` removes it. This is the only state this tool keeps outside an archive.
+
+  The login flow binds a one-shot HTTP listener on `127.0.0.1` — not `0.0.0.0` —
+  for the length of one browser round trip, and checks the `state` parameter
+  before using the code it receives.
+
+  Note that the two services want opposite header forms, and both were measured
+  rather than assumed: the REST API rejects `Bearer` and takes the token bare,
+  while the MCP resource advertises `bearer_methods_supported: ["header"]` and
+  takes only a Bearer.
 
 - **An endpoint denylist, asserted rather than intended.** The borrowed
   credential is the account's own, so it is entitled to do things this tool must
@@ -205,4 +245,6 @@ requests weekly.
 The dependency set is deliberately small. The store is SQLite and NDJSON, both of
 which the standard library reads, so the local export path pulls in nothing that
 parses untrusted bytes in C beyond the `sqlite3` module Python already ships.
-`httpx` is imported lazily and only by the cloud backend.
+`httpx` is imported lazily and only by the two remote backends; the MCP client
+is JSON-RPC written against it directly rather than an SDK, so no protocol
+implementation joins the audit surface.

@@ -75,10 +75,43 @@ def test_backup_databases_are_recognized() -> None:
     assert by_name.db_is_backup
 
 
-def test_there_is_no_credential_cache() -> None:
-    """Nothing mints a token, so nothing stores one.
+def test_the_credential_store_is_nowhere_near_an_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The one credential this tool stores must not travel with an archive.
 
-    A cache would be a second place a credential could live, and the whole
-    design of the cloud backend is that there is exactly one.
+    This replaces an older assertion that no token store existed at all. That
+    held while every backend borrowed the app's own token; the MCP server is a
+    separate OAuth resource with a separate issuer that rejects it, so there is
+    now exactly one credential this tool mints and keeps.
+
+    What mattered about the old rule survives intact and is what is asserted
+    here: an archive is the thing people copy to a backup drive or hand to
+    someone else, and no credential is inside one.
     """
-    assert not hasattr(paths, "token_store_path")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    store = paths.token_store_path()
+
+    assert store.parent.name == "wispr-flow-exporter"
+    assert store.name.endswith(".json")
+    # Not under any plausible archive root, including the default.
+    for archive in (Path("archive").resolve(), tmp_path / "archive"):
+        assert archive not in store.parents
+
+
+def test_the_credential_store_follows_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Somebody who set XDG_CONFIG_HOME meant it, macOS or not."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/tmp/xdg-example")
+
+    assert paths.token_store_path() == Path(
+        "/tmp/xdg-example/wispr-flow-exporter/mcp-token.json"
+    )
+
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    assert paths.token_store_path().parts[-3:] == (
+        ".config",
+        "wispr-flow-exporter",
+        "mcp-token.json",
+    )

@@ -2,8 +2,8 @@
 
 Local, incremental archive of Wispr Flow dictation history, meetings,
 transcripts, speakers and custom dictionary — read straight from the app's own
-SQLite store, with the sync API as a second backend for the data that never
-reaches disk.
+SQLite store, with the sync API and the remote MCP server as second and third
+backends for what never reaches disk, or no longer does.
 
 ## Why this exists
 
@@ -20,28 +20,40 @@ reaches disk.
 An archive that survives all of that has to be a separate artifact, on your
 disk, in formats you can still read in ten years.
 
-## Two backends
+## Three backends
 
-| | Local store | Sync API |
-| --- | --- | --- |
-| Source | `~/Library/Application Support/Wispr Flow/` | `api.wisprflow.ai` |
-| Auth | none | the app's existing Supabase session |
-| Network | none | required |
-| Dictation text | only when `localDataPolicy` records it | **no — see below** |
-| Dictation totals | no | yes (counts, durations, streaks, per-day activity) |
-| Meetings, notes, todos | yes | **no** — not readable, see below |
-| Meeting audio | yes, while the app still has it | no |
-| Stability | app schema, ~20 migrations/month | undocumented, unversioned |
-| Confirmed live | yes | yes, on app 1.6.721 |
+| | Local store | Sync API | MCP server |
+| --- | --- | --- | --- |
+| Source | `~/Library/Application Support/Wispr Flow/` | `api.wisprflow.ai` | `api.wisprflow.ai/connect/mcp` |
+| Auth | none | the app's existing Supabase session | OAuth, its own token — `wispr-export login` |
+| Network | none | required | required |
+| Dictation text | only when `localDataPolicy` records it | **no — see below** | **no** |
+| Dictation totals | no | yes (counts, durations, streaks, per-day activity) | no |
+| Meetings | yes | **no** — not readable | **yes, with transcripts** |
+| Notes | yes | **no** — not readable | yes |
+| Meeting audio | yes, while the app still has it | no | no |
+| Transcript fidelity | raw turns, speakers, timestamps | — | normalized plaintext only |
+| Stability | app schema, ~20 migrations/month | undocumented, unversioned | versioned, but no stability promise |
+| Confirmed live | yes | yes, on app 1.6.721 | yes, on `wispr-meetings` 1 |
 
-The local backend is the primary one and is fully functional on its own.
+The local backend is the primary one and is fully functional on its own. The two
+remote backends are reached only when you ask for them, and each announces
+itself before it makes a request.
 
-Both backends are now confirmed against a live account. For the cloud backend
-that meant finding out it had never worked: it sent `Authorization: Bearer
-<token>`, and the service accepts only the bare token, so every one of its nine
-endpoints returned `401`. It also had four wrong paths. Both are fixed, and 18
-endpoints are archived with their real status recorded. What that confirmation
-mostly established, though, is what the sync API *cannot* do — the next section.
+The MCP backend exists for one thing the other two cannot do: **recover a
+transcript the local store no longer has.** Wispr Flow garbage-collects meeting
+artifacts — on the machine this was developed against, only one of three
+meetings still had its recording — and MCP still serves the transcript. It is a
+*lower fidelity* source (normalized plaintext, no speaker attribution, no
+timestamps), so it never replaces a local rendering; it fills a gap and says so
+in the file it writes.
+
+All three are confirmed against a live account. For the cloud backend that meant
+finding out it had never worked: it sent `Authorization: Bearer <token>`, and
+the service accepts only the bare token, so every one of its nine endpoints
+returned `401`. It also had four wrong paths. Both are fixed, and 18 endpoints
+are archived with their real status recorded. What that confirmation mostly
+established, though, is what the sync API *cannot* do — the next section.
 
 ## The dictation-history caveat, up front
 
@@ -82,7 +94,12 @@ you said it.
 
 Meetings, notes and todos are not readable from the cloud either — the app syncs
 all three through write methods this tool does not issue. The local store is
-their only route, which is why it is the primary backend.
+their primary route; the MCP backend reaches meetings and notes, and is the only
+way to recover a transcript the local store has lost.
+
+The MCP server has no dictation access either, and Wispr Flow says so itself in
+the settings copy that describes it. Three independent confirmations now agree,
+so that question is closed.
 
 [MAINTENANCE.md](MAINTENANCE.md) records how each of these conclusions was
 reached, and how to re-check them when Wispr Flow updates.
@@ -99,13 +116,19 @@ flowchart TD
     end
     subgraph cloud["Cloud backend"]
         API["api.wisprflow.ai<br/>/api/v1/*"]
-        SESS["session.json<br/>read only, never refreshed"]
+        SESS["session.json<br/>borrowed, never refreshed"]
         SESS --> API
+    end
+    subgraph mcp["MCP backend"]
+        MCPS["/connect/mcp<br/>JSON-RPC, read tools only"]
+        TOK["~/.config token<br/>minted, separate issuer"]
+        TOK --> MCPS
     end
     DB --> NORM["normalize<br/>4 timestamp formats,<br/>speaker tokens, text cascade"]
     ND --> NORM
     CFG --> NORM
     API --> NORM
+    MCPS --> GAP["transcript.mcp.md<br/>only where local has none"]
     NORM --> RAW["raw/*.json + *.ndjson<br/>written FIRST, verbatim"]
     OGG --> MEDIA["media/ (0600)"]
     RAW --> MD["Markdown<br/>meeting.md, summary.md,<br/>transcript.refined.md"]
@@ -144,11 +167,11 @@ equivalent command line — before anything is written:
 $ wispr-export
   Wispr Flow data directory [auto-detect]:
   Archive directory [./archive]:
-  Backend  local / cloud / both [local]:
+  Backend  all / local / cloud / mcp / both [all]:
   Entities to archive [all]:
   ...
   Equivalent command:
-    wispr-export sync --source local --audio copy
+    wispr-export sync --source all --audio copy
   Proceed? [yes]:
 ```
 
@@ -159,7 +182,8 @@ Or pass the flags directly:
 # Never writes anything.
 uv run wispr-export doctor
 
-# Archive everything the local store holds.
+# Archive from every backend that is ready. Local always; cloud and MCP when
+# a credential exists for them.
 uv run wispr-export sync
 
 # Just meetings, verbosely.
@@ -177,16 +201,35 @@ uv run wispr-export render --force
 # Reconcile the archive against the database.
 uv run wispr-export verify --deep
 
-# Include the cloud backend. It is never reached otherwise, not even when a
-# valid session exists — it is an undocumented private API and calling it
-# should be a decision, not a default.
-uv run wispr-export sync --source both
+# Every backend that is ready. This is the default: local always, plus cloud
+# and MCP where a credential exists. Each run says which it will contact
+# before it contacts any of them, and one that is not authorized is skipped
+# rather than reported as a failure.
+uv run wispr-export sync --source all
+
+# Or name one. Naming a backend explicitly makes a missing credential an
+# error rather than a skip, which is what you want in a scripted run.
+uv run wispr-export sync --source local   # offline; touches no network at all
+uv run wispr-export sync --source cloud
+uv run wispr-export sync --source mcp
 ```
 
-There is no `login` and no `logout`. This tool never mints a credential of its
-own, so it has none to store or discard — it borrows the token Wispr Flow
-already holds, for the duration of one request. See *On the internal API*
-below.
+Two backends borrow and one mints. The local store needs no credential, and the
+sync API borrows the token Wispr Flow already holds for the duration of one
+request — neither has anything to store or discard.
+
+The MCP server is different: it is a separate OAuth resource with a separate
+issuer, and it rejects the borrowed token outright. So it gets `login` and
+`logout`, and it is the only thing in this tool that keeps a credential:
+
+```bash
+uv run wispr-export login    # opens a browser once; stores a token 0600
+uv run wispr-export logout   # deletes it
+```
+
+The token lives in `~/.config/wispr-flow-exporter/`, deliberately outside the
+archive, so an archive you copy or share still carries no credential. See *On
+the internal API* below.
 
 Every `sync` pulls whatever it has not pulled yet: each entity carries its own
 watermark, so a run reads only what changed. Re-running with nothing changed
@@ -211,6 +254,10 @@ archive/
     media/upload.ogg
   notes/  dictation/  dictionary/  calendar/  account/  tables/
   cloud/                        # one verbatim response per endpoint
+  mcp/                          # verbatim MCP responses, content-addressed
+    meetings/                   # meetings upstream has and the local store does not
+  meetings/…/transcript.mcp.md  # a transcript recovered when local had none
+  meetings/…/raw/mcp/           # its verbatim chunks and manifest
 ```
 
 Both backends record the Wispr Flow build that produced the archive
@@ -252,7 +299,9 @@ See `.env.example` for the full set. Precedence is **CLI flag > environment >
 | `doctor` | Report the source, schema, policy and archive. Writes nothing. |
 | `sync` | Archive new and changed data. |
 | `schema` | Show the live schema against the declaration. Writes nothing. |
+| `login` / `logout` | Authorize against the MCP server, or discard the token. The only credential this tool keeps. |
 | `schema --source cloud` | Probe the live API and report its response shapes against the declaration. `GET` only; writes nothing, to the archive or to Wispr Flow. Add `--candidates` to also probe paths not yet adopted. |
+| `schema --source mcp` | Handshake with the MCP server and report its tools against the pin. Calls no tool; writes nothing. |
 | `verify` | Check integrity and reconcile against the database. |
 | `render` | Re-render Markdown from archived payloads, with no source access. |
 
@@ -367,14 +416,17 @@ rm -rf archive/
 # Remove the virtualenv and caches.
 rm -rf .venv .pytest_cache
 
+# Remove the MCP credential (or run: wispr-export logout).
+rm -rf ~/.config/wispr-flow-exporter
+
 # Remove the whole checkout.
 cd .. && rm -rf wispr-flow-exporter
 ```
 
-Nothing is installed outside the checkout at all — this tool stores no
-credential of its own, so there is nothing else to clean up. It never modifies
-Wispr Flow's own data either, so uninstalling it leaves the app exactly as it
-was.
+One thing lives outside the checkout: the MCP credential, at
+`~/.config/wispr-flow-exporter/`. `wispr-export logout` removes it, or delete
+the directory. Nothing else is installed anywhere, and the tool never modifies
+Wispr Flow's own data, so uninstalling it leaves the app exactly as it was.
 
 ## Assumptions
 

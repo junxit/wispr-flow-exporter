@@ -31,6 +31,9 @@ _WISPR_VARS = (
     "WISPR_STRICT_SCHEMA",
     "WISPR_API_BASE",
     "WISPR_SESSION_FILE",
+    "WISPR_ACCESS_TOKEN",
+    "WISPR_MCP_ENDPOINT",
+    "WISPR_MCP_TOKEN",
 )
 
 
@@ -45,6 +48,11 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # own Wispr Flow store and reads real meetings; one did, and copied 15 MB
     # of real audio into a temp archive before this guard was added.
     monkeypatch.setenv("WISPR_DATA_DIR", str(tmp_path / "no-such-wispr-flow"))
+    # Point the credential store somewhere empty. The default source is now
+    # "all", so without this a test that runs sync would reach the live MCP
+    # server using whatever token the developer happens to have logged in with
+    # -- the same failure mode the data-directory guard above exists for.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-config"))
     monkeypatch.chdir(tmp_path)
 
 

@@ -209,7 +209,7 @@ def collect(defaults: Answers, *, reader=input, stream=None) -> Answers:
     )
     archive_dir = _ask("Archive directory", defaults.archive_dir, reader=reader)
     source = _ask_choice(
-        "Backend", defaults.source, ("local", "cloud", "both"), reader=reader
+        "Backend", defaults.source, ("all", "local", "cloud", "mcp", "both"), reader=reader
     )
     entities = _ask("Entities to archive", defaults.entities or "all", reader=reader)
     full = _ask_bool(

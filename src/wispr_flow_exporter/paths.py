@@ -11,10 +11,16 @@ Linux path from Electron's ``app.getPath("userData")`` convention; both are
 best-effort until someone runs the tool there, which is why ``WISPR_DATA_DIR``
 exists as an override.
 
-There is deliberately no credential cache here. This tool never mints a token
-of its own -- it borrows the one Wispr Flow already holds, for the duration of
-one request -- so there is nothing to store, and nothing that could travel with
-an archive someone backs up or hands to someone else.
+Two credentials, two rules. For the local store and the REST API this tool
+mints nothing: it borrows the token Wispr Flow already holds, for the duration
+of one request. The MCP server is a separate OAuth resource with a separate
+issuer, which will not accept that borrowed token, so for that one backend the
+tool registers itself and holds a token of its own.
+
+That token lives in :func:`token_store_path` -- deliberately outside the
+archive, so an archive someone backs up or hands to someone else still cannot
+carry a credential, which is the property that mattered when there was no
+token store at all.
 """
 
 from __future__ import annotations
@@ -26,6 +32,28 @@ from pathlib import Path
 
 APP_DIR_NAME = "Wispr Flow"
 DB_NAME = "flow.sqlite"
+TOOL_DIR_NAME = "wispr-flow-exporter"
+TOKEN_STORE_NAME = "mcp-token.json"
+
+
+def token_store_path() -> Path:
+    """Return where the MCP credential is kept.
+
+    The one piece of state this tool holds outside an archive. It is *not* in
+    the archive on purpose: an archive is the thing people copy to a backup
+    drive or hand to somebody else, and a credential that travelled with it
+    would be a disclosure every time.
+
+    Honors ``XDG_CONFIG_HOME`` where it is set, on macOS too -- somebody who has
+    gone to the trouble of setting it means it.
+
+    Returns:
+        Path to the token file. Neither it nor its parent is created here;
+        the caller writes through ``secure_io`` so the modes are right.
+    """
+    config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(config_home) if config_home else Path.home() / ".config"
+    return base.expanduser() / TOOL_DIR_NAME / TOKEN_STORE_NAME
 
 
 def default_data_dir() -> Path:

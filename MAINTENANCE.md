@@ -1,14 +1,17 @@
-# Maintaining the cloud backend
+# Maintaining the remote backends
 
 The local backend reads files Wispr Flow wrote to your disk. If it breaks, the
 schema moved, and `wispr-export schema` will tell you how.
 
-The cloud backend is different in kind. It talks to `api.wisprflow.ai`, which is
-the desktop app's own private interface: undocumented, unversioned, with no
-changelog, no deprecation policy and no promise that any of it still exists
-tomorrow. **This document is the price of reaching data that is otherwise
-unreachable.** Read it when something stops working, or after Wispr Flow
-updates.
+The two remote backends are different in kind. Most of this document is about
+the REST one, which is the more fragile; the MCP backend has its own section at
+the end.
+
+The cloud backend talks to `api.wisprflow.ai`, which is the desktop app's own
+private interface: undocumented, unversioned, with no changelog, no deprecation
+policy and no promise that any of it still exists tomorrow. **This document is
+the price of reaching data that is otherwise unreachable.** Read it when
+something stops working, or after Wispr Flow updates.
 
 Everything below was measured against **app 1.6.721** on macOS. Nothing in it is
 inferred from documentation, because there is none.
@@ -336,3 +339,129 @@ Probed and deliberately **not** archived, with the reason recorded in
 | `/api/v1/calendar/events/batch` | 422 | needs a request body |
 | `/api/v1/user_context` | 204 | empty |
 | `/api/v1/me/active-cost-center` | 404 | not a route |
+
+
+---
+
+# The MCP backend
+
+`api.wisprflow.ai/connect/mcp` is Wispr Flow's remote MCP server. Unlike the
+REST API it is a *product surface*: documented, versioned, and it declares its
+own capabilities. That makes it easier to maintain, and the runbook is shorter.
+
+It is also the only backend that holds a credential, which is the part worth
+being careful with.
+
+## When something breaks, in order
+
+### 1. Check the authorization
+
+```bash
+uv run wispr-export schema --source mcp
+```
+
+`401` almost always means the stored token expired and the refresh failed. Run
+`wispr-export login` again. Everything else the server says is passed through
+verbatim, including the reason.
+
+If the token store is confusing you, look at it — it is one small JSON file:
+
+```bash
+cat ~/.config/wispr-flow-exporter/mcp-token.json | python3 -c \
+  'import json,sys; print(sorted(json.load(sys.stdin)))'
+```
+
+It holds `client_id`, `issuer`, `access_token`, `refresh_token` and
+`expires_at`. `wispr-export logout` deletes it; the next `login` re-registers.
+
+### 2. Re-check the OAuth topology
+
+Every endpoint is discovered, never hardcoded, so a server that moves one is
+followed automatically. To see what it is advertising today:
+
+```bash
+# What resource, and which authorization server?
+curl -s https://api.wisprflow.ai/.well-known/oauth-protected-resource | python3 -m json.tool
+
+# What grants, and is dynamic registration still open?
+curl -s https://mcp-auth.wisprflow.com/.well-known/oauth-authorization-server | python3 -m json.tool
+```
+
+Measured on the build this was written against:
+
+| fact | value |
+| --- | --- |
+| resource | `https://api.wisprflow.ai/connect/mcp` |
+| authorization server | `https://mcp-auth.wisprflow.com` |
+| scopes | `openid offline_access` |
+| bearer method | header — and it takes **only** `Bearer`, unlike the REST API which takes only the bare token |
+| registration | dynamic, public client, no secret |
+| grant used | authorization code + PKCE S256, loopback redirect |
+
+**The device grant does not work, and the metadata says it does.**
+`grant_types_supported` advertises
+`urn:ietf:params:oauth:grant-type:device_code`, but registration refuses it —
+*"each value in grant_types must be one of the following values:
+authorization_code, refresh_token"* — and calling the device endpoint with a
+registered client answers *"Device authorization is not enabled for this
+application."* Both measured. If you are wondering why a command-line tool
+listens on a loopback port instead of printing a code, that is why. Re-test it
+occasionally; if it ever starts working, the listener can go.
+
+### 3. Re-check the tools
+
+`wispr-export schema --source mcp` prints every advertised tool, marks the ones
+this backend calls, and classifies drift the same four ways the other backends
+do. The pin covers each tool's **input schema**, so a renamed argument is
+reported before a single call is made.
+
+Severity is about what this tool needs, not the server's inventory: a server
+that adds tools is `additive`, one that drops or changes a tool in `READ_TOOLS`
+is `breaking`.
+
+To re-baseline, paste the values from `--json` into `MCP_PIN` in
+`mcp_schema.py`.
+
+### 4. The allowlist
+
+`READ_TOOLS` in `mcp_api.py` is the read-only guarantee. The client refuses to
+call anything not in it, and refuses to send any JSON-RPC method outside
+`initialize`, `notifications/initialized`, `tools/list` and `tools/call`. Both
+asserted by test.
+
+MCP is JSON-RPC over POST, so the REST backend's GET-only test cannot extend
+here — and should not be made to. What that test protects is *cannot mutate*,
+and the allowlist is the MCP-shaped form of it. If the server grows a write
+tool, absence from the table is what keeps it unreachable.
+
+## What cannot be reached
+
+**Dictation, again.** The MCP server does not expose it, and Wispr Flow says so
+in its own settings copy in every locale: *"Wispr MCP has no access to your
+dictation."* That is now the third independent confirmation, after the app's
+push/pull resource lists and the REST probe. Do not go looking a fourth time.
+
+## The rules that must not be relaxed
+
+- **The two credentials must not meet.** `cloud_auth` borrows the app's Supabase
+  token and must never refresh it. The MCP backend mints its own against a
+  different issuer, where refreshing is safe *because it is not the app's
+  session*. A test asserts the MCP modules cannot reference `read_access_token`,
+  `cloud_auth`, the Supabase issuer or `session.json` at all — so the minting
+  path cannot reach the borrowed one.
+- **The token never enters an archive.** It lives in `~/.config/`, and an
+  archive stays copyable without carrying a credential.
+- **Local wins on transcripts.** MCP returns normalized plaintext with no
+  speaker attribution and no timestamps. The gap-fill gate reads the archive's
+  own NDJSON from disk rather than trusting `index.json`, and a meeting with any
+  local transcript — refined *or* live — is left alone.
+- **The two ownership rules.** The MCP pass never creates a key under
+  `entities["meetings"]` and writes exactly one field into an existing one, the
+  reserved `"mcp"` sub-key; and every file it writes carries an `mcp` path
+  component or an `.mcp.md` suffix. Together these keep `_archive_meeting`'s
+  up-to-date check invariant under the MCP pass, which is what stops the two
+  backends rewriting each other's work forever. Asserted by
+  `test_the_pass_adds_no_meetings_key_and_only_the_mcp_subkey`.
+- **Upstream-only meetings stay under `mcp/`.** Writing them into `meetings/`
+  would make `verify` count them against the database and report a mismatch on
+  every run, forever, on a healthy archive.

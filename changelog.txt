@@ -8,6 +8,104 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.3.0
+-----
+- Added a third backend over Wispr Flow's remote MCP server, and it is the
+  only one that reaches meeting content remotely. The REST API cannot:
+  meetings, notes and todos are synced by the app through write methods this
+  tool does not issue, so over REST they measure 404 and 405. MCP serves all
+  three with transcripts, filtered by modification time and paginated.
+- The point of it is recovering a transcript the local store no longer has.
+  Wispr Flow garbage-collects meeting artifacts -- only one of three meetings
+  on the development machine still had its recording -- and MCP still serves
+  the text. Verified against a live account: a meeting directory with no
+  refined.ndjson and no live.ndjson recovered 32,995 characters, archived as
+  a verbatim chunk under raw/mcp/ with a manifest carrying the assembled
+  sha256, and rendered as transcript.mcp.md.
+- It is a lower-fidelity source and says so in the file it writes. MCP returns
+  normalized plaintext with no speaker attribution and no timestamps, where
+  the local NDJSON has both. So local wins wherever local has anything: the
+  gate reads the archive's own NDJSON from disk rather than trusting
+  index.json, and a meeting with either a refined or a live transcript is left
+  alone. Live counts because turns with timestamps beat flat prose.
+- The MCP server has no dictation access either. Wispr Flow states it in its
+  own settings copy, in every locale -- "Wispr MCP has no access to your
+  dictation" -- which is the third independent confirmation after the app's
+  push/pull resource lists and the REST probe. That question is closed.
+- This tool now mints one credential, and the rule it appeared to break is
+  restated rather than abandoned. The no-refresh rule exists because rotating
+  the borrowed Supabase token would sign the user out of the app being backed
+  up. The MCP server is a separate OAuth resource whose authorization server
+  is a different issuer, and it answers the borrowed token with 401
+  invalid_token, bare and as a Bearer -- so there is nothing to borrow.
+  Refreshing a token this tool minted for itself cannot touch the app's
+  session. Never refresh a borrowed credential; a minted one is its own to
+  manage. Tests assert both halves: cloud_auth still may not contain
+  grant_type, and the MCP modules may not reference read_access_token,
+  cloud_auth, the Supabase issuer or session.json at all.
+- The token lives in ~/.config/wispr-flow-exporter/, mode 0600 in a 0700
+  directory, deliberately outside the archive so an archive that is copied or
+  shared still carries no credential -- the property that mattered when there
+  was no token store at all. `login` and `logout` create and remove it. The
+  test asserting no token store could exist was replaced with tests asserting
+  where this one may live, rather than deleted.
+- The device grant is advertised and does not work. grant_types_supported
+  lists urn:ietf:params:oauth:grant-type:device_code, but dynamic registration
+  refuses it -- "each value in grant_types must be one of the following
+  values: authorization_code, refresh_token" -- and the device endpoint
+  answers "Device authorization is not enabled for this application" to a
+  client registered anyway. Both measured. So login is authorization code with
+  PKCE S256 over a one-shot listener bound to 127.0.0.1, not because a
+  listener was preferred but because it is the only grant open to a client
+  this tool can register.
+- MCP drift is pinned against what the server says about itself, which is
+  better than the cloud backend can do: server name, version, negotiated
+  protocol, and a digest over each tool's input schema, so a renamed argument
+  is reported before a call is made. Severity is about what this tool needs --
+  a server that adds tools is additive, one that drops or changes a tool in
+  READ_TOOLS is breaking. Measured: wispr-meetings 1, protocol 2025-06-18, 14
+  tools advertised, 8 used, pin 12849ed42255.
+- MCP is JSON-RPC over POST, so the REST backend's GET-only test cannot extend
+  to it and was not made to. What that test protects -- this tool cannot
+  change anything upstream -- is protected instead by an allowlist: only four
+  JSON-RPC methods are ever sent, and tools/call refuses any name outside
+  READ_TOOLS. A write tool the server grows tomorrow is unreachable by
+  absence.
+- Two ownership rules keep a third writer from corrupting the archive, and a
+  test enforces them because they are otherwise only a convention. The MCP
+  pass never creates a key under entities["meetings"] and writes exactly one
+  field into an existing one, the reserved "mcp" sub-key; and every file it
+  writes carries an mcp path component or an .mcp.md suffix. Together they
+  make _archive_meeting's up-to-date check invariant under the MCP pass, which
+  is what stops the two backends rewriting each other's work forever -- a loop
+  whose only symptom would be every meeting rewritten on every run.
+- Meetings that exist upstream and not locally are archived under mcp/ with
+  their own namespace rather than into meetings/. Writing them there would
+  make verify count them against the database and report a mismatch on every
+  run, permanently, on a healthy archive.
+- The zero-bytes invariant holds for all three backends together: a second
+  --source all run wrote no byte and moved no mtime anywhere in a real
+  archive. The MCP verbatim store is content-addressed and existence-gated
+  rather than compare-then-write, so a nonce in an envelope could not cause a
+  rewrite, and no request carries a parameter that moves on its own.
+- The default is now --source all: local always, plus cloud and MCP wherever a
+  credential exists. Every run prints which backends it will contact before
+  contacting any of them, and a backend included by "all" that is not
+  authorized is skipped rather than counted as a failure -- naming one
+  explicitly still makes a missing credential an error. Each --source now runs
+  exactly what it names; previously --source cloud also ran a full local sync
+  and required flow.sqlite to exist. "auto" is kept as local-only for anyone
+  who wants the previous default.
+- Fixed: the test environment isolation did not cover the MCP credential, so
+  once a token existed a default sync in the suite would have reached the live
+  server with the developer's own authorization -- the same failure mode as
+  the guard that exists because a test once copied 15 MB of real audio.
+  XDG_CONFIG_HOME and three environment variables are now cleared too, one of
+  which, WISPR_ACCESS_TOKEN, had been missing since before this release.
+- The response fingerprint machinery moved to drift.py, shared by both remote
+  backends rather than living in the cloud one and being imported sideways.
+- 471 tests, up from 447.
+
 0.2.0
 -----
 - The cloud backend never worked. Probed against the live service for the
