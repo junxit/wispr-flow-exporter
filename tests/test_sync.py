@@ -501,12 +501,13 @@ def test_notes_archive_as_markdown_beside_their_raw_payload(
     result = _run(archive, resolved)
 
     assert result.counts["notes"].written == 1
-    stem = archive.root / archive.entry("notes", NOTE_A)["path"]
-    assert (stem.parent / f"{stem.name}.md").is_file()
-    assert (stem.parent / f"{stem.name}.raw.json").is_file()
-    assert "murmur quota" in (stem.parent / f"{stem.name}.md").read_text(
-        encoding="utf-8"
-    )
+    # The index points at a file that exists, not at a bare stem: verification
+    # cannot check what it cannot resolve, and relocation cannot move it.
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    assert document.name.endswith(".md")
+    assert document.is_file()
+    assert document.with_suffix(".raw.json").is_file()
+    assert "murmur quota" in document.read_text(encoding="utf-8")
 
 
 def test_a_calendar_id_too_long_to_be_a_path_is_hashed(
@@ -1044,3 +1045,36 @@ def test_the_archived_profile_carries_no_credential(
     assert '"access_token"' not in body
     assert "refresh_token" not in body
     assert OWNER_EMAIL in body
+
+
+def test_a_retitled_note_moves_rather_than_duplicating(
+    scene: Callable[..., tuple],
+) -> None:
+    """A document record is several files sharing a stem, and all must move.
+
+    Indexing the bare stem made relocate find nothing to move, so a retitled
+    note was written under its new name while the old files stayed -- leaving
+    the archive holding two copies with no way to tell which was current.
+    """
+    archive, resolved, db = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+    original = archive.root / archive.entry("notes", NOTE_A)["path"]
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            'UPDATE "Notes" SET title = ?, modifiedAt = ? WHERE id = ?',
+            ("Renamed scratch", "2026-05-19 10:00:00.000 +00:00", NOTE_A),
+        )
+
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved)
+
+    assert result.counts["notes"].relocated == 1
+    assert not original.exists()
+    assert not original.with_suffix(".raw.json").exists()
+    moved = fresh.root / fresh.entry("notes", NOTE_A)["path"]
+    assert moved.is_file()
+    assert moved.with_suffix(".raw.json").is_file()
+    assert len(list((fresh.root / "notes").rglob("*.md"))) == 1

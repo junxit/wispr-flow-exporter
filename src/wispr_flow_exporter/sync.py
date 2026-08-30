@@ -50,6 +50,7 @@ from .secure_io import (
     file_digest,
     write_bytes_if_changed,
     secure_mkdir,
+    read_json,
     write_json_if_changed,
     write_ndjson_if_changed,
     write_text_if_changed,
@@ -64,6 +65,9 @@ AUDIO_LINK = "link"
 AUDIO_SKIP = "skip"
 
 # Every local pass, in the order a run walks them.
+# The sibling files that together make up one archived note.
+NOTE_SUFFIXES = (".md", ".raw.json")
+
 ENTITIES = (
     "meetings",
     "notes",
@@ -688,8 +692,8 @@ def sync_notes(
                 entry is not None
                 and entry.get("content_hash") == digest
                 and not options.full
-                and archive.existing_path("notes", key) == stem
-                and _document_paths(stem, ".md").is_file()
+                and archive.existing_path("notes", key)
+                == _document_paths(stem, ".md")
             ):
                 counts.unchanged += 1
                 continue
@@ -697,7 +701,7 @@ def sync_notes(
                 counts.written += 1
                 continue
 
-            if archive.relocate("notes", key, stem):
+            if archive.relocate_document("notes", key, stem, NOTE_SUFFIXES):
                 counts.relocated += 1
 
             wrote = write_json_if_changed(_document_paths(stem, ".raw.json"), data)
@@ -716,7 +720,10 @@ def sync_notes(
                 ),
             )
             fields: dict[str, Any] = {
-                "path": archive.relative(stem),
+                # The .md file, not the bare stem: an index path has to point
+                # at something that exists, or verification cannot check it and
+                # relocation cannot find it.
+                "path": archive.relative(_document_paths(stem, ".md")),
                 "title": title or None,
                 "created_at": created.isoformat() if created else None,
                 "content_hash": digest,
@@ -1263,3 +1270,79 @@ def sync_account(
     counts.written = 1 if wrote else 0
     counts.unchanged = 0 if wrote else 1
     return counts
+
+
+def rerender(archive: Archive, options: SyncOptions) -> SyncCounts:
+    """Rebuild every rendered document from what is already archived.
+
+    This is what the raw-before-render rule buys. Rendering is a pure function
+    of payloads that are already on disk, so a fixed template or a corrected
+    speaker map is applied without touching the source at all -- which matters
+    most in exactly the case the archive exists for, where Wispr Flow has since
+    deleted the transcript being re-rendered.
+
+    Args:
+        archive: The archive to rebuild in place.
+        options: What this run was asked to do; only ``full`` (rewrite even
+            when unchanged) and ``dry_run`` are consulted.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    for key, entry in sorted(archive.entries("meetings").items()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        counts.scanned += 1
+        directory = archive.existing_path("meetings", key)
+        if directory is None or not directory.is_dir():
+            counts.failed += 1
+            continue
+
+        data = read_json(directory / "raw" / "meeting.json", None)
+        if not isinstance(data, dict):
+            counts.failed += 1
+            continue
+
+        artifacts = MeetingArtifacts(
+            meeting_id=key,
+            directory=directory / "raw",
+            refined=_archived(directory / "raw" / "refined.ndjson"),
+            live=_archived(directory / "raw" / "live.ndjson"),
+            observations=_archived(
+                directory / "raw" / "speakers.observations.ndjson"
+            ),
+            audio=_archived(directory / "media" / "upload.ogg"),
+        )
+        if options.dry_run:
+            counts.written += 1
+            continue
+
+        record = Record(table="Meetings", key=key, data=data)
+        # audio="skip": the media file is already in the archive, and this
+        # pass must not need the source for anything at all.
+        wrote = _write_meeting_files(
+            archive,
+            directory,
+            record,
+            artifacts,
+            SyncOptions(audio=AUDIO_SKIP),
+            counts,
+        )
+        if options.full:
+            wrote = True
+        counts.written += 1 if wrote else 0
+        counts.unchanged += 0 if wrote else 1
+    return counts
+
+
+def _archived(path: Path) -> Path | None:
+    """Return a path when the archive actually holds that artifact.
+
+    Args:
+        path: Candidate file.
+
+    Returns:
+        The path, or ``None``.
+    """
+    return path if path.is_file() else None

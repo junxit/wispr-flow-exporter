@@ -33,7 +33,8 @@ from .store import Archive
 # Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
 # sync's is the backend key "wispr-local" that namespaces sync state.
 from .sync import SOURCE_LOCAL as LOCAL_BACKEND
-from .sync import SyncOptions, sync_local
+from .sync import SyncOptions, rerender, sync_local
+from .verify import verify_archive
 
 SOURCE_AUTO = "auto"
 SOURCE_LOCAL = "local"
@@ -399,6 +400,59 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check the archive's integrity and reconcile it with the source.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Process exit code.
+    """
+    config = _config(args)
+    resolved = paths.resolve(config.data_dir, config.db)
+    archive = Archive(root=config.archive_dir)
+
+    print("wispr-flow-exporter verify")
+    if resolved.db.exists():
+        with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
+            report = verify_archive(archive, source, deep=getattr(args, "deep", False))
+    else:
+        # Internal consistency does not need the source, so a missing app is
+        # a narrower check rather than a refusal.
+        _say("source", "absent; checking internal consistency only")
+        report = verify_archive(archive, None, deep=getattr(args, "deep", False))
+
+    for line in report.lines():
+        _say("", line)
+    return EXIT_OK if report.ok else EXIT_FAILURE
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    """Re-render Markdown from archived payloads, touching no source.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        Process exit code.
+    """
+    config = _config(args)
+    archive = Archive(root=config.archive_dir)
+    options = SyncOptions(
+        full=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        verbose=getattr(args, "verbose", False),
+    )
+
+    print("wispr-flow-exporter render")
+    counts = rerender(archive, options)
+    if not options.dry_run:
+        archive.save()
+    _say("", counts.line("meetings"))
+    return EXIT_FAILURE if counts.failed else EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``wispr-export`` command.
 
@@ -488,6 +542,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     sync.add_argument("-v", "--verbose", action="store_true", help="per-record output")
     sync.set_defaults(func=cmd_sync)
+
+    verify = sub.add_parser(
+        "verify", help="check integrity and reconcile against the database"
+    )
+    add_source(verify)
+    verify.add_argument(
+        "--deep",
+        action="store_true",
+        help="recompute archived digests instead of trusting the index",
+    )
+    verify.set_defaults(func=cmd_verify)
+
+    render_parser = sub.add_parser(
+        "render", help="re-render Markdown from archived payloads"
+    )
+    render_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="rewrite even when the rendered output is unchanged",
+    )
+    render_parser.add_argument(
+        "--dry-run", action="store_true", help="report without writing"
+    )
+    render_parser.add_argument("-v", "--verbose", action="store_true")
+    render_parser.set_defaults(func=cmd_render)
 
     args = parser.parse_args(argv)
 

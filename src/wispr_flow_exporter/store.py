@@ -29,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -379,6 +379,48 @@ class Archive:
             shutil.rmtree(destination) if destination.is_dir() else destination.unlink()
         shutil.move(str(current), str(destination))
         return True
+
+    def relocate_document(
+        self, entity: str, key: str, new_stem: Path, suffixes: Sequence[str]
+    ) -> bool:
+        """Move every file belonging to a document-layout record.
+
+        A document record is several sibling files sharing one stem, so there
+        is no single path to move. The index stores one of them; the stem is
+        recovered from it and each suffix moved in turn.
+
+        This exists because the obvious alternative silently failed: indexing
+        the bare stem made ``relocate`` find nothing to move, so a retitled
+        note was written under its new name while the old files stayed --
+        leaving the archive holding two copies with no way to tell which was
+        current.
+
+        Args:
+            entity: Archive directory name.
+            key: Record key.
+            new_stem: Where the record now belongs, without a suffix.
+            suffixes: Extensions that make up the record.
+
+        Returns:
+            ``True`` when anything was moved.
+        """
+        current = self.existing_path(entity, key)
+        if current is None:
+            return False
+        old_stem = current.parent / current.name.split(".", 1)[0]
+        if old_stem == new_stem:
+            return False
+
+        moved = False
+        for suffix in suffixes:
+            source = old_stem.parent / f"{old_stem.name}{suffix}"
+            if not source.exists():
+                continue
+            destination = new_stem.parent / f"{new_stem.name}{suffix}"
+            secure_mkdir(destination.parent)
+            source.replace(destination)
+            moved = True
+        return moved
 
     def mark_seen(
         self, entity: str, key: str, *, soft_deleted: bool, when: str
