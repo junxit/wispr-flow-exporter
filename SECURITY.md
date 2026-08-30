@@ -10,7 +10,10 @@ Please do not open a public issue for an undisclosed vulnerability.
 
 ## Supported versions
 
-This is a personal tool. Only the current `main` branch is supported.
+This is an unofficial side project, not affiliated with or endorsed by Wispr
+Flow, maintained best-effort by one person. Only the current `main` branch is
+supported, and "supported" means best-effort: reports are read and taken
+seriously, but there is no response-time commitment and no warranty.
 
 ## Scope and threat model
 

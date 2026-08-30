@@ -5,6 +5,24 @@ transcripts, speakers and custom dictionary — read straight from the app's own
 SQLite store, with the sync API and the remote MCP server as second and third
 backends for what never reaches disk, or no longer does.
 
+> ### Unofficial, unaffiliated, best-effort
+>
+> **This is not a Wispr Flow product.** It is a side project, written and
+> maintained by one person for their own use, and nobody at Wispr Flow has
+> reviewed, endorsed or supported it. There is no warranty and no support
+> obligation — if it breaks, it breaks, and fixing it is whoever-wants-to work.
+>
+> It is also built on ground that moves. Only one of its three backends reads
+> anything Wispr Flow published: the other two read an undocumented HTTP API and
+> a private SQLite schema, neither of which owes this tool stability. That is not
+> hypothetical — the sync API shipped here for a whole release unable to
+> authenticate at all, and the app has averaged roughly twenty schema migrations
+> a month. [MAINTENANCE.md](MAINTENANCE.md) exists because of it.
+>
+> So: **treat the archive as the valuable thing and this tool as replaceable.**
+> The output is plain Markdown, JSON and NDJSON precisely so it outlives the
+> code that wrote it. Keep the archive; expect to re-check the tool.
+
 ## Why this exists
 
 - **Wispr Flow deletes things.** `Meetings.transcriptDeletedAt` exists,
@@ -373,11 +391,12 @@ records the fact. They are reported as one line and are not counted as
 failures; a permanent `FAILED` on every run is how an operator learns to stop
 reading the word.
 
-`wispr-flow-exporter` is not affiliated with, endorsed by, or supported by Wispr
-Flow. It reads files that Wispr Flow wrote to your own disk, under your own
-account. Your use of Wispr Flow remains governed by their terms; you are
-responsible for your own compliance with them, and with the recording-consent law
-of your jurisdiction.
+Beyond the unaffiliated-side-project point made at the top, the practical
+consequence: this tool reads files Wispr Flow wrote to your own disk, and calls
+its services with your own credentials, under your own account. Your use of
+Wispr Flow remains governed by their terms. You are responsible for your own
+compliance with those, and with the recording-consent law of your jurisdiction —
+this tool cannot evaluate either for you.
 
 ## Security
 
