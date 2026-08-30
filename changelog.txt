@@ -12,5 +12,6 @@ Changelog
   Decided before the first commit, so this file never needs a relicensing
   entry.
 
-(Entries are added as each build step lands. This section is finalized, with
-measurements from a real run, when 0.1.0 is tagged.)
+(This section is written in full, with measurements from a real run, when
+0.1.0 is tagged. Until then the commit history is the record: each commit
+opens with the evidence that motivated it.)
