@@ -128,7 +128,15 @@ uv run wispr-export render --force
 
 # Reconcile the archive against the database.
 uv run wispr-export verify --deep
+
+# Include the cloud backend explicitly.
+uv run wispr-export sync --source both
 ```
+
+There is no `login` and no `logout`. This tool never mints a credential of its
+own, so it has none to store or discard — it borrows the token Wispr Flow
+already holds, for the duration of one request. See *On the internal API*
+below.
 
 Re-running `sync` with nothing changed upstream must write **zero bytes**. That
 is an asserted invariant, not an aspiration.
@@ -208,7 +216,13 @@ correct trade, and no refresh code path exists to be reached by accident.
 
 An undocumented endpoint can also change shape without notice, which is why the
 local store is the primary backend and the cloud backend is confined to three
-lazily-imported modules.
+lazily-imported modules — and why it archives responses **verbatim** under
+`cloud/`, one file per endpoint, rather than reshaping them into the local
+layout. Guessing at an unconfirmed schema would produce an archive that looks
+structured and is quietly wrong the first time a field is renamed. The client
+issues `GET` only; there is no code path that writes to Wispr Flow's servers,
+and a cloud pass that cannot reach one is reported without discarding a
+successful local run.
 
 `wispr-flow-exporter` is not affiliated with, endorsed by, or supported by Wispr
 Flow. It reads files that Wispr Flow wrote to your own disk, under your own
@@ -257,10 +271,10 @@ rm -rf .venv .pytest_cache
 cd .. && rm -rf wispr-flow-exporter
 ```
 
-Nothing is installed outside the checkout except an optional cached credential at
-`$XDG_STATE_HOME/wispr-flow-exporter/`, removed by `uv run wispr-export logout`.
-This tool never modifies Wispr Flow's own data, so uninstalling it leaves the app
-exactly as it was.
+Nothing is installed outside the checkout at all — this tool stores no
+credential of its own, so there is nothing else to clean up. It never modifies
+Wispr Flow's own data either, so uninstalling it leaves the app exactly as it
+was.
 
 ## Assumptions
 

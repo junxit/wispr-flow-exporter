@@ -462,11 +462,29 @@ def _write_meeting_files(
                 continue
             wrote |= _copy_if_changed(path, raw_dir / filename, counts)
 
-        if options.audio == AUDIO_COPY and artifacts.audio is not None:
+        if artifacts.audio is not None and options.audio != AUDIO_SKIP:
             size = artifacts.size_of("audio")
-            if size <= options.max_audio_mb * 1024 * 1024:
+            too_large = size > options.max_audio_mb * 1024 * 1024
+            if options.audio == AUDIO_COPY and not too_large:
                 wrote |= _copy_if_changed(
                     artifacts.audio, destination / "media" / "upload.ogg", counts
+                )
+            else:
+                # link mode, or a file over the cap. The archive records that
+                # the recording existed, where it was and what it hashed to,
+                # so a later run or a human can still find it -- while being
+                # honest that this archive does not contain it. Wispr Flow
+                # garbage-collects meeting audio, so that pointer may already
+                # be dangling, which is exactly why copy is the default.
+                wrote |= write_json_if_changed(
+                    raw_dir / "audio.json",
+                    {
+                        "archived": False,
+                        "reason": "over max_audio_mb" if too_large else "link mode",
+                        "source_path": str(artifacts.audio),
+                        "bytes": size,
+                        "sha256": file_digest(artifacts.audio),
+                    },
                 )
 
     title = data.get("title") if isinstance(data.get("title"), str) else ""

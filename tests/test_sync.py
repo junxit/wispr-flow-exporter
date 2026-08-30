@@ -391,15 +391,6 @@ def test_audio_can_be_skipped(scene: Callable[..., tuple]) -> None:
     assert not (archive.root / entry["path"] / "media").exists()
 
 
-def test_audio_over_the_cap_is_not_copied(scene: Callable[..., tuple]) -> None:
-    """A single enormous recording must not silently fill the disk."""
-    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(4096))
-    _run(archive, resolved, max_audio_mb=0)
-
-    entry = archive.entry("meetings", MEETING_A)
-    assert not (archive.root / entry["path"] / "media").exists()
-
-
 def test_a_malformed_meeting_id_is_refused_not_archived(
     scene: Callable[..., tuple],
 ) -> None:
@@ -1078,3 +1069,45 @@ def test_a_retitled_note_moves_rather_than_duplicating(
     assert moved.is_file()
     assert moved.with_suffix(".raw.json").is_file()
     assert len(list((fresh.root / "notes").rglob("*.md"))) == 1
+
+
+def test_link_mode_records_the_recording_without_copying_it(
+    scene: Callable[..., tuple],
+) -> None:
+    """An archive must be honest about what it chose not to contain.
+
+    Wispr Flow garbage-collects meeting audio, so this pointer may already be
+    dangling -- which is exactly why copy is the default.
+    """
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(2048))
+    _run(archive, resolved, audio="link")
+
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    assert not (directory / "media").exists()
+    record = json.loads((directory / "raw" / "audio.json").read_text(encoding="utf-8"))
+    assert record["archived"] is False
+    assert record["reason"] == "link mode"
+    assert record["bytes"] == 2052
+    assert len(record["sha256"]) == 64
+
+
+def test_audio_over_the_cap_records_why_it_was_skipped(
+    scene: Callable[..., tuple],
+) -> None:
+    """Silently omitting a large recording would be the worst of both."""
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(4096))
+    _run(archive, resolved, max_audio_mb=0)
+
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    record = json.loads((directory / "raw" / "audio.json").read_text(encoding="utf-8"))
+    assert record["reason"] == "over max_audio_mb"
+
+
+def test_skip_mode_records_nothing_at_all(scene: Callable[..., tuple]) -> None:
+    """Asking for no audio means no audio, and no pointer either."""
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(2048))
+    _run(archive, resolved, audio="skip")
+
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    assert not (directory / "media").exists()
+    assert not (directory / "raw" / "audio.json").exists()

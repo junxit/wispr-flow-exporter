@@ -75,23 +75,10 @@ def test_backup_databases_are_recognized() -> None:
     assert by_name.db_is_backup
 
 
-def test_token_store_is_outside_the_archive(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Credentials cache under XDG_STATE_HOME, never in the archive.
+def test_there_is_no_credential_cache() -> None:
+    """Nothing mints a token, so nothing stores one.
 
-    The archive is something an operator may back up or sync to another
-    machine; a credential must not travel with it.
+    A cache would be a second place a credential could live, and the whole
+    design of the cloud backend is that there is exactly one.
     """
-    monkeypatch.delenv("WISPR_TOKEN_FILE", raising=False)
-    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/state")
-    assert paths.token_store_path() == Path(
-        "/tmp/state/wispr-flow-exporter/session.json"
-    )
-
-
-def test_token_store_honors_an_explicit_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """WISPR_TOKEN_FILE wins over the XDG default."""
-    monkeypatch.setenv("WISPR_TOKEN_FILE", "/tmp/custom/creds.json")
-    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/state")
-    assert paths.token_store_path() == Path("/tmp/custom/creds.json")
+    assert not hasattr(paths, "token_store_path")

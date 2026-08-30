@@ -1,4 +1,4 @@
-"""Locations of Wispr Flow's store, and of this tool's own credential cache.
+"""Where Wispr Flow keeps its store on each platform.
 
 This is the only module that branches on the operating system. Everything else
 takes a resolved ``WisprPaths`` and stays platform-agnostic, so porting beyond
@@ -11,9 +11,10 @@ Linux path from Electron's ``app.getPath("userData")`` convention; both are
 best-effort until someone runs the tool there, which is why ``WISPR_DATA_DIR``
 exists as an override.
 
-The credential cache deliberately does **not** live inside the archive. The
-archive is something an operator may back up, sync to another machine or hand
-to someone else, and credentials must not travel with it.
+There is deliberately no credential cache here. This tool never mints a token
+of its own -- it borrows the one Wispr Flow already holds, for the duration of
+one request -- so there is nothing to store, and nothing that could travel with
+an archive someone backs up or hands to someone else.
 """
 
 from __future__ import annotations
@@ -106,21 +107,3 @@ def resolve(data_dir: str | Path | None = None, db: str | Path | None = None) ->
         meetings=root / "meetings",
         backups=root / "backups",
     )
-
-
-def token_store_path() -> Path:
-    """Return where refreshed cloud credentials are cached.
-
-    Deliberately outside the archive: the archive is something an operator may
-    back up or sync, and a credential must not travel with it.
-
-    Returns:
-        Path to the credential cache, honoring ``WISPR_TOKEN_FILE`` and then
-        ``XDG_STATE_HOME``.
-    """
-    override = os.environ.get("WISPR_TOKEN_FILE", "").strip()
-    if override:
-        return Path(override).expanduser()
-    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
-    base = Path(state_home).expanduser() if state_home else Path.home() / ".local" / "state"
-    return base / "wispr-flow-exporter" / "session.json"

@@ -382,6 +382,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"  source unreadable: {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE
 
+    if config.source in (SOURCE_CLOUD, SOURCE_BOTH) or (
+        config.source == SOURCE_AUTO and _cloud_available(resolved, config)
+    ):
+        exit_code = _run_cloud(archive, resolved, config, options, result) or exit_code
+        archive.save()
+
     for entity, counts in result.counts.items():
         _say("", counts.line(entity))
         if counts.bytes_copied:
@@ -398,6 +404,77 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if options.dry_run:
         _say("", "dry run: nothing was written")
     return exit_code
+
+
+def _cloud_available(resolved: object, config: Config) -> bool:
+    """Report whether a cloud pass could run without prompting for anything.
+
+    Used only by ``--source auto``, which adds the cloud backend when a valid
+    session already exists and stays silent when it does not. A backup tool
+    should not start demanding credentials on its own.
+
+    Args:
+        resolved: Resolved source paths.
+        config: This run's configuration.
+
+    Returns:
+        ``True`` when a usable token is already available.
+    """
+    if os.environ.get("WISPR_ACCESS_TOKEN", "").strip():
+        return True
+    path = (
+        Path(config.session_file).expanduser()
+        if config.session_file
+        else resolved.session  # type: ignore[attr-defined]
+    )
+    info = read_session(path)
+    return info.present and not info.is_expired
+
+
+def _run_cloud(
+    archive: Archive,
+    resolved: object,
+    config: Config,
+    options: SyncOptions,
+    result: object,
+) -> int:
+    """Run the cloud pass, reporting rather than raising on failure.
+
+    The local archive is the primary artifact. A cloud backend that cannot
+    reach the server must not discard a successful local run.
+
+    Args:
+        archive: The destination archive.
+        resolved: Resolved source paths.
+        config: This run's configuration.
+        options: What this run was asked to do.
+        result: The sync result, mutated with the cloud counts.
+
+    Returns:
+        An exit code contribution, or 0.
+    """
+    from .cloud_api import CloudClient
+    from .cloud_auth import CloudAuthError, resolve_credential
+    from .sync_cloud import sync_cloud
+
+    session_path = (
+        Path(config.session_file).expanduser()
+        if config.session_file
+        else resolved.session  # type: ignore[attr-defined]
+    )
+    try:
+        credential = resolve_credential(session_path)
+    except CloudAuthError as error:
+        _say("cloud", redact(str(error)))
+        return EXIT_FAILURE if config.source in (SOURCE_CLOUD, SOURCE_BOTH) else EXIT_OK
+
+    _say("cloud", f"using the token from {credential.origin}; never refreshing it")
+    with CloudClient(credential, base_url=config.api_base) as client:
+        counts = sync_cloud(archive, client, options)
+        for name, reason in client.failures:
+            _say("", f"cloud {name}: {redact(reason)}")
+    result.counts["cloud"] = counts  # type: ignore[attr-defined]
+    return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
