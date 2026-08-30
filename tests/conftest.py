@@ -21,6 +21,15 @@ quarterly whisper budget.
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from wispr_flow_exporter.schema import EXPECTED
+
 # --- cast -----------------------------------------------------------------
 # example.invalid is reserved by RFC 2606 and can never resolve or route. This
 # is a deliberate divergence from granola-exporter, whose fixtures use a real
@@ -68,3 +77,105 @@ TITLE_AMPERSAND = "Murmur & Hush weekly"
 TITLE_EMPTY = ""
 TITLE_TRAVERSAL = "../../../../etc/passwd"
 TITLE_FRONTMATTER = "  \n---\ntitle: injected\n---  "
+
+# --- a real database ------------------------------------------------------
+# Two synthetic migrations, so no real migration name is embedded here. Tests
+# that need the pin to match compute it from this list rather than asserting a
+# hardcoded digest.
+DEFAULT_MIGRATIONS = ("00000000000001-init.js", "00000000000002-add-meetings.js")
+
+
+def _create_table(
+    table: str,
+    columns: Sequence[str],
+    primary_key: str | None,
+) -> str:
+    """Build a CREATE TABLE statement for a set of columns.
+
+    Column types are deliberately omitted. Nothing in this package reads a
+    declared type: binary is detected from the runtime value being ``bytes``,
+    and everything else is declared in ``schema.py``. Leaving columns untyped
+    also gives them no affinity, so values round-trip exactly as inserted
+    rather than being coerced by SQLite on the way in.
+
+    Args:
+        table: Table name.
+        columns: Column names, in order.
+        primary_key: Column to declare as the key, when it is still present.
+
+    Returns:
+        The statement.
+    """
+    quoted = [f'"{name}"' for name in columns]
+    if primary_key and primary_key in columns:
+        quoted.append(f'PRIMARY KEY("{primary_key}")')
+    return f'CREATE TABLE "{table}" ({", ".join(quoted)})'
+
+
+@pytest.fixture
+def wispr_db(tmp_path: Path) -> Callable[..., Path]:
+    """Build a real SQLite database matching the declared schema.
+
+    A stub object would not do here. The behavior under test *is* SQLite
+    metadata -- ``PRAGMA table_info`` is the drift detector's only input, and
+    read-only open semantics against a live WAL database are the whole risk
+    surface -- so faking it would fake the test.
+
+    Schema is generated from ``schema.EXPECTED`` rather than pasted from a
+    dump, which means the fixture cannot silently drift from the declaration
+    it exists to exercise. ``extra_columns``, ``drop_columns`` and
+    ``drop_tables`` deliberately reintroduce drift where a test wants it.
+
+    Returns:
+        A factory taking ``rows`` (table to list of row mappings) plus
+        optional ``migrations``, ``extra_columns``, ``drop_columns``,
+        ``drop_tables`` and ``extra_tables``, and returning the database path.
+    """
+
+    def build(
+        rows: Mapping[str, Iterable[Mapping[str, Any]]] | None = None,
+        *,
+        migrations: Sequence[str] = DEFAULT_MIGRATIONS,
+        extra_columns: Mapping[str, Sequence[str]] | None = None,
+        drop_columns: Mapping[str, Sequence[str]] | None = None,
+        drop_tables: Sequence[str] = (),
+        extra_tables: Mapping[str, Sequence[str]] | None = None,
+        name: str = "flow.sqlite",
+    ) -> Path:
+        path = tmp_path / name
+        connection = sqlite3.connect(path)
+        try:
+            for table, spec in EXPECTED.items():
+                if table in drop_tables:
+                    continue
+                columns = [
+                    column
+                    for column in spec.columns
+                    if column not in (drop_columns or {}).get(table, ())
+                ]
+                columns.extend((extra_columns or {}).get(table, ()))
+                connection.execute(_create_table(table, columns, spec.pk))
+
+            for table, columns in (extra_tables or {}).items():
+                connection.execute(_create_table(table, list(columns), None))
+
+            if "SequelizeMeta" not in drop_tables:
+                connection.executemany(
+                    'INSERT INTO "SequelizeMeta" ("name") VALUES (?)',
+                    [(entry,) for entry in migrations],
+                )
+
+            for table, records in (rows or {}).items():
+                for record in records:
+                    names = ", ".join(f'"{key}"' for key in record)
+                    marks = ", ".join("?" for _ in record)
+                    connection.execute(
+                        f'INSERT INTO "{table}" ({names}) VALUES ({marks})',
+                        tuple(record.values()),
+                    )
+            connection.commit()
+        finally:
+            connection.close()
+        return path
+
+    return build

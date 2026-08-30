@@ -154,6 +154,28 @@ class TableSpec:
             return tuple(available)
         return tuple(name for name in available if name not in self.screen_context)
 
+    def is_soft_deleted(self, row: Mapping[str, object]) -> bool:
+        """Report whether a row is tombstoned upstream.
+
+        Driven by the declaration rather than a hardcoded ``isDeleted``:
+        ``Todos`` tombstones with either ``isDeleted`` or ``isArchived``,
+        ``History`` uses ``isArchived`` alone, and ``NotetakerChats`` uses a
+        nullable ``deletedAt`` timestamp. A truthiness test covers all three,
+        since a non-null timestamp and a ``1`` are both truthy and an unset
+        flag is ``0`` or ``None``.
+
+        Note that a soft-deleted record is still archived and still rendered.
+        The flag records what upstream thinks, and never causes a deletion
+        here.
+
+        Args:
+            row: The record, keyed by column name.
+
+        Returns:
+            ``True`` when any declared tombstone column is set.
+        """
+        return any(bool(row.get(column)) for column in self.soft_delete)
+
 
 # Columns that flip without the record's content changing. Sequelize writes
 # most of these as part of its own sync bookkeeping; hashing them would mean
