@@ -38,7 +38,7 @@ from typing import Any
 from . import __version__
 from .normalize import slugify
 from .schema import Layout, TableSpec
-from .secure_io import read_json, secure_mkdir, write_json
+from .secure_io import read_json, secure_mkdir, write_json_if_changed
 
 INDEX_NAME = "index.json"
 STATE_NAME = ".sync-state.json"
@@ -359,14 +359,20 @@ class Archive:
     ) -> None:
         """Record that a key was present in the source on this run.
 
+        Deliberately does **not** stamp ``archived_at``. That field means "when
+        this record's content was last written", not "when it was last looked
+        at": stamping it on every pass would make index.json change on a run
+        that archived nothing, which breaks the guarantee that a no-op sync
+        rewrites nothing and makes every incremental backup re-upload it.
+
         Args:
             entity: Archive directory name.
             key: Record key.
             soft_deleted: Whether the source has tombstoned it.
-            when: ISO timestamp for the observation.
+            when: ISO timestamp, used only for a state transition.
         """
         state = STATE_SOFT_DELETED if soft_deleted else STATE_PRESENT
-        entry = self.put(entity, key, upstream_state=state, archived_at=when)
+        entry = self.put(entity, key, upstream_state=state)
         if soft_deleted:
             entry.setdefault("soft_deleted_since", when)
         else:
@@ -473,8 +479,10 @@ class Archive:
         self.index["tool_version"] = __version__
         self.state["schema_version"] = SCHEMA_VERSION
         self.state["tool_version"] = __version__
-        write_json(self.root / INDEX_NAME, self.index)
-        write_json(self.root / STATE_NAME, self.state)
+        # Compare-then-write, so a run that changed nothing leaves even the
+        # bookkeeping files' mtimes alone.
+        write_json_if_changed(self.root / INDEX_NAME, self.index)
+        write_json_if_changed(self.root / STATE_NAME, self.state)
 
     def count(self, entity: str | None = None) -> int:
         """Count archived records.

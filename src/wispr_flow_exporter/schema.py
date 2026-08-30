@@ -191,6 +191,17 @@ _PUSH_FLAGS = frozenset(
     }
 )
 
+# The modification timestamps are the *signal* that something changed, not the
+# change itself. Sequelize bumps modifiedAt whenever it touches a row, so a
+# background sync that only flips `synced` also moves modifiedAt -- and if the
+# digest counted it, every such sync would rewrite the record even though not
+# one word of its content moved. The watermark still reads these columns; the
+# content digest deliberately does not.
+_TOUCH_TIMES = frozenset({"modifiedAt", "updatedAt", "syncedAt"})
+
+_CHURN = _PUSH_FLAGS | _TOUCH_TIMES
+
+
 _MEETING_TIMESTAMPS: Mapping[str, TimestampKind] = {
     "createdAt": TimestampKind.SEQUELIZE,
     "modifiedAt": TimestampKind.SEQUELIZE,
@@ -274,7 +285,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "refineUploadFailureReason", "calendarOccurrenceStartAtUtc",
         ),
         required=frozenset({"id", "title", "createdAt", "modifiedAt"}),
-        volatile=_PUSH_FLAGS
+        volatile=_CHURN
         | {
             "refineRetries",
             "speakerArtifactRetries",
@@ -307,7 +318,7 @@ EXPECTED: Mapping[str, TableSpec] = {
         required=frozenset({"id", "title", "content", "createdAt", "modifiedAt"}),
         # searchableContent is a derived index of content; archiving both
         # doubles the text and makes every content edit look like two.
-        volatile=_PUSH_FLAGS | {"searchableContent", "contentPreview"},
+        volatile=_CHURN | {"searchableContent", "contentPreview"},
         timestamps=_SEQUELIZE_TIMES,
         soft_delete=("isDeleted",),
         date_column="createdAt",
@@ -361,7 +372,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "createdAt", "modifiedAt", "synced", "sortOrder",
         ),
         required=frozenset({"id", "title"}),
-        volatile=_PUSH_FLAGS | {"sortOrder"},
+        volatile=_CHURN | {"sortOrder"},
         timestamps=_SEQUELIZE_TIMES,
         soft_delete=("isDeleted", "isArchived"),
         date_column="createdAt",
@@ -394,7 +405,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "editedTextUnbounded",
         ),
         required=frozenset({"transcriptEntityId", "timestamp"}),
-        volatile=_PUSH_FLAGS | {"editedTextStatus", "editedTextAttempts"},
+        volatile=_CHURN | {"editedTextStatus", "editedTextAttempts"},
         timestamps={"timestamp": TimestampKind.SEQUELIZE},
         soft_delete=("isArchived",),
         date_column="timestamp",
@@ -423,7 +434,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "messageNumber", "app", "url", "tools", "screenshot", "axText",
             "axHTML", "needsUploading", "createdAt", "updatedAt",
         ),
-        volatile=_PUSH_FLAGS,
+        volatile=_CHURN,
         timestamps=_SEQUELIZE_TIMES,
         date_column="createdAt",
         json_columns=frozenset({"content", "tools"}),
@@ -458,7 +469,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "diffCount", "feedback", "usedProvider", "promptName",
             "shortcutKey", "instructHistoryId",
         ),
-        volatile=_PUSH_FLAGS,
+        volatile=_CHURN,
         timestamps=_SEQUELIZE_TIMES,
         date_column="createdAt",
     ),
@@ -491,7 +502,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "createdAt", "updatedAt", "instructSessionId", "sessionTurnIndex",
             "feedback", "editArtifact",
         ),
-        volatile=_PUSH_FLAGS,
+        volatile=_CHURN,
         timestamps=_SEQUELIZE_TIMES,
         date_column="createdAt",
         json_columns=frozenset(
@@ -584,7 +595,7 @@ EXPECTED: Mapping[str, TableSpec] = {
         pk="id",
         layout=Layout.SNAPSHOT,
         columns=("id", "preference", "filter", "needsUploading", "createdAt", "updatedAt"),
-        volatile=_PUSH_FLAGS,
+        volatile=_CHURN,
         timestamps=_SEQUELIZE_TIMES,
     ),
     "Automations": _spec(
@@ -601,7 +612,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "id", "type", "key", "title", "text", "isArchived", "isRead",
             "createdAt", "updatedAt", "synced",
         ),
-        volatile=_PUSH_FLAGS | {"isRead"},
+        volatile=_CHURN | {"isRead"},
         timestamps=_SEQUELIZE_TIMES,
         soft_delete=("isArchived",),
     ),
@@ -609,7 +620,7 @@ EXPECTED: Mapping[str, TableSpec] = {
         pk="id",
         layout=Layout.SNAPSHOT,
         columns=("id", "title", "needsUploading", "createdAt", "updatedAt"),
-        volatile=_PUSH_FLAGS,
+        volatile=_CHURN,
         timestamps=_SEQUELIZE_TIMES,
     ),
     "GranolaImportRun": _spec(

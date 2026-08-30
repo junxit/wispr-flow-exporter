@@ -161,3 +161,33 @@ def test_remove_stale_temp_sweeps_an_interrupted_run(tmp_path: Path) -> None:
 def test_remove_stale_temp_tolerates_a_missing_directory(tmp_path: Path) -> None:
     """Sweeping a directory that was never created is not an error."""
     assert remove_stale_temp(tmp_path / "nope") == 0
+
+
+def test_every_created_level_is_owner_only(tmp_path: Path) -> None:
+    """Intermediate directories must be 0700 too, not just the leaf.
+
+    Path.mkdir(parents=True, mode=...) applies the mode only to the final
+    directory. A real archive came out with meetings/, meetings/2026/ and
+    meetings/2026/08/ world-readable while every leaf was 0700 -- and those
+    directory names carry meeting titles and participant names.
+    """
+    old = os.umask(0)
+    try:
+        secure_mkdir(tmp_path / "meetings" / "2026" / "08" / "a-meeting")
+        for part in ("meetings", "meetings/2026", "meetings/2026/08",
+                     "meetings/2026/08/a-meeting"):
+            assert _mode(tmp_path / part) == DIR_MODE, f"{part} is not 0700"
+    finally:
+        os.umask(old)
+
+
+def test_existing_directories_are_left_alone(tmp_path: Path) -> None:
+    """Permissions on directories we did not create are not ours to change."""
+    existing = tmp_path / "given"
+    existing.mkdir(mode=0o755)
+    os.chmod(existing, 0o755)
+
+    secure_mkdir(existing / "ours")
+
+    assert _mode(existing) == 0o755
+    assert _mode(existing / "ours") == DIR_MODE

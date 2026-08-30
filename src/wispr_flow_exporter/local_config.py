@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,18 +86,34 @@ class Policy:
         """
         return self.local_data_policy != NEVER_STORE
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, previous: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Serialize for ``.sync-state.json``.
+
+        ``observed_at`` means "in force since", not "last checked". Carrying
+        the earlier timestamp forward while the values are unchanged is both
+        more useful -- it dates the policy rather than the run -- and keeps the
+        state file byte-identical across a sync that changed nothing.
+
+        Args:
+            previous: The policy block from an earlier run, if any.
 
         Returns:
             A JSON-serializable mapping.
         """
-        return {
+        current = {
             "local_data_policy": self.local_data_policy,
             "notetaker_transcript_retention": self.transcript_retention,
             "records_dictation": self.records_dictation,
             "observed_at": self.observed_at.isoformat(),
         }
+        if previous and all(
+            previous.get(key) == current[key]
+            for key in ("local_data_policy", "notetaker_transcript_retention")
+        ):
+            carried = previous.get("observed_at")
+            if isinstance(carried, str) and carried:
+                current["observed_at"] = carried
+        return current
 
 
 @dataclass(frozen=True, slots=True)

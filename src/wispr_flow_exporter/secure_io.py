@@ -36,19 +36,39 @@ CHUNK_SIZE = 1024 * 1024
 
 
 def secure_mkdir(path: Path) -> None:
-    """Create a directory tree, owner-accessible only.
+    """Create a directory tree, owner-accessible only at every level.
 
-    ``Path.mkdir(mode=...)`` is subject to the umask, so the mode is applied
-    explicitly afterwards.
+    ``Path.mkdir(parents=True, mode=...)`` applies the mode to the **leaf
+    only**; intermediate directories are created with the default permissions,
+    which is typically 0755. That was measured, not assumed: a real archive
+    came out with ``meetings/``, ``meetings/2026/`` and ``meetings/2026/08/``
+    world-readable while every leaf was 0700. The archive root being 0700
+    blocked traversal in that layout, but relying on one directory to hold the
+    guarantee is exactly the kind of accident that survives until someone
+    points the archive somewhere else.
+
+    Each level this call creates is therefore created and chmodded
+    individually. Directories that already existed are left alone -- their
+    permissions are not ours to change.
 
     Args:
         path: Directory to create.
     """
-    path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
-    try:
-        os.chmod(path, DIR_MODE)
-    except OSError:
-        pass
+    missing: list[Path] = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+
+    for target in reversed(missing):
+        target.mkdir(mode=DIR_MODE, exist_ok=True)
+        try:
+            # mkdir's mode is masked by the umask, so it is reapplied.
+            os.chmod(target, DIR_MODE)
+        except OSError:
+            pass
 
 
 def secure_write_text(path: Path, text: str) -> None:
@@ -132,6 +152,49 @@ def write_ndjson(path: Path, records: Iterable[Any]) -> int:
     secure_write_text(tmp, "".join(f"{line}\n" for line in lines))
     tmp.replace(path)
     return count
+
+
+def write_text_if_changed(path: Path, text: str) -> bool:
+    """Write text only when it differs from what is already there.
+
+    This is what makes "a re-run with no upstream change writes zero bytes" a
+    property of the code rather than of the calling logic being careful. The
+    hash short-circuits in ``sync`` avoid the work of rendering; this avoids
+    the write itself, so even a rendering change that happens to be a no-op
+    leaves mtimes alone.
+
+    Args:
+        path: Destination file.
+        text: Contents to write.
+
+    Returns:
+        ``True`` when the file was written.
+    """
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except (OSError, ValueError):
+        pass
+    secure_mkdir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    secure_write_text(tmp, text)
+    tmp.replace(path)
+    return True
+
+
+def write_json_if_changed(path: Path, payload: Any) -> bool:
+    """Write JSON only when it differs from what is already there.
+
+    Args:
+        path: Destination file.
+        payload: JSON-serializable value.
+
+    Returns:
+        ``True`` when the file was written.
+    """
+    return write_text_if_changed(
+        path, json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    )
 
 
 def copy_file_secure(src: Path, dest: Path) -> str:

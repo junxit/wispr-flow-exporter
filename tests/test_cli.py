@@ -40,6 +40,11 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _WISPR_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("WISPR_ARCHIVE_DIR", str(tmp_path / "archive"))
+    # Point the data directory at somewhere that does not exist. Without this,
+    # a test that forgets --data-dir silently falls through to the developer's
+    # own Wispr Flow store and reads real meetings; one did, and copied 15 MB
+    # of real audio into a temp archive before this guard was added.
+    monkeypatch.setenv("WISPR_DATA_DIR", str(tmp_path / "no-such-wispr-flow"))
     monkeypatch.chdir(tmp_path)
 
 
@@ -116,10 +121,14 @@ def test_screen_context_needs_a_second_flag() -> None:
     assert caught.value.code == 2
 
 
-def test_screen_context_with_the_acknowledgement_parses() -> None:
+def test_screen_context_with_the_acknowledgement_parses(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
     """With both flags, parsing succeeds and the command runs."""
-    with pytest.raises(NotImplementedError):
-        main(["sync", "--include-screen-context", "--i-understand"])
+    data_dir = _data_dir(tmp_path, wispr_db)
+    assert main(
+        ["sync", "--data-dir", str(data_dir), "--include-screen-context", "--i-understand"]
+    ) == EXIT_OK
 
 
 def test_an_invalid_source_is_rejected() -> None:

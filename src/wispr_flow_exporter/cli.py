@@ -29,6 +29,11 @@ from . import files_source, paths
 from .local_config import read_config, read_session, redact
 from .schema import EXPECTED, MIGRATION_PIN
 from .sqlite_source import DriftClass, SourceError, open_source
+from .store import Archive
+# Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
+# sync's is the backend key "wispr-local" that namespaces sync state.
+from .sync import SOURCE_LOCAL as LOCAL_BACKEND
+from .sync import SyncOptions, sync_local
 
 SOURCE_AUTO = "auto"
 SOURCE_LOCAL = "local"
@@ -316,7 +321,70 @@ def cmd_sync(args: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
-    raise NotImplementedError("sync lands in build step 9")
+    config = _config(args)
+    resolved = paths.resolve(config.data_dir, config.db)
+    if not resolved.db.exists():
+        print(f"  no Wispr Flow database at {resolved.db}")
+        return EXIT_SOURCE_UNREACHABLE
+
+    archive = Archive(root=config.archive_dir)
+    options = SyncOptions(
+        full=getattr(args, "full", False),
+        audio=config.audio,
+        max_audio_mb=config.max_audio_mb,
+        include_screen_context=config.include_screen_context,
+        include_blobs=config.include_audio_blobs or config.include_images,
+        verbose=getattr(args, "verbose", False),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+    exit_code = EXIT_OK
+    try:
+        with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
+            drift = source.detect_drift()
+            if drift.kind is not DriftClass.OK:
+                _say("schema", drift.summary())
+            if drift.kind is DriftClass.BREAKING:
+                # Raw archiving still completes; only renderers are affected.
+                # For an archival tool, failing loud must never mean failing
+                # closed, so this is reported and the pass continues.
+                exit_code = EXIT_BREAKING_DRIFT
+            elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+                exit_code = EXIT_ADDITIVE_DRIFT
+
+            state = archive.source_state(LOCAL_BACKEND)
+            config_state = read_config(resolved.config)
+            # Recorded on every run, so an archive that is empty because of a
+            # preference can prove which preference, and when it was in force.
+            state["policy"] = config_state.policy.as_dict(state.get("policy"))
+            state["sync_coordinator"] = config_state.sync_coordinator
+            state["migration_pin"] = {
+                "count": drift.live.count,
+                "latest": drift.live.latest,
+                "sha256": drift.live.sha256,
+            }
+
+            result = sync_local(archive, source, resolved, options)
+    except SourceError as error:
+        print(f"  source unreadable: {redact(str(error))}")
+        return EXIT_SOURCE_UNREACHABLE
+
+    for entity, counts in result.counts.items():
+        _say("", counts.line(entity))
+        if counts.bytes_copied:
+            _say("", f"{entity}: {_human_bytes(counts.bytes_copied)} of media copied")
+        if counts.failed:
+            exit_code = EXIT_FAILURE
+
+    if not config_state.policy.records_dictation:
+        _say("", "dictation: 0 records — localDataPolicy is never_store")
+
+    if result.interrupted:
+        _say("", "interrupted; progress was saved and the next run resumes")
+        return 130
+    if options.dry_run:
+        _say("", "dry run: nothing was written")
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -395,6 +463,16 @@ def main(argv: list[str] | None = None) -> int:
         "--strict-schema",
         action="store_true",
         help="exit 3 on additive schema drift instead of warning",
+    )
+    sync.add_argument(
+        "--full",
+        action="store_true",
+        help="ignore watermarks and re-check every record",
+    )
+    sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be written and touch nothing",
     )
     sync.add_argument("-v", "--verbose", action="store_true", help="per-record output")
     sync.set_defaults(func=cmd_sync)
