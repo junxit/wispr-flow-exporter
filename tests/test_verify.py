@@ -176,14 +176,52 @@ def test_verification_works_without_a_source(
     assert report.unarchived == []
 
 
-def test_a_tombstone_is_not_a_fault(archived: tuple[Archive, object]) -> None:
-    """A record upstream deleted is what the archive exists to keep."""
+def test_a_tombstone_is_not_a_fault(
+    archived: tuple[Archive, object], wispr_db: Callable[..., Path]
+) -> None:
+    """A record upstream deleted is what the archive exists to keep.
+
+    The bug this reproduces: the count check compared the source's rows
+    against every index entry, tombstones included. So the first time anything
+    was deleted upstream -- the case this whole tool is built around -- a
+    healthy archive reported "archive has problems" and `verify` exited 1,
+    permanently. An operator who sees that every run stops reading it, which is
+    the trap `--strict-schema` exists to avoid.
+
+    The old version of this test marked the record absent while the row was
+    still in the database, which no real run can produce, and asserted only the
+    tombstone count. That is why it passed while the archive it describes was
+    being reported as broken.
+    """
     archive, resolved = archived
+    # The record leaves the database entirely, and the archive keeps it.
+    wispr_db({"Meetings": []}).replace(resolved.db)  # type: ignore[attr-defined]
     archive.mark_absent("meetings", [], when="2026-09-01T00:00:00+00:00")
 
     report = _verify(archive, resolved)
 
     assert report.tombstoned == 1
+    assert report.counts == {}
+    assert report.ok
+
+
+def test_a_genuine_count_mismatch_still_fails(
+    archived: tuple[Archive, object], wispr_db: Callable[..., Path]
+) -> None:
+    """Reconciling tombstones must not blunt the check it lives in.
+
+    A record that vanished from the source *without* being tombstoned is a
+    real inconsistency and must still be reported, with the retained count
+    shown so the numbers visibly add up.
+    """
+    archive, resolved = archived
+    wispr_db({"Meetings": []}).replace(resolved.db)  # type: ignore[attr-defined]
+
+    report = _verify(archive, resolved)
+
+    assert report.counts["Meetings"] == (0, 1, 0)
+    assert not report.ok
+    assert any("0 in source, 1 archived" in line for line in report.lines())
 
 
 # --- render ---------------------------------------------------------------

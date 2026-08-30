@@ -1,6 +1,6 @@
 [project]
 name = "wispr-flow-exporter"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local, incremental archive of Wispr Flow dictation history, meetings, transcripts and dictionary."
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE.md"]

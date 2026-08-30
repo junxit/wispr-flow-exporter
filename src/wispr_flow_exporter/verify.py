@@ -50,7 +50,10 @@ class VerifyReport:
         stale_hashes: Entries whose archived payload no longer matches.
         untracked: Meeting directories on disk with no index entry.
         unarchived: Source records with no index entry.
-        counts: Tables whose source and archived totals disagree.
+        counts: Tables whose totals disagree, as
+            ``(in_source, archived, retained)``. The comparison is against
+            ``archived - retained``: a record the source dropped and the
+            archive kept is not a discrepancy.
         tombstoned: Entries upstream has deleted, kept deliberately.
         unresolved_tokens: Speaker mentions that could not be resolved.
     """
@@ -61,7 +64,7 @@ class VerifyReport:
     stale_hashes: list[str] = field(default_factory=list)
     untracked: list[str] = field(default_factory=list)
     unarchived: list[str] = field(default_factory=list)
-    counts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    counts: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     tombstoned: int = 0
     unresolved_tokens: int = 0
 
@@ -102,8 +105,13 @@ class VerifyReport:
                 shown = ", ".join(items[:5])
                 more = f" (+{len(items) - 5} more)" if len(items) > 5 else ""
                 out.append(f"{len(items)} {label}: {shown}{more}")
-        for table, (in_source, archived) in sorted(self.counts.items()):
-            out.append(f"{table}: {in_source} in source, {archived} archived")
+        for table, (in_source, archived, retained) in sorted(self.counts.items()):
+            line = f"{table}: {in_source} in source, {archived} archived"
+            if retained:
+                # Say what was already accounted for, or the numbers look like
+                # they simply fail to add up.
+                line += f" ({retained} kept after upstream deletion)"
+            out.append(line)
         if self.tombstoned:
             out.append(f"{self.tombstoned} deleted upstream, kept here")
         if self.unresolved_tokens:
@@ -198,6 +206,25 @@ def _check_untracked(archive: Archive, report: VerifyReport) -> None:
             report.untracked.append(archive.relative(candidate))
 
 
+def _retained(archive: Archive, entity: str) -> int:
+    """Count entries kept although the source no longer holds them.
+
+    Args:
+        archive: The archive.
+        entity: Archive directory name.
+
+    Returns:
+        How many entries are flagged as gone upstream. Uses ``entries``, which
+        is deliberately non-mutating, so counting an empty entity does not
+        create it in the index.
+    """
+    return sum(
+        1
+        for entry in archive.entries(entity).values()
+        if isinstance(entry, dict) and entry.get("upstream_state") == STATE_ABSENT
+    )
+
+
 def _check_against_source(
     archive: Archive, source: SqliteSource, report: VerifyReport
 ) -> None:
@@ -223,8 +250,14 @@ def _check_against_source(
             continue
         in_source = source.row_count(table)
         archived = len(archive.entries(entity))
-        if in_source != archived:
-            report.counts[table] = (in_source, archived)
+        # Records the source has dropped and the archive deliberately keeps do
+        # not belong in an equality check. Without this, the first time
+        # anything is deleted upstream the archive reports "problems" and exits
+        # non-zero forever, for doing exactly what this tool promises -- and an
+        # operator who sees that every run stops reading it.
+        retained = _retained(archive, entity)
+        if in_source != archived - retained:
+            report.counts[table] = (in_source, archived, retained)
 
     for table, entity in SNAPSHOT_ENTITIES:
         if table not in available:
@@ -233,4 +266,4 @@ def _check_against_source(
         archived = int(entry.get("records", 0)) if entry else 0
         in_source = source.row_count(table)
         if in_source != archived:
-            report.counts[table] = (in_source, archived)
+            report.counts[table] = (in_source, archived, 0)

@@ -8,6 +8,28 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.3.1
+-----
+- Fixed: verify reported a healthy archive as broken. The count check
+  compared the source's row count against every index entry, tombstones
+  included, so the first time anything was deleted upstream -- the case
+  this tool is built around -- verify printed "archive has problems" and
+  exited 1, permanently. Measured on a real archive holding one calendar
+  event Wispr Flow had dropped: 2 in source, 3 archived, exit 1. It now
+  compares against the archived count minus the records deliberately
+  retained, and says "archive is consistent" while still reporting
+  "1 deleted upstream, kept here".
+- The test named test_a_tombstone_is_not_a_fault did not assert that the
+  report was ok, only that the tombstone was counted, which is how the
+  bug survived a test written to catch it. Its setup was also
+  unreachable: it marked a record absent while the row was still in the
+  database. Both fixed, and a second test asserts a genuine count
+  mismatch still fails, so reconciling tombstones did not blunt the
+  check it lives in.
+- A count line now shows the retained figure when there is one, so the
+  numbers visibly add up rather than looking like arithmetic that
+  failed.
+
 0.3.0
 -----
 - Added a third backend over Wispr Flow's remote MCP server, and it is the
