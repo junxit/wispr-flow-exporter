@@ -317,8 +317,13 @@ def ensure_ignored(archive_dir: Path, *, stream=None) -> None:
         return
     repo = Path(top.stdout.strip())
 
+    # Checked against a file *inside* the archive rather than the directory
+    # itself. A gitignore pattern ending in "/" matches directories only, so
+    # asking about a path that does not exist yet reports "not ignored" -- and
+    # a first run into a fresh archive would then append a rule duplicating one
+    # already there, once per run.
     check = subprocess.run(
-        ["git", "-C", str(repo), "check-ignore", "-q", str(archive_dir)],
+        ["git", "-C", str(repo), "check-ignore", "-q", str(archive_dir / "index.json")],
         capture_output=True,
         check=False,
         timeout=10,

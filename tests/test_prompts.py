@@ -325,3 +325,23 @@ def test_the_existing_gitignore_is_appended_to_not_replaced(
     body = (repo / ".gitignore").read_text(encoding="utf-8")
     assert body.startswith("*.log\n")
     assert "/vault/" in body
+
+
+def test_a_directory_only_pattern_is_recognized_before_the_archive_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """"archive/" matches directories only, so a missing archive read as unignored.
+
+    A first run into a fresh archive then appended a rule duplicating one
+    already present -- once per run. The check asks about a file inside the
+    archive instead, which is the question that actually matters.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / ".gitignore").write_text("archive/\n", encoding="utf-8")
+
+    ensure_ignored(repo / "archive")  # deliberately not created
+
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == "archive/\n"
+    assert capsys.readouterr().out == ""
