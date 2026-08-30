@@ -30,9 +30,17 @@ disk, in formats you can still read in ten years.
 | Dictation history | only when `localDataPolicy` records it | yes |
 | Meeting audio | yes, while the app still has it | no |
 | Stability | app schema, ~20 migrations/month | undocumented, unversioned |
+| Confirmed live | yes | **not yet** — see below |
 
 The local backend is the primary one and is fully functional on its own. The
 cloud backend exists for one reason: see the next section.
+
+**The cloud backend has not been confirmed against the live service.** Its
+endpoint paths were read from strings in the application bundle, and its tests
+run against a mock transport — so its pacing, error handling and credential
+rules are verified while its response shapes are not. It archives whatever
+comes back verbatim, so an unconfirmed shape costs a rendering rather than the
+data.
 
 ## The dictation-history caveat, up front
 

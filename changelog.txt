@@ -66,6 +66,13 @@ Changelog
   issues GET only, responses are archived verbatim because the API is not a
   contract, and it is reached only on an explicit --source cloud or --source
   both -- never because a session happens to exist.
+- The cloud backend has not been confirmed against the live service. Its nine
+  endpoint paths were read from strings in the application bundle, and every
+  test exercises a mock transport or a protocol fake, so its request pacing,
+  error handling and credential rules are verified while its response shapes
+  are not. It is reached only on an explicit --source cloud or --source both,
+  and it archives whatever comes back verbatim, so an unconfirmed shape costs
+  a rendering rather than the data.
 - Security: archive files are written 0600 and directories 0700 at every
   level. Path.mkdir(parents=True, mode=...) applies its mode to the leaf only,
   which left meetings/, meetings/2026/ and meetings/2026/08/ world-readable in
