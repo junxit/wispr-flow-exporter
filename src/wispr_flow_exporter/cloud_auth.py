@@ -56,10 +56,17 @@ class Credential:
     def header(self) -> dict[str, str]:
         """Build the Authorization header for one request.
 
+        The token is sent bare, with no ``Bearer`` scheme. That is not a
+        stylistic choice: the desktop app sets ``Authorization`` to the raw
+        access token, and the server rejects the RFC 6750 form outright --
+        measured against the live service, the same token returns 200 bare and
+        401 with the prefix. Sending the correct-looking header would make the
+        whole backend silently unusable, which is exactly what it did.
+
         Returns:
             A single-entry mapping.
         """
-        return {"Authorization": f"Bearer {self.token}"}
+        return {"Authorization": self.token}
 
 
 def resolve_credential(session_path: Path) -> Credential:

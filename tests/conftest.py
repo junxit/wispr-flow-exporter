@@ -192,3 +192,24 @@ def wispr_db(tmp_path: Path) -> Callable[..., Path]:
         return path
 
     return build
+
+
+def archive_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
+    """Capture every archived file's mtime and contents.
+
+    Shared by both backends' zero-bytes tests. Comparing whole contents rather
+    than a digest also catches added and removed files, and walking the root
+    covers ``index.json`` and ``.sync-state.json`` -- a pass that rewrote its
+    own bookkeeping every run would otherwise slip through.
+
+    Args:
+        root: Archive root.
+
+    Returns:
+        Relative path to ``(mtime_ns, bytes)``.
+    """
+    return {
+        str(path.relative_to(root)): (path.stat().st_mtime_ns, path.read_bytes())
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }

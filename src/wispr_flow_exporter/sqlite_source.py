@@ -36,11 +36,14 @@ from .normalize import decode_json
 from .schema import (
     EXPECTED,
     MIGRATION_PIN,
+    DriftClass,
     Layout,
     SchemaPin,
     TableSpec,
     pin_from_migrations,
 )
+
+__all__ = ["DriftClass", "Drift", "SourceError", "SqliteSource", "open_source"]
 
 # A single value large enough to be a problem in memory. Meeting audio blobs
 # and screenshots are the realistic cases.
@@ -49,25 +52,6 @@ MAX_BLOB_BYTES = 256 * 1024 * 1024
 
 class SourceError(Exception):
     """The database could not be opened or read."""
-
-
-class DriftClass(StrEnum):
-    """How far the live schema has moved from the declaration.
-
-    Attributes:
-        OK: The pin matches exactly.
-        ADDITIVE: New migrations, tables or columns, with every required
-            column still present. The export completes.
-        BREAKING: A required column or an expected table is gone, or a primary
-            key changed. Raw archiving still completes; renderers are skipped.
-        STALE_SOURCE: Fewer migrations than declared -- an older database, such
-            as a backup or a restored copy.
-    """
-
-    OK = "ok"
-    ADDITIVE = "additive"
-    BREAKING = "breaking"
-    STALE_SOURCE = "stale_source"
 
 
 @dataclass(frozen=True, slots=True)

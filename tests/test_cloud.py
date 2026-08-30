@@ -17,7 +17,15 @@ import httpx
 import pytest
 
 from wispr_flow_exporter import cloud_auth
-from wispr_flow_exporter.cloud_api import ENDPOINTS, CloudClient, CloudError
+from wispr_flow_exporter.cloud_api import (
+    ALLOWED_PREFIXES,
+    CANDIDATES,
+    DENIED,
+    ENDPOINTS,
+    CloudClient,
+    CloudError,
+    EndpointResult,
+)
 from wispr_flow_exporter.cloud_auth import (
     Credential,
     CloudAuthError,
@@ -25,9 +33,14 @@ from wispr_flow_exporter.cloud_auth import (
 )
 from wispr_flow_exporter.store import Archive
 from wispr_flow_exporter.sync import SyncOptions
-from wispr_flow_exporter.sync_cloud import SOURCE_CLOUD, sync_cloud
+from wispr_flow_exporter.sync_cloud import (
+    SOURCE_CLOUD,
+    content_digest,
+    sync_cloud,
+    truncated,
+)
 
-from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL
+from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot
 
 CREDENTIAL = Credential(token=FAKE_JWT, origin="test")
 
@@ -67,6 +80,7 @@ class _Recorder:
         self.payloads = payloads
         self.asked: list[str] = []
         self.failures: list[tuple[str, str]] = []
+        self.results: dict[str, Any] = {}
 
     def fetch(self, name: str) -> Any:
         """Return a canned response.
@@ -135,7 +149,12 @@ def test_the_stored_session_is_used_when_valid(
 
     assert credential.token == FAKE_JWT
     assert credential.origin == "session.json"
-    assert credential.header() == {"Authorization": f"Bearer {FAKE_JWT}"}
+    # Bare, with no "Bearer" scheme. Measured against the live service: the
+    # same token returns 200 sent bare and 401 sent the way RFC 6750 says it
+    # should be. Sending the correct-looking header made every endpoint fail,
+    # which is how this backend shipped unusable and untested against reality.
+    assert credential.header() == {"Authorization": FAKE_JWT}
+    assert "Bearer" not in credential.header()["Authorization"]
 
 
 def test_an_expired_token_stops_rather_than_refreshing(
@@ -310,17 +329,31 @@ def test_an_unrecognized_shape_reports_an_unknown_count(tmp_path: Path) -> None:
 
 
 def test_a_second_cloud_pass_writes_nothing(tmp_path: Path) -> None:
-    """The zero-bytes invariant holds for the cloud backend too."""
+    """The zero-bytes invariant holds for the cloud backend too.
+
+    Measured over the whole archive rather than one file's mtime, which is what
+    this asserted before. The weaker check would have passed while the pass
+    rewrote index.json on every run, and the local backend's equivalent has
+    always compared everything.
+    """
     archive = Archive(root=tmp_path / "archive")
-    client = _Recorder({"notes": [{"id": "n-1"}]})
-    sync_cloud(archive, client, SyncOptions(), endpoints=("notes",))
-    before = (archive.root / "cloud" / "notes.json").stat().st_mtime_ns
+    client = _Recorder(
+        {"notes": [{"id": "n-1"}], "calendar": {"events": [], "serverTime": "t1"}}
+    )
+    names = ("notes", "calendar")
+    sync_cloud(archive, client, SyncOptions(), endpoints=names)
+    archive.save()
+    before = archive_snapshot(archive.root)
 
-    counts = sync_cloud(archive, client, SyncOptions(), endpoints=("notes",))
+    # A moved server clock must not count as a change; nothing else moved.
+    client.payloads["calendar"] = {"events": [], "serverTime": "t2"}
+    second = Archive(root=archive.root)
+    counts = sync_cloud(second, client, SyncOptions(), endpoints=names)
+    second.save()
 
-    assert counts.unchanged == 1
+    assert counts.unchanged == 2
     assert counts.written == 0
-    assert (archive.root / "cloud" / "notes.json").stat().st_mtime_ns == before
+    assert archive_snapshot(archive.root) == before
 
 
 def test_a_failed_endpoint_is_recorded_not_fatal(tmp_path: Path) -> None:
@@ -352,6 +385,88 @@ def test_a_dry_run_fetches_but_writes_nothing(tmp_path: Path) -> None:
 
 def test_the_endpoint_set_is_auditable_and_read_only() -> None:
     """Every endpoint this tool may touch is visible in one place."""
-    assert all(path.startswith("/api/v1/") for path in ENDPOINTS.values())
+    for table in (ENDPOINTS, CANDIDATES):
+        assert all(e.path.startswith(ALLOWED_PREFIXES) for e in table.values())
     assert "meetings" in ENDPOINTS
     assert "dictionary_personal" in ENDPOINTS
+
+
+def test_no_endpoint_reaches_a_denied_path() -> None:
+    """Some paths are off-limits however useful a future maintainer finds them.
+
+    The first is account deletion, which the borrowed credential is perfectly
+    entitled to call. The rest are other people's data. Asserted rather than
+    left to discipline, because the whole endpoint table was once wrong.
+    """
+    for table in (ENDPOINTS, CANDIDATES):
+        for name, endpoint in table.items():
+            assert not endpoint.path.startswith(DENIED), name
+
+
+def test_a_documented_failure_is_evidence_rather_than_an_alarm() -> None:
+    """Three endpoints are declared knowing they cannot answer.
+
+    Measured: /api/v1/meetings/ is 404 and the two */sync paths are 405,
+    because they answer only to a write method this tool does not issue. They
+    stay declared so a run records the fact, and they must not be counted as
+    failures -- a permanent FAILED on every run is how an operator learns to
+    stop reading the word.
+    """
+    assert ENDPOINTS["meetings"].expected_status == 404
+    assert ENDPOINTS["notes"].expected_status == 405
+    assert ENDPOINTS["todos"].expected_status == 405
+
+    archive = Archive(root=Path("/nonexistent"))
+    client = _Recorder({})
+    client.results = {
+        "notes": EndpointResult("notes", "/api/v1/notes/sync", 405, reason="HTTP 405")
+    }
+    counts = sync_cloud(
+        archive, client, SyncOptions(dry_run=True), endpoints=("notes",)
+    )
+
+    assert counts.failed == 0
+
+
+def test_an_unexpected_failure_is_still_counted() -> None:
+    """The exemption is for the documented status, not for failure generally."""
+    archive = Archive(root=Path("/nonexistent"))
+    client = _Recorder({})
+    client.results = {
+        "notes": EndpointResult("notes", "/api/v1/notes/sync", 500, reason="HTTP 500")
+    }
+    counts = sync_cloud(
+        archive, client, SyncOptions(dry_run=True), endpoints=("notes",)
+    )
+
+    assert counts.failed == 1
+
+
+def test_a_short_response_is_reported_not_absorbed() -> None:
+    """Four endpoints paginate, and archiving one page quietly would be a lie.
+
+    This tool does not page -- that needs a layout other than one verbatim file
+    per endpoint -- so the least it can do is notice. An archive that holds one
+    page and says nothing is indistinguishable from a complete one.
+    """
+    assert truncated({"notes": [], "has_more": True, "next_cursor": None})
+    assert truncated({"events": [], "nextCursor": "more"})
+    assert not truncated({"events": [], "nextCursor": None})
+    assert not truncated({"notes": [], "has_more": False})
+    assert not truncated([{"id": "n-1"}])
+
+
+def test_a_server_clock_does_not_rewrite_an_unchanged_archive() -> None:
+    """The calendar endpoints echo the server's clock into every response.
+
+    Measured: two consecutive runs differed in exactly one path, .serverTime,
+    which rewrote both files every time. The local backend has the same problem
+    with Sequelize's modifiedAt and answers it the same way -- archive the
+    value, exclude it from the digest that decides whether to write.
+    """
+    first = {"events": [{"id": "e-1"}], "serverTime": "2026-08-30T10:00:00Z"}
+    second = {"events": [{"id": "e-1"}], "serverTime": "2026-08-30T11:00:00Z"}
+    moved = {"events": [{"id": "e-2"}], "serverTime": "2026-08-30T11:00:00Z"}
+
+    assert content_digest(first) == content_digest(second)
+    assert content_digest(first) != content_digest(moved)

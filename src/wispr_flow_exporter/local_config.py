@@ -122,10 +122,20 @@ class LocalConfig:
 
     Attributes:
         policy: The storage preferences.
+        app_version: ``prefs.version`` -- the Wispr Flow build that wrote this
+            file. The private API is the desktop app's own interface, so this
+            is the only version number the cloud backend has to pin against,
+            and a future reader needs it to know which client build produced an
+            archive.
         preferences: ``prefs.user``, archived under ``account/``.
-        sync_coordinator: Wispr Flow's own per-entity watermark map. Archived
-            as provenance evidence, and a ready-made taxonomy of the entities
-            the cloud backend syncs.
+        sync_coordinator: Wispr Flow's own per-entity timestamp map. Archived
+            as provenance evidence and nothing more. It is *not* an inventory
+            of what the account holds: the app sends it as query parameters to
+            a sync-check endpoint and advances an entry only when the server
+            returns one, so entities still driven by the app's older per-entity
+            intervals sit at the epoch while holding real data. Reading it as a
+            taxonomy would understate the account by seven entities out of
+            eleven on the machine this was measured against.
         voice_profile: The account's voice profile, which lives only here.
         writing_samples: Saved writing samples, which live only here.
         polish_prompts: Saved rewrite prompts, which live only here.
@@ -133,6 +143,7 @@ class LocalConfig:
     """
 
     policy: Policy
+    app_version: str | None = None
     preferences: dict[str, Any] = field(default_factory=dict)
     sync_coordinator: dict[str, Any] = field(default_factory=dict)
     voice_profile: Any = None
@@ -172,12 +183,15 @@ def read_config(path: Path) -> LocalConfig:
         else {}
     )
 
+    version = prefs.get("version")
+
     return LocalConfig(
         policy=Policy(
             local_data_policy=user.get("localDataPolicy"),
             transcript_retention=user.get("notetakerTranscriptRetention"),
             observed_at=observed_at,
         ),
+        app_version=version if isinstance(version, str) and version else None,
         preferences=dict(user),
         sync_coordinator=dict(coordinator),
         voice_profile=payload.get("voiceProfile"),

@@ -27,20 +27,21 @@ disk, in formats you can still read in ten years.
 | Source | `~/Library/Application Support/Wispr Flow/` | `api.wisprflow.ai` |
 | Auth | none | the app's existing Supabase session |
 | Network | none | required |
-| Dictation history | only when `localDataPolicy` records it | yes |
+| Dictation text | only when `localDataPolicy` records it | **no — see below** |
+| Dictation totals | no | yes (counts, durations, streaks, per-day activity) |
+| Meetings, notes, todos | yes | **no** — not readable, see below |
 | Meeting audio | yes, while the app still has it | no |
 | Stability | app schema, ~20 migrations/month | undocumented, unversioned |
-| Confirmed live | yes | **not yet** — see below |
+| Confirmed live | yes | yes, on app 1.6.721 |
 
-The local backend is the primary one and is fully functional on its own. The
-cloud backend exists for one reason: see the next section.
+The local backend is the primary one and is fully functional on its own.
 
-**The cloud backend has not been confirmed against the live service.** Its
-endpoint paths were read from strings in the application bundle, and its tests
-run against a mock transport — so its pacing, error handling and credential
-rules are verified while its response shapes are not. It archives whatever
-comes back verbatim, so an unconfirmed shape costs a rendering rather than the
-data.
+Both backends are now confirmed against a live account. For the cloud backend
+that meant finding out it had never worked: it sent `Authorization: Bearer
+<token>`, and the service accepts only the bare token, so every one of its nine
+endpoints returned `401`. It also had four wrong paths. Both are fixed, and 18
+endpoints are archived with their real status recorded. What that confirmation
+mostly established, though, is what the sync API *cannot* do — the next section.
 
 ## The dictation-history caveat, up front
 
@@ -48,19 +49,43 @@ Wispr Flow has a privacy preference, `localDataPolicy`. When it is set to
 `never_store` — which may be enforced by your organization — **dictation history
 is never written to disk at all.** The `History` table is present but empty.
 
-This is not a bug in this tool, and it is the reason `doctor` reports the policy
-before you ever run a sync:
+**The server cannot give it back.** This was the reason the cloud backend was
+built, and it does not work: dictation is upload-only. Wispr Flow's own sync
+coordinator sorts its resources into a pull list and a push list, and `history`,
+`polish` and `instructHistory` are all in the push list. The records leave your
+machine and there is no endpoint that returns them. Nothing in the application
+bundle reads them back.
+
+So, plainly:
+
+> **If `localDataPolicy` is `never_store`, your past dictation text is not
+> archivable by this tool or any other. Change the preference in Wispr Flow, and
+> everything you dictate from that point on becomes archivable. What was already
+> said is gone.**
+
+`doctor` reports the policy before you ever run a sync, because an archive that
+silently contains no dictation is indistinguishable from a complete one — the
+worst failure mode an archival tool has:
 
 ```
 policy       : localDataPolicy = never_store   <-- DICTATION HISTORY IS NOT RECORDED
 ```
 
-An archive that silently contains no dictation is indistinguishable from a
-complete one, which is the worst failure mode an archival tool has. So the
-policy and the moment it was observed are recorded in `.sync-state.json`, and the
-archive can prove *why* it has no dictation for a given date range. Reaching that
-data requires either changing the preference in Wispr Flow (which only affects
-future dictations) or the cloud backend.
+The policy and the moment it was observed are recorded in `.sync-state.json`, so
+the archive can prove *why* it has no dictation for a given date range.
+
+What the cloud backend *can* reach is the aggregate shadow of that dictation:
+word counts, total duration, day and week streaks, words per minute, per-day
+activity, most-used and most-removed words. Five endpoints' worth, archived
+under `cloud/`. It is not what you said. It is the only surviving evidence that
+you said it.
+
+Meetings, notes and todos are not readable from the cloud either — the app syncs
+all three through write methods this tool does not issue. The local store is
+their only route, which is why it is the primary backend.
+
+[MAINTENANCE.md](MAINTENANCE.md) records how each of these conclusions was
+reached, and how to re-check them when Wispr Flow updates.
 
 ## How it works
 
@@ -177,14 +202,20 @@ control that works exactly until somebody scrolls.
 ```
 archive/
   index.json                    # machine index, namespaced per entity
-  .sync-state.json              # watermarks, schema pin, observed policy
+  .sync-state.json              # watermarks, pins, app version, observed
+                                # policy, per-endpoint response shapes
   meetings/2026/08/2026-08-21--<slug>--<uuid>/
     meeting.md summary.md notes.md
     transcript.refined.md transcript.live.md
     raw/…                       # verbatim JSON and NDJSON
     media/upload.ogg
   notes/  dictation/  dictionary/  calendar/  account/  tables/
+  cloud/                        # one verbatim response per endpoint
 ```
+
+Both backends record the Wispr Flow build that produced the archive
+(`prefs.version`, `1.6.721` here), because a future reader looking at these
+files otherwise has no way to tell which client wrote them.
 
 Frontmatter is Obsidian-friendly: `aliases` so `[[` autocomplete finds a meeting
 whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
@@ -220,13 +251,25 @@ See `.env.example` for the full set. Precedence is **CLI flag > environment >
 | --- | --- |
 | `doctor` | Report the source, schema, policy and archive. Writes nothing. |
 | `sync` | Archive new and changed data. |
-| `schema` | Show the live schema against the declaration. |
+| `schema` | Show the live schema against the declaration. Writes nothing. |
+| `schema --source cloud` | Probe the live API and report its response shapes against the declaration. `GET` only; writes nothing, to the archive or to Wispr Flow. Add `--candidates` to also probe paths not yet adopted. |
 | `verify` | Check integrity and reconcile against the database. |
 | `render` | Re-render Markdown from archived payloads, with no source access. |
 
 ## Known limitations
 
-- **Dictation history may be empty by policy.** See above.
+- **Dictation text may be permanently unrecoverable.** See above. Neither
+  backend can reach it once `localDataPolicy` is `never_store`.
+- **The cloud backend cannot enumerate meetings, notes or todos.** All three are
+  synced by the app through write methods this tool does not issue.
+- **Four cloud endpoints paginate and this tool does not page them.** It detects
+  the markers and reports `MORE RECORDS EXIST upstream than archived` rather
+  than archiving one page quietly. Every one returned a complete single page on
+  the account it was measured against, which is a fact about that account and
+  not a guarantee about yours.
+- **The sync API can change without notice, and will.** It is versioned only by
+  the desktop app's build number. [MAINTENANCE.md](MAINTENANCE.md) is the
+  runbook for when it moves.
 - **Schema drift is continuous.** Wispr Flow shipped 11 migrations in August, 21
   in July and 25 in June. The raw path is schema-driven — rows are dumped via
   `PRAGMA table_info`, so a column added in migration 150 is archived on the next
@@ -256,14 +299,30 @@ recently; when the token has expired, open Wispr Flow and re-run. That is the
 correct trade, and no refresh code path exists to be reached by accident.
 
 An undocumented endpoint can also change shape without notice, which is why the
-local store is the primary backend and the cloud backend is confined to three
+local store is the primary backend and the cloud backend is confined to four
 lazily-imported modules — and why it archives responses **verbatim** under
 `cloud/`, one file per endpoint, rather than reshaping them into the local
-layout. Guessing at an unconfirmed schema would produce an archive that looks
-structured and is quietly wrong the first time a field is renamed. The client
-issues `GET` only; there is no code path that writes to Wispr Flow's servers,
-and a cloud pass that cannot reach one is reported without discarding a
+layout. Guessing at a schema nobody publishes would produce an archive that
+looks structured and is quietly wrong the first time a field is renamed. The
+client issues `GET` only; there is no code path that writes to Wispr Flow's
+servers, and a cloud pass that cannot reach one is reported without discarding a
 successful local run.
+
+Because nothing upstream will announce a change, the cloud backend fingerprints
+every response's *structure* — field names and types, never values or counts —
+and stores the digest in `.sync-state.json`. A changed shape is then reported
+rather than silently absorbed, and classified the same four ways the local
+backend classifies schema drift: `ok`, `additive`, `breaking`, `stale_source`.
+Breaking drift still archives everything reachable and exits non-zero naming
+what broke. `wispr-export schema --source cloud` runs that check on its own,
+writing nothing. The procedure for acting on it is in
+[MAINTENANCE.md](MAINTENANCE.md).
+
+Three endpoints are declared knowing they cannot answer — `/api/v1/meetings/`
+returns `404`, and the two `*/sync` paths return `405` — so that every run
+records the fact. They are reported as one line and are not counted as
+failures; a permanent `FAILED` on every run is how an operator learns to stop
+reading the word.
 
 `wispr-flow-exporter` is not affiliated with, endorsed by, or supported by Wispr
 Flow. It reads files that Wispr Flow wrote to your own disk, under your own

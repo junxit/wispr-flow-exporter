@@ -45,8 +45,15 @@ spoke.
 
   **Invariant:** no byte originating in `session.json` is ever written to a file
   this tool creates, printed to a stream it writes, or included in an exception
-  message or traceback. The only place a bearer token may appear is an outbound
+  message or traceback. The only place the token may appear is an outbound
   `Authorization` header; it is held in a local and never stored.
+
+  This extends to the cloud backend's drift machinery. The per-endpoint
+  response fingerprints in `.sync-state.json` are digests of *structure* —
+  field names and types, with every value discarded and dictionary keys that do
+  not look like field names collapsed to `<dynamic>`, so a response keyed by
+  UUID cannot put an id into the state file. That is a privacy property first
+  and a stability property second.
 
 - **The tool never refreshes the session.** Supabase GoTrue rotates refresh
   tokens and detects reuse, so a second client calling the refresh endpoint with
@@ -56,6 +63,36 @@ spoke.
   has refreshed recently; when the token has expired the correct behavior is to
   stop and tell you to open Wispr Flow and re-run. No refresh code path exists
   to be reached by accident.
+
+  The token is sent bare, as `Authorization: <token>`, with no `Bearer` scheme —
+  that is what the service accepts, measured against it. The redactor does not
+  depend on the scheme: it matches the JWT shape itself, so a bare token in a
+  log line or an exception is redacted exactly as a prefixed one was.
+
+- **An endpoint denylist, asserted rather than intended.** The borrowed
+  credential is the account's own, so it is entitled to do things this tool must
+  never do. `DENIED` in `cloud_api.py` names path prefixes no endpoint may begin
+  with, and a test enforces it against both the archived table and the candidate
+  table:
+
+  - `/api/v1/support/` — **account deletion**. A `DELETE` here removes the
+    account. The `GET`-only rule already makes it unreachable; the denylist means
+    a future maintainer cannot make it reachable by widening one method.
+  - `/api/v1/sandbox-user/` — creates and destroys accounts.
+  - `/api/v1/enterprise/` — organization administration: members, invitations,
+    join requests, settings.
+  - `/api/v1/contacts`, `/api/v1/teams/` — other people.
+
+  One further endpoint answers, is not on the denylist, and is still deliberately
+  not archived: `/api/v1/referral/` returns the names of people this account
+  referred. It is third-party data with no archival value here, and the reason is
+  recorded next to the decision in `CANDIDATES`.
+
+- **Silent truncation, again, at the endpoint boundary.** Four cloud endpoints
+  paginate. This tool does not page them, so it detects the markers
+  (`has_more`, `next_cursor`, `nextCursor`) and reports loudly when a response
+  says it withheld records. An archive holding one page and saying nothing would
+  be indistinguishable from a complete one.
 
 - **Redaction is at the sink, not the source.** Every diagnostic stream — log
   lines, `--verbose` output, exception messages, the run summary — passes

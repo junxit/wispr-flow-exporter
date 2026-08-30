@@ -1,6 +1,117 @@
 Changelog
 =========
 
+0.2.0
+-----
+- The cloud backend never worked. Probed against the live service for the
+  first time, all nine endpoints returned 401. The cause was the
+  Authorization header: the service accepts the access token bare and
+  rejects the RFC 6750 form, so the same token returns 200 sent as
+  "Authorization: <token>" and 401 sent as "Authorization: Bearer
+  <token>". Every request the backend had ever been able to make was
+  refused, and no test could see it because every test ran against a mock
+  transport that never checked the header.
+- Four of the nine declared endpoints were also wrong, and the errors came
+  from how the paths were found. Extracting /api/v1/[a-z0-9_/-]+ from the
+  app bundle cannot tell a read from a write and truncates at the last
+  matched character, so it invented /api/v1/meetings/ out of the common
+  prefix of /api/v1/meetings/<id>/status -- measured 404 -- and it kept
+  /api/v1/notes/sync and /api/v1/todos/sync, which answer only to a write
+  method and measured 405. Matching the app's own request helper instead
+  yields the method with the path, which is the property that decides
+  whether this tool may call something at all.
+- Dictation history cannot be retrieved from the server, and this is the
+  finding rather than an obstacle. Wispr Flow's sync coordinator sorts its
+  resources into a pull list and a push list, and history, polish and
+  instructHistory are all in the push list; dictation leaves through
+  /history/upload and /api/v1/instruct_history/upload with no counterpart.
+  Nothing in the bundle reads it back. So when localDataPolicy is
+  never_store the text is gone, not withheld, and the tool's honest answer
+  is to change the preference in Wispr Flow and archive from that day
+  forward. The README says so at the top rather than implying it.
+- What the server does hold is the aggregate shadow of that dictation, and
+  it is worth having: word counts, total and non-empty durations, day and
+  week streaks, words per minute, per-day activity, and a derived profile
+  naming the most-used and most-removed word. Five endpoints, all
+  archived. Not a sentence anyone dictated.
+- ENDPOINTS now carries 18 entries with a status measured against the live
+  service rather than inferred, up from 9 inferred. Three of them are
+  declared knowing they cannot answer, so a run records the 404 and the two
+  405s as standing evidence -- reported as one line, and deliberately not
+  counted as failures, because a permanent FAILED on every run is how an
+  operator learns to stop reading the word. A change in those statuses is
+  reported loudly instead: if /api/v1/notes/sync ever answers a read, that
+  is news.
+- The zero-bytes invariant did not hold for the cloud backend and now does.
+  Two consecutive runs differed in exactly one path, .serverTime, which is
+  the server's clock echoed into the calendar responses; hashing it rewrote
+  both files every pass. The digest is now taken over a projection that
+  drops self-moving fields, exactly as the local backend excludes the
+  *PendingPush flags and modifiedAt, while the value is still archived
+  verbatim. The cloud zero-bytes test was also measuring one file's mtime,
+  which would have passed while index.json was rewritten every run; it now
+  compares mtime and contents across the whole archive like the local one.
+- Schema drift has a cloud analogue. CLIENT_PIN records the app build the
+  endpoint table was validated against, prefs.version, plus a digest over
+  the table; each response's structure is fingerprinted into
+  .sync-state.json; and the same four verdicts are reported for both
+  backends -- ok, additive, breaking, stale_source. Breaking drift still
+  archives everything reachable and exits non-zero naming what broke. The
+  fingerprint discards every value and is independent of list length, so a
+  new meeting is not drift and content cannot reach the state file: a
+  dictionary key that does not look like a field name collapses to
+  <dynamic>, so a response keyed by UUID cannot record an id.
+- Added `schema --source cloud`, the cloud half of the schema command. One
+  paced GET per endpoint, writing nothing to the archive or to Wispr Flow,
+  reporting status, shape and drift. `--candidates` also probes paths that
+  are not archived, which is how a maintainer checks what a new app build
+  exposes before adopting any of it.
+- Four cloud endpoints paginate and this tool does not page them. Each
+  returned one complete page on the account measured, which is a fact about
+  that account rather than a guarantee, so the markers are detected and a
+  short response is reported. Silent truncation is the one failure an
+  archival tool must not have.
+- Security: added an endpoint denylist asserted by test, covering
+  /api/v1/support/ -- which is account deletion, and which the borrowed
+  credential is entitled to call -- along with sandbox-user, enterprise
+  administration, contacts and teams. The GET-only rule already made them
+  unreachable; the denylist means widening one method cannot quietly make
+  them reachable again. /api/v1/referral/ answers and is deliberately not
+  archived: it returns the names of people this account referred.
+- Both backends now record the Wispr Flow build that produced the archive.
+  Nothing did before, so an archive could not say which client wrote it.
+- syncCoordinator.timestamps is not an inventory and is no longer described
+  as one. Seven of its eleven entries sat at the epoch, including notes and
+  todos, which have real data; it is a client-side validator map sent to
+  /api/v1/sync/check, and entries advance only when the server returns one.
+  The entities at the epoch are driven by the app's older per-entity
+  intervals, which keep separate watermarks in the same file --
+  prefs.user.lastNoteSyncTime was non-zero, proving notes had synced.
+  Reading that map as a taxonomy would understate the account by seven
+  entities out of eleven.
+- The GET endpoints do accept cursors -- since and cursor on calendar,
+  since on the insights heatmap, cursor on notetaker chats -- and the
+  client deliberately sends none of them. The archive keeps one verbatim
+  snapshot per endpoint, so a delta response would overwrite a whole
+  snapshot with a partial one, and the zero-bytes invariant already makes a
+  full re-fetch free on disk. The parameter names are recorded next to each
+  endpoint so the choice stays visible rather than looking like an omission.
+- Verbatim-only archiving stays, and for a better reason than caution. The
+  entities with a local shape to map into -- meetings, notes, todos -- are
+  exactly the ones no readable endpoint returns, and what remains reachable
+  has no local counterpart to merge with. There is nothing for a mapping
+  layer to do.
+- Fixed: a cloud endpoint that failed once kept last_error forever, because
+  the success path never cleared it. It now does, and an entry whose only
+  difference is a stale error is rewritten rather than skipped.
+- Added MAINTENANCE.md: what to re-check when Wispr Flow updates and in
+  what order, why the obvious rediscovery grep is wrong, how to tell a
+  readable endpoint from an upload-only one, what cannot be reached and
+  why, and the rules that must not be relaxed. This backend is built on an
+  interface with no stability promise, and the maintenance burden is the
+  price of reaching data that is otherwise unreachable.
+- 447 tests, up from 414.
+
 0.1.0
 -----
 - Initial implementation: a local, incremental archive of Wispr Flow's own

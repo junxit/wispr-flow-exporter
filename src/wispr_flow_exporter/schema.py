@@ -49,6 +49,31 @@ class Layout(StrEnum):
     SNAPSHOT = "snapshot"
 
 
+class DriftClass(StrEnum):
+    """How far a live source has moved from what this tool declares.
+
+    Shared vocabulary for both backends. The local backend classifies a SQLite
+    schema against ``MIGRATION_PIN``; the cloud backend classifies response
+    shapes against ``CLIENT_PIN``. Reporting the same four words for both is
+    what lets one habit cover both.
+
+    Attributes:
+        OK: The pin matches exactly.
+        ADDITIVE: New migrations, tables, columns or response fields, with
+            everything previously known still present. The export completes.
+        BREAKING: Something declared is gone -- a required column, an expected
+            table, a primary key, or an endpoint that stopped answering. Raw
+            archiving still completes; only interpretation is skipped.
+        STALE_SOURCE: The source is older than the declaration -- fewer
+            migrations than pinned, or an app build behind the pinned one.
+    """
+
+    OK = "ok"
+    ADDITIVE = "additive"
+    BREAKING = "breaking"
+    STALE_SOURCE = "stale_source"
+
+
 @dataclass(frozen=True, slots=True)
 class SchemaPin:
     """A fingerprint of the migrations applied to a database.

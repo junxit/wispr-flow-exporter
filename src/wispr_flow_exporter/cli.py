@@ -335,11 +335,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print("  WARNING: History is empty because localDataPolicy is")
         print(f'           "{policy.local_data_policy}". This is a Wispr Flow')
         print("           setting, not a failure of this tool. Dictation is")
-        print("           never written to disk under it, so a local sync")
-        print("           cannot recover past dictations -- only the cloud")
-        print("           backend can. The policy and the time it was observed")
-        print("           are recorded in the archive, so an empty dictation")
-        print("           history can be told apart from an unread one.")
+        print("           never written to disk under it, and the server has")
+        print("           no endpoint that reads it back, so PAST DICTATION")
+        print("           TEXT CANNOT BE RECOVERED -- by this tool or any")
+        print("           other. Change the setting in Wispr Flow and what you")
+        print("           dictate from then on becomes archivable. The cloud")
+        print("           backend can still reach the totals: word counts,")
+        print("           durations, streaks and per-day activity.")
+        print("           The policy and the time it was observed are recorded")
+        print("           in the archive, so an empty dictation history can be")
+        print("           told apart from an unread one.")
     return exit_code
 
 
@@ -401,6 +406,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 "latest": drift.live.latest,
                 "sha256": drift.live.sha256,
             }
+            # Which client build produced this archive. Recorded for both
+            # backends: a future reader looking at an archive cannot otherwise
+            # tell which Wispr Flow wrote the data it describes.
+            if config_state.app_version:
+                state["app_version"] = config_state.app_version
 
             result = sync_local(
                 archive,
@@ -469,9 +479,11 @@ def _run_cloud(
     Returns:
         An exit code contribution, or 0.
     """
-    from .cloud_api import CloudClient
+    from .cloud_api import ENDPOINTS, CloudClient
     from .cloud_auth import CloudAuthError, resolve_credential
-    from .sync_cloud import sync_cloud
+    from .cloud_schema import CLIENT_PIN, detect_cloud_drift, observe
+    from .sync_cloud import SOURCE_CLOUD as CLOUD_BACKEND
+    from .sync_cloud import sync_cloud, truncated
 
     session_path = (
         Path(config.session_file).expanduser()
@@ -487,9 +499,51 @@ def _run_cloud(
     _say("cloud", f"using the token from {credential.origin}; never refreshing it")
     with CloudClient(credential, base_url=config.api_base) as client:
         counts = sync_cloud(archive, client, options)
-        for name, reason in client.failures:
+        failures = list(client.failures)
+        results = dict(client.results)
+
+    app_version = read_config(resolved.config).app_version  # type: ignore[attr-defined]
+    state = archive.source_state(CLOUD_BACKEND)
+    drift = detect_cloud_drift(
+        results, state.get("endpoint_shapes"), ENDPOINTS, app_version
+    )
+    if not options.dry_run:
+        if app_version:
+            state["app_version"] = app_version
+        state["client_pin"] = {
+            "app_version": CLIENT_PIN.app_version,
+            "count": CLIENT_PIN.count,
+            "sha256": CLIENT_PIN.sha256,
+        }
+        state["endpoint_shapes"] = observe(results, state.get("endpoint_shapes"))
+
+    documented = set(drift.unreachable)
+    for name, reason in failures:
+        if name not in documented:
             _say("", f"cloud {name}: {redact(reason)}")
+    if documented:
+        # One line rather than one per endpoint. These are recorded in the
+        # archive either way; repeating them as errors every run is how the
+        # word stops meaning anything.
+        listed = ", ".join(f"{n} {results[n].status}" for n in sorted(documented))
+        _say("", f"cloud: unreachable as documented — {listed}")
+
+    short = sorted(n for n, r in results.items() if r.ok and truncated(r.payload))
+    if short:
+        # Never quiet about this. An archive that holds one page and says
+        # nothing is indistinguishable from a complete one.
+        _say("", f"cloud: MORE RECORDS EXIST upstream than archived — {', '.join(short)}")
+
+    if drift.kind is not DriftClass.OK:
+        _say("cloud schema", drift.summary())
+
     result.counts["cloud"] = counts  # type: ignore[attr-defined]
+    if drift.kind is DriftClass.BREAKING:
+        # Everything reachable was still archived. Failing loud must not mean
+        # failing closed for this backend either.
+        return EXIT_BREAKING_DRIFT
+    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+        return EXIT_ADDITIVE_DRIFT
     return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
 
 
@@ -528,6 +582,112 @@ def _entities(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(name for name in ENTITIES if name in chosen)
 
 
+def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
+    """Probe the live API and report its shapes against the declaration.
+
+    This is the cloud half of ``schema``: the same job the local half does with
+    ``PRAGMA table_info``, done with one paced ``GET`` per declared endpoint. It
+    writes nothing -- not to the archive and not to Wispr Flow -- so it is the
+    safe thing to run first after an app update.
+
+    Args:
+        args: Parsed arguments.
+        config: This run's configuration.
+
+    Returns:
+        Process exit code.
+    """
+    from .cloud_api import CANDIDATES, ENDPOINTS, CloudClient
+    from .cloud_auth import CloudAuthError, resolve_credential
+    from .cloud_schema import CLIENT_PIN, detect_cloud_drift, field_names, fingerprint
+    from .sync_cloud import SOURCE_CLOUD as CLOUD_BACKEND
+
+    resolved = paths.resolve(config.data_dir, config.db)
+    session_path = (
+        Path(config.session_file).expanduser()
+        if config.session_file
+        else resolved.session
+    )
+    try:
+        credential = resolve_credential(session_path)
+    except CloudAuthError as error:
+        print(f"  {redact(str(error))}")
+        return EXIT_SOURCE_UNREACHABLE
+
+    table = dict(ENDPOINTS)
+    if getattr(args, "candidates", False):
+        table.update(CANDIDATES)
+
+    with CloudClient(
+        credential, base_url=config.api_base, endpoints=table
+    ) as client:
+        for name in table:
+            client.fetch(name)
+        results = dict(client.results)
+
+    app_version = read_config(resolved.config).app_version
+    # Read for the baseline, never written. A report that mutated the archive
+    # would not be safe to run while diagnosing one.
+    recorded = Archive(root=config.archive_dir).source_state(CLOUD_BACKEND)
+    drift = detect_cloud_drift(
+        results, recorded.get("endpoint_shapes"), table, app_version
+    )
+
+    observed = {
+        name: {
+            "path": table[name].path,
+            "status": result.status,
+            "expected_status": table[name].expected_status,
+            "shape": fingerprint(result.payload) if result.ok else None,
+            "fields": list(field_names(result.payload)) if result.ok else [],
+            "cursor_param": table[name].cursor_param,
+        }
+        for name, result in results.items()
+    }
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "app_version": app_version,
+                    "declared_pin": {
+                        "app_version": CLIENT_PIN.app_version,
+                        "count": CLIENT_PIN.count,
+                        "sha256": CLIENT_PIN.sha256,
+                    },
+                    "drift": drift.kind,
+                    "endpoints": observed,
+                    "broke": list(drift.broke),
+                    "recovered": list(drift.recovered),
+                    "unreachable": list(drift.unreachable),
+                    "changed_shapes": list(drift.changed_shapes),
+                    "new_fields": {k: list(v) for k, v in drift.new_fields.items()},
+                    "missing_fields": {
+                        k: list(v) for k, v in drift.missing_fields.items()
+                    },
+                },
+                indent=2,
+            )
+        )
+        return EXIT_OK
+
+    print("wispr-flow-exporter schema (cloud)")
+    _say("app", f"{app_version or 'unknown'} (pinned {CLIENT_PIN.app_version})")
+    _say("endpoints", f"{len(table)} probed, {CLIENT_PIN.count} declared")
+    for name, seen in observed.items():
+        status = seen["status"]
+        mark = "ok " if seen["shape"] else "-- "
+        shape = seen["shape"] or "no body"
+        _say("", f"{mark}{name:22} {status or 'net':>4}  {shape}")
+    _say("drift", drift.summary())
+
+    if drift.kind is DriftClass.BREAKING:
+        return EXIT_BREAKING_DRIFT
+    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
+        return EXIT_ADDITIVE_DRIFT
+    return EXIT_OK
+
+
 def cmd_schema(args: argparse.Namespace) -> int:
     """Report the live schema against the declaration.
 
@@ -538,6 +698,8 @@ def cmd_schema(args: argparse.Namespace) -> int:
         Process exit code.
     """
     config = _config(args)
+    if config.source == SOURCE_CLOUD:
+        return _schema_cloud(args, config)
     resolved = paths.resolve(config.data_dir, config.db)
     if not resolved.db.exists():
         print(f"  no Wispr Flow database at {resolved.db}")
@@ -759,6 +921,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     schema_parser.add_argument(
         "--json", action="store_true", help="machine-readable output"
+    )
+    schema_parser.add_argument(
+        "--candidates",
+        action="store_true",
+        help="with --source cloud, also probe paths not yet adopted",
     )
     schema_parser.set_defaults(func=cmd_schema)
 
