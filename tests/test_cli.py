@@ -102,11 +102,13 @@ def _data_dir(
 # --- parsing --------------------------------------------------------------
 
 
-def test_a_subcommand_is_required() -> None:
-    """Bare invocation is a usage error, which argparse owns."""
-    with pytest.raises(SystemExit) as caught:
-        main([])
-    assert caught.value.code == 2
+def test_an_empty_argument_list_prints_help() -> None:
+    """An explicit empty vector is a programmatic call, not a bare shell run.
+
+    A bare shell invocation runs the interactive setup instead; that path is
+    covered in tests/test_prompts.py.
+    """
+    assert main([]) == EXIT_OK
 
 
 def test_screen_context_needs_a_second_flag() -> None:

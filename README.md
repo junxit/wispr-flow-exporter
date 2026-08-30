@@ -103,6 +103,24 @@ cp .env.example .env   # optional; every setting has a working default
 
 ## Run
 
+Run it with no arguments and it asks. Every setting is shown with its default,
+each can be changed in place, and the run is summarized — along with the
+equivalent command line — before anything is written:
+
+```
+$ wispr-export
+  Wispr Flow data directory [auto-detect]:
+  Archive directory [./archive]:
+  Backend  local / cloud / both [local]:
+  Entities to archive [all]:
+  ...
+  Equivalent command:
+    wispr-export sync --source local --audio copy
+  Proceed? [yes]:
+```
+
+Or pass the flags directly:
+
 ```bash
 # What is on this machine, what policy is in force, what a sync would cost.
 # Never writes anything.
@@ -137,8 +155,14 @@ own, so it has none to store or discard — it borrows the token Wispr Flow
 already holds, for the duration of one request. See *On the internal API*
 below.
 
-Re-running `sync` with nothing changed upstream must write **zero bytes**. That
-is an asserted invariant, not an aspiration.
+Every `sync` pulls whatever it has not pulled yet: each entity carries its own
+watermark, so a run reads only what changed. Re-running with nothing changed
+upstream writes **zero bytes** — an asserted invariant, not an aspiration.
+
+The archive is never committable. If it sits inside a git working tree that
+does not already ignore it, `sync` adds it to that repository's `.gitignore`
+before writing anything. A warning printed once at the top of a long run is a
+control that works exactly until somebody scrolls.
 
 ## Archive layout
 

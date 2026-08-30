@@ -21,12 +21,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from . import files_source, paths
+from .prompts import Answers, PromptAborted, collect, ensure_ignored
 from .local_config import read_config, read_session, redact
 from .schema import EXPECTED, MIGRATION_PIN
 from .sqlite_source import DriftClass, SourceError, open_source
@@ -201,6 +203,33 @@ def _say(label: str, value: str) -> None:
     print(f"  {label:<13}: {redact(value)}")
 
 
+def _defaults() -> Answers:
+    """Build the interactive defaults from the environment and .env.
+
+    Deliberately the same resolution the flags use, so the prompt offers what
+    a bare ``sync`` would actually do rather than a second set of defaults
+    that could drift from it.
+
+    Returns:
+        The values to offer.
+    """
+    config = _config(argparse.Namespace())
+    return Answers(
+        data_dir=config.data_dir,
+        archive_dir=str(config.archive_dir),
+        source=SOURCE_LOCAL if config.source == SOURCE_AUTO else config.source,
+        entities=None,
+        audio=config.audio,
+        max_audio_mb=config.max_audio_mb,
+        include_audio_blobs=config.include_audio_blobs,
+        include_images=config.include_images,
+        include_screen_context=config.include_screen_context,
+        recheck_days=config.recheck_days,
+        full=False,
+        strict_schema=config.strict_schema,
+    )
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report on the source, schema, policy and archive without writing.
 
@@ -336,6 +365,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return EXIT_FAILURE
 
     archive = Archive(root=config.archive_dir)
+    ensure_ignored(config.archive_dir)
     options = SyncOptions(
         full=getattr(args, "full", False),
         audio=config.audio,
@@ -624,7 +654,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="wispr-export",
         description="Maintain a local archive of all Wispr Flow data.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Not required: a bare invocation runs the interactive setup, because
+    # "usage error" is the wrong answer for someone who wants a backup.
+    sub = parser.add_subparsers(dest="command", required=False)
 
     def add_selection(target: argparse.ArgumentParser) -> None:
         target.add_argument(
@@ -755,7 +787,18 @@ def main(argv: list[str] | None = None) -> int:
     render_parser.add_argument("-v", "--verbose", action="store_true")
     render_parser.set_defaults(func=cmd_render)
 
+    if not argv and len(sys.argv) <= 1:
+        try:
+            answers = collect(_defaults())
+        except PromptAborted as error:
+            print(f"  {error}")
+            return EXIT_OK if str(error) == "cancelled" else EXIT_FAILURE
+        return main(answers.to_argv())
+
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help()
+        return EXIT_OK
 
     # Two flags rather than one, because the widest tier includes captures of
     # whatever application had focus while dictating -- which can be a password
