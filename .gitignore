@@ -1,0 +1,144 @@
+# ---------------------------------------------------------------------------
+# PRIVATE DICTATION AND MEETING CONTENT — never commit.
+# The archive holds verbatim diarized transcripts of real conversations,
+# everything this machine has ever dictated, and the screen context captured
+# alongside it. It must never reach a remote, public or private.
+# ---------------------------------------------------------------------------
+archive/
+*.archive/
+/notes/
+/export/
+/exports/
+/out/
+
+# ---------------------------------------------------------------------------
+# Local copies of Wispr Flow's own store — never commit.
+# A snapshot of flow.sqlite is the entire corpus in one file: meetings with AI
+# summaries, scratchpad notes, the custom dictionary (which is mostly names,
+# employers and project codenames), calendar attendees, and the History and
+# FlowLensHistory tables' audio, screenshot, axText and axHTML columns.
+# The -wal and -shm sidecars hold uncommitted pages of exactly the same data,
+# so they are no less sensitive than the main database. backups/ is the app's
+# own rolling copy and is a full second corpus.
+# ---------------------------------------------------------------------------
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+flow.sqlite*
+backup-*.sqlite
+/backups/
+/snapshots/
+
+# ---------------------------------------------------------------------------
+# Wispr Flow application state — never commit.
+# session.json is a PLAINTEXT Supabase session: a bearer access_token, a
+# refresh token, and the account's email, id and full name. There is no
+# keychain entry guarding it; it is a bare file, mode 0666. config.json
+# carries the account's name, email, device ids, saved writing samples and
+# polish prompts. The logs carry accessibility-tree captures of whatever was
+# on screen. These are only ever copied here while debugging, and must never
+# be committed even then.
+# ---------------------------------------------------------------------------
+session.json
+config.json
+config.json.tmp-*
+feature-flags.json
+Local State
+Preferences
+/sentry/
+*.log
+*.log.*
+
+# ---------------------------------------------------------------------------
+# Transcript and audio artifacts — never commit.
+# refined.ndjson, live.ndjson and speakers.observations.ndjson are verbatim
+# diarized transcripts. upload.ogg is raw meeting audio: every voice in the
+# room, unredactable, ~16 MB apiece. No test ever needs a real one — fixtures
+# are Python literals in conftest.py, never data files, so this blanket
+# ignore has no legitimate exception.
+# ---------------------------------------------------------------------------
+*.ndjson
+*.jsonl
+*.ogg
+*.opus
+*.wav
+*.m4a
+*.mp3
+*.flac
+*.webm
+
+# ---------------------------------------------------------------------------
+# Screen captures — never commit.
+# History.screenshot and FlowLensHistory.screenshot are image BLOBs taken at
+# dictation time, and NoteImages.data is an image BLOB too. Anything extracted
+# from them lands here first. There is no negation for docs/ on purpose: a
+# negated ignore pattern is precisely how real data gets committed, and a
+# documentation image is rare enough to deserve a deliberate `git add -f` and
+# a look at the file before it goes in.
+# ---------------------------------------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.heic
+*.webp
+*.gif
+*.pdf
+
+# ---------------------------------------------------------------------------
+# Secrets — never commit.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.enc
+credentials.json
+secrets.json
+*token*.json
+*.jwt
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Note: uv.lock IS committed on purpose — it pins the dependency graph.
+
+# ---------------------------------------------------------------------------
+# Editors and tooling
+# ---------------------------------------------------------------------------
+.claude/settings.local.json
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+._*

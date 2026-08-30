@@ -1,0 +1,16 @@
+Changelog
+=========
+
+0.1.0
+-----
+- Initial implementation: a local, incremental archive of Wispr Flow's own
+  store. Reads flow.sqlite and the per-meeting NDJSON transcripts and writes
+  Markdown plus verbatim JSON, with the undocumented sync API as a second
+  backend for data that never reaches disk.
+- License: PolyForm Noncommercial 1.0.0 (source-available). Noncommercial use
+  is free; commercial use requires a separate license. Copyright Jade Naaman.
+  Decided before the first commit, so this file never needs a relicensing
+  entry.
+
+(Entries are added as each build step lands. This section is finalized, with
+measurements from a real run, when 0.1.0 is tagged.)
