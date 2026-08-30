@@ -5,9 +5,6 @@ transcripts, speakers and custom dictionary — read straight from the app's own
 SQLite store, with the sync API as a second backend for the data that never
 reaches disk.
 
-> **Status:** in development. The build sequence is tracked in `changelog.txt`;
-> until v0.1.0 is tagged, assume commands land incrementally.
-
 ## Why this exists
 
 - **Wispr Flow deletes things.** `Meetings.transcriptDeletedAt` exists,
@@ -184,6 +181,16 @@ See `.env.example` for the full set. Precedence is **CLI flag > environment >
 | `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
 | `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures |
 | `WISPR_STRICT_SCHEMA` | `0` | Exit non-zero on additive schema drift |
+
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `doctor` | Report the source, schema, policy and archive. Writes nothing. |
+| `sync` | Archive new and changed data. |
+| `schema` | Show the live schema against the declaration. |
+| `verify` | Check integrity and reconcile against the database. |
+| `render` | Re-render Markdown from archived payloads, with no source access. |
 
 ## Known limitations
 

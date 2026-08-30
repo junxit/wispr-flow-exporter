@@ -5,13 +5,126 @@ Changelog
 -----
 - Initial implementation: a local, incremental archive of Wispr Flow's own
   store. Reads flow.sqlite and the per-meeting NDJSON transcripts and writes
-  Markdown plus verbatim JSON, with the undocumented sync API as a second
-  backend for data that never reaches disk.
+  Markdown plus verbatim JSON, with the undocumented sync API available as a
+  second backend for data that never reaches disk.
+- A second run with nothing changed upstream writes zero bytes. Not "no
+  records written" -- no byte and no mtime anywhere in the archive changes,
+  index and sync state included. Three mechanisms hold it: a record whose
+  projected digest and artifact fingerprints are unchanged is skipped before
+  anything is read or rendered, everything rendered goes through a
+  compare-then-write, and an artifact whose size and mtime match its cursor is
+  never re-hashed or re-copied.
+- The content digest is taken over a projection rather than the whole row.
+  Wispr rows carry a dozen columns that flip without the record changing --
+  the *PendingPush flags, the *Retries counters, syncedAt, lastUsed, and the
+  modification timestamps themselves. Sequelize bumps modifiedAt whenever it
+  touches a row, so a background sync that only flips `synced` also moves
+  modifiedAt; counting it would rewrite a meeting whose content had not moved
+  by one word. The watermark still reads those columns and the digest does
+  not, while their values are archived verbatim.
+- The database is read while Wispr Flow has it open. The connection is opened
+  mode=ro with PRAGMA query_only, and one deferred read transaction spans the
+  whole export, so every table comes from a single snapshot and a torn read
+  across tables is impossible rather than unlikely. A full run leaves
+  flow.sqlite and both sidecars byte-identical.
+- The reader never names a column it did not discover. Projections come from
+  PRAGMA table_info at runtime, so a column added in migration 150 is archived
+  on the next run with no code change, and an undeclared table is archived
+  generically. Wispr Flow shipped 11 migrations in August, 21 in July and 25
+  in June, so drift is continuous rather than exceptional: additive drift
+  warns and completes, and breaking drift still archives everything reachable
+  through the raw path while skipping only the affected renderers. For an
+  archival tool, failing loud must never mean failing closed.
+- Screen context is excluded by name from the SELECT rather than filtered out
+  of a SELECT *, so the failure mode of an upstream schema change is a missing
+  field rather than a silent screenshot dump. History and FlowLensHistory both
+  carry screenshot, axText and axHTML; a rule written against History alone
+  would have leaked the other table entirely. Widening that far needs two
+  flags, because the columns hold a capture of whatever application had focus
+  while you spoke.
+- Meeting audio is copied by default. Wispr Flow garbage-collects it: on the
+  machine this was developed against only one of three meetings still had its
+  upload.ogg, so a recorded pointer would already be dangling. --audio link
+  records the path, size and digest instead, and --audio skip records nothing.
+- An archive empty because of a preference can prove which preference. When
+  localDataPolicy is never_store, dictation is never written to disk at all,
+  and a zero row count would otherwise be indistinguishable from a failed
+  read. The policy and the date it came into force are recorded in
+  .sync-state.json, and doctor reports it before anything is written. This is
+  the one failure here that is silent, permanent, and discovered only on the
+  day the data is finally wanted.
+- Nothing is ever deleted. Deletion has three states rather than a boolean,
+  because Wispr tombstones rows in place: present, soft_deleted and absent are
+  different facts and are recorded as such. A transcript Wispr Flow has
+  dropped is flagged transcript_deleted_upstream and stays exactly where it
+  is -- an archive that honoured an upstream deletion would not be an archive.
+- The cloud backend borrows a token and never mints one. It reads the access
+  token Wispr Flow already holds and never calls the refresh endpoint:
+  Supabase GoTrue rotates refresh tokens and detects reuse, so refreshing
+  would sign you out of the app being backed up. A test asserts against the
+  source of all three cloud modules that no refresh path exists. The client
+  issues GET only, responses are archived verbatim because the API is not a
+  contract, and it is reached only on an explicit --source cloud or --source
+  both -- never because a session happens to exist.
+- Security: archive files are written 0600 and directories 0700 at every
+  level. Path.mkdir(parents=True, mode=...) applies its mode to the leaf only,
+  which left meetings/, meetings/2026/ and meetings/2026/08/ world-readable in
+  a real archive while every leaf was correct; those directory names carry
+  meeting titles and participant names.
+- Security: meeting ids are validated as canonical lowercase UUIDs before they
+  become path components, titles are slugified and length-capped, and every
+  archive path resolves through a containment check that refuses absolute
+  components as well as traversal. The id, not the slug, is what makes a
+  directory safe.
+- Security: emitted YAML frontmatter is quoted and escaped, and titles are
+  flattened before they reach a Markdown heading. Escaping the frontmatter
+  alone was not enough -- a title carrying a newline and "---" opened a second
+  block in the body, where escaping does nothing.
+- Security: no credential reaches the archive. session.json is read only by
+  the cloud backend, the archived account profile carries identity and expiry
+  and nothing else, and NoteImages.presignedGetUrl is redacted at read time
+  because a signed object URL is a bearer credential in a TEXT column. A test
+  records every path opened during a local export and asserts the credential
+  file is not among them.
+- verify is authoritative rather than approximate, because the upstream is a
+  local file: it counts what should exist instead of sampling. It reports
+  index entries missing from disk, meeting directories missing from the index,
+  payload digests that no longer match, and source records that were never
+  archived. render rebuilds every document from archived payloads with no
+  source access at all, which is the payoff of writing raw before rendering.
+- tests/test_privacy.py enforces the fixture policy: no real name, no absolute
+  home path, no JWT-shaped string, and no UUID outside an approved table. It
+  caught real mistakes three times during the build. Fixtures are Python
+  literals only -- no transcript, audio or image file is ever committed -- so
+  the blanket ignores in .gitignore have no exceptions to erode.
+- Added CI (pytest plus osv-scanner against uv.lock, on push, pull request and
+  weekly), Dependabot configuration, and SECURITY.md.
 - License: PolyForm Noncommercial 1.0.0 (source-available). Noncommercial use
   is free; commercial use requires a separate license. Copyright Jade Naaman.
   Decided before the first commit, so this file never needs a relicensing
   entry.
 
-(This section is written in full, with measurements from a real run, when
-0.1.0 is tagged. Until then the commit history is the record: each commit
-opens with the evidence that motivated it.)
+Verified against a live store
+-----------------------------
+- Backfill: 3 meetings, 1 scratchpad note, 2 calendar events, 8 dictionary
+  entries and 165 rows across 17 further tables, plus 15.7 MB of meeting
+  audio, in 0.1s.
+- Re-run: 0 scanned, 0 written. A --full rescan: 3 scanned, 0 written, 3
+  unchanged. Content and mtime digests over the whole archive are identical
+  across all three runs.
+- Transcripts: 151, 283 and 285 refined turns read with no malformed lines;
+  180 turns plus one "paused" marker from 182 live lines, and 366 from 367.
+  The marker carries a wall clock in the field a turn uses for an mm:ss
+  offset, which is what breaks a naive parser.
+- Speaker attribution measured, not assumed: 141 of one meeting's 366 live
+  lines carry a name, all on the system channel, and a verified line
+  attributes one participant's words to the other. Live turns are labelled by
+  capture channel and names come only from the refined pass.
+- Schema: 26 tables and 149 migrations, pin bbc0c3726dac, matching the
+  declaration exactly.
+- Exclusions measured: the default export omits nothing on this machine
+  because History is empty by policy; --audio skip would omit 15.7 MB.
+- Live-write safety: a full export left the Wispr Flow directory's files
+  byte-identical apart from the app's own writes, and a DELETE against the
+  open connection was refused with "attempt to write a readonly database".
+- verify --deep on the resulting archive: 28 records checked, consistent.
