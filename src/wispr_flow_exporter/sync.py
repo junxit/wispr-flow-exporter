@@ -38,19 +38,20 @@ from .files_source import MEETING_DIR_RE, MeetingArtifacts, read_transcript
 from .local_config import LocalConfig, Policy, SessionInfo, account_profile
 from .normalize import (
     SpeakerMap,
+    TimestampKind,
     calendar_key,
     resolve_dictation_text,
     resolve_speaker_tokens,
     to_instant,
 )
 from .paths import WisprPaths
-from .schema import EXPECTED, Layout, TimestampKind
+from .schema import EXPECTED, Layout
 from .secure_io import (
     copy_file_secure,
     file_digest,
-    write_bytes_if_changed,
-    secure_mkdir,
     read_json,
+    secure_mkdir,
+    write_bytes_if_changed,
     write_json_if_changed,
     write_ndjson_if_changed,
     write_text_if_changed,
@@ -95,6 +96,9 @@ class SyncOptions:
         recheck_days: Trailing days re-read for tables with no modification
             column, so an in-place edit is not missed forever.
         checkpoint_every: Records between index saves.
+        drift_blocks_rendering: Breaking drift is in force, so an existing
+            rendering must not be replaced by one built from a schema this
+            tool no longer understands. See :func:`_write_markdown`.
     """
 
     full: bool = False
@@ -106,6 +110,7 @@ class SyncOptions:
     dry_run: bool = False
     recheck_days: int = 14
     checkpoint_every: int = 50
+    drift_blocks_rendering: bool = False
 
 
 @dataclass(slots=True)
@@ -358,7 +363,7 @@ def _archive_meeting(
     entry = archive.entry("meetings", key)
 
     created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
-    title = data.get("title") if isinstance(data.get("title"), str) else ""
+    title = _text(data.get("title"))
     destination = archive.record_path(
         "Meetings", spec, key, when=created, title=title
     )
@@ -487,8 +492,8 @@ def _write_meeting_files(
                     },
                 )
 
-    title = data.get("title") if isinstance(data.get("title"), str) else ""
-    raw_summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+    title = _text(data.get("title"))
+    raw_summary = _text(data.get("summary"))
     # Resolved once. The hub inlines this body and summary.md wraps it, and
     # rendering twice to recover the body from the document would couple the
     # two files through the exact shape of a Markdown heading.
@@ -501,17 +506,17 @@ def _write_meeting_files(
             meeting_id=record.key,
             heading="Summary",
         )
-        wrote |= write_text_if_changed(destination / "summary.md", summary_text)
+        wrote |= _write_markdown(destination / "summary.md", summary_text, options)
 
     notes = data.get("notes")
     if isinstance(notes, str) and notes.strip():
         notes_text, _ = render.render_summary(
             notes, speakers, title=title, meeting_id=record.key, heading="Notes"
         )
-        wrote |= write_text_if_changed(destination / "notes.md", notes_text)
+        wrote |= _write_markdown(destination / "notes.md", notes_text, options)
 
     if refined.turns:
-        wrote |= write_text_if_changed(
+        wrote |= _write_markdown(
             destination / "transcript.refined.md",
             render.render_transcript(
                 refined.turns,
@@ -522,9 +527,10 @@ def _write_meeting_files(
                 malformed=refined.malformed,
                 truncated=refined.truncated_tail,
             ),
+            options,
         )
     if live.turns:
-        wrote |= write_text_if_changed(
+        wrote |= _write_markdown(
             destination / "transcript.live.md",
             render.render_transcript(
                 live.turns,
@@ -534,6 +540,7 @@ def _write_meeting_files(
                 malformed=live.malformed,
                 truncated=live.truncated_tail,
             ),
+            options,
         )
 
     participants = data.get("participantNames")
@@ -542,7 +549,7 @@ def _write_meeting_files(
     ] if isinstance(participants, list) else []
     speaker_names = sorted({person.name for person in speakers.people.values()})
 
-    wrote |= write_text_if_changed(
+    wrote |= _write_markdown(
         destination / "meeting.md",
         render.render_meeting(
             data,
@@ -559,6 +566,7 @@ def _write_meeting_files(
             transcript_deleted_upstream=data.get("transcriptDeletedAt") is not None,
             unresolved_tokens=unresolved,
         ),
+        options,
     )
     return wrote
 
@@ -650,6 +658,23 @@ def sync_local(
     return result
 
 
+def _text(value: Any) -> str:
+    """Return ``value`` when it is a string, and an empty string otherwise.
+
+    Titles and summaries arrive from columns that are nominally TEXT and
+    nominally NOT NULL, and neither is a guarantee this tool can rely on -- a
+    renderer handed ``None`` would fail on a record the raw path archived
+    perfectly well.
+
+    Args:
+        value: A column value.
+
+    Returns:
+        The string, or ``""``.
+    """
+    return value if isinstance(value, str) else ""
+
+
 def _document_paths(stem: Path, suffix: str) -> Path:
     """Return a sibling file for a document-layout record.
 
@@ -665,6 +690,40 @@ def _document_paths(stem: Path, suffix: str) -> Path:
         The file path.
     """
     return stem.parent / f"{stem.name}{suffix}"
+
+
+def _write_markdown(path: Path, text: str, options: SyncOptions) -> bool:
+    """Write a rendering, unless doing so would degrade one already on disk.
+
+    The raw path is schema-driven and survives anything; renderers are not.
+    They read declared columns by name and are written defensively, with
+    ``.get`` and ``isinstance`` guards throughout -- which means that when a
+    required column disappears upstream they do not crash, they quietly render
+    less. A note whose ``content`` column is gone renders as an empty note, and
+    writing that over the good copy from yesterday destroys the only readable
+    form of it. The raw JSON is still correct, so nothing is unrecoverable, but
+    "recoverable" is not the same as "not broken".
+
+    So the gate is narrow on purpose: only a rendering that *already exists* is
+    protected. A record archived for the first time during breaking drift gets
+    its degraded rendering, because the alternative is an index entry pointing
+    at a file that was never written.
+
+    Renderings held back this way stay stale until the declaration is updated
+    and ``wispr-export render`` is run; the sync pass says so rather than
+    leaving that to be discovered.
+
+    Args:
+        path: Destination document.
+        text: Rendered Markdown.
+        options: This run's options.
+
+    Returns:
+        Whether the file changed.
+    """
+    if options.drift_blocks_rendering and path.exists():
+        return False
+    return write_text_if_changed(path, text)
 
 
 def sync_notes(
@@ -700,7 +759,7 @@ def sync_notes(
             seen.append(key)
             data = record.data
             created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
-            title = data.get("title") if isinstance(data.get("title"), str) else ""
+            title = _text(data.get("title"))
             stem = archive.record_path("Notes", spec, key, when=created, title=title)
             digest = content_hash(spec, data)
             entry = archive.entry("notes", key)
@@ -723,7 +782,7 @@ def sync_notes(
                 counts.relocated += 1
 
             wrote = write_json_if_changed(_document_paths(stem, ".raw.json"), data)
-            wrote |= write_text_if_changed(
+            wrote |= _write_markdown(
                 _document_paths(stem, ".md"),
                 render.render_note(
                     note_id=key,
@@ -736,6 +795,7 @@ def sync_notes(
                     pinned=bool(data.get("pinned")),
                     soft_deleted=record.soft_deleted,
                 ),
+                options,
             )
             fields: dict[str, Any] = {
                 # The .md file, not the bare stem: an index path has to point
@@ -804,7 +864,7 @@ def sync_calendar(
             seen.append(key)
 
             starts = to_instant(TimestampKind.EPOCH_MS, data.get("startAtUtc"))
-            title = data.get("title") if isinstance(data.get("title"), str) else ""
+            title = _text(data.get("title"))
             stem = archive.record_path(
                 "CalendarEvents", spec, key, when=starts, title=title
             )
@@ -920,8 +980,10 @@ def sync_snapshot(
 
     wrote = write_ndjson_if_changed(destination, rows)
     if render_markdown and table == "Dictionary":
-        wrote |= write_text_if_changed(
-            destination.with_name("dictionary.md"), render.render_dictionary(rows)
+        wrote |= _write_markdown(
+            destination.with_name("dictionary.md"),
+            render.render_dictionary(rows),
+            options,
         )
 
     fields: dict[str, Any] = {
@@ -1070,8 +1132,10 @@ def sync_dictation(
                     "provenance": provenance,
                 }
             )
-        wrote |= write_text_if_changed(
-            shard.with_suffix(".md"), render.render_dictation_day(day, entries)
+        wrote |= _write_markdown(
+            shard.with_suffix(".md"),
+            render.render_dictation_day(day, entries),
+            options,
         )
 
         fields: dict[str, Any] = {

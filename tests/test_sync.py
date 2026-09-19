@@ -13,15 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-
-from wispr_flow_exporter import paths
-from wispr_flow_exporter.local_config import LocalConfig, Policy, SessionInfo
-from wispr_flow_exporter.normalize import calendar_key
-from wispr_flow_exporter.schema import EXPECTED
-from wispr_flow_exporter.sqlite_source import open_source
-from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
-from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
-
 from conftest import (
     FAKE_JWT,
     HISTORY_A,
@@ -36,6 +27,14 @@ from conftest import (
     SECOND,
     TITLE_PLAIN,
 )
+
+from wispr_flow_exporter import paths
+from wispr_flow_exporter.local_config import LocalConfig, Policy, SessionInfo
+from wispr_flow_exporter.normalize import calendar_key
+from wispr_flow_exporter.schema import EXPECTED
+from wispr_flow_exporter.sqlite_source import open_source
+from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
+from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
 
 REFINED = [
     {
@@ -501,6 +500,82 @@ def test_notes_archive_as_markdown_beside_their_raw_payload(
     assert "murmur quota" in document.read_text(encoding="utf-8")
 
 
+def test_breaking_drift_keeps_the_rendering_already_on_disk(
+    scene: Callable[..., tuple],
+) -> None:
+    """The gate the documentation has always described, now enforced.
+
+    Renderers read declared columns by name and are written defensively, so a
+    missing required column makes them render *less* rather than raise. Writing
+    that over yesterday's good document is the loss this prevents.
+
+    Demonstrated by putting a sentinel where the rendering goes: with the gate
+    on, a full re-run leaves it alone.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    document.write_text("sentinel", encoding="utf-8")
+
+    _run(archive, resolved, full=True, drift_blocks_rendering=True)
+
+    assert document.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_breaking_drift_still_archives_the_raw_payload(
+    scene: Callable[..., tuple],
+) -> None:
+    """Fail loud, never fail closed: the gate must not stop archiving.
+
+    An archive that refused to run because it did not recognize a column would
+    be no archive at all, so the raw path is deliberately untouched by this.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    raw = document.with_suffix(".raw.json")
+    raw.unlink()
+
+    _run(archive, resolved, full=True, drift_blocks_rendering=True)
+
+    assert raw.is_file()
+    assert "murmur quota" in raw.read_text(encoding="utf-8")
+
+
+def test_the_gate_does_not_outlive_the_drift(scene: Callable[..., tuple]) -> None:
+    """Held-back renderings are stale, not lost -- a later run repairs them.
+
+    This is what makes the gate safe to apply: it withholds a write, it does
+    not record the document as correct.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    document.write_text("sentinel", encoding="utf-8")
+    _run(archive, resolved, full=True, drift_blocks_rendering=True)
+
+    _run(archive, resolved, full=True)
+
+    assert "murmur quota" in document.read_text(encoding="utf-8")
+
+
+def test_a_record_first_seen_under_drift_is_still_rendered(
+    scene: Callable[..., tuple],
+) -> None:
+    """The gate is narrow on purpose: it protects, it does not withhold.
+
+    Skipping unconditionally would leave the notes index pointing at a ``.md``
+    that was never written, which verification would then report as damage.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+
+    _run(archive, resolved, drift_blocks_rendering=True)
+
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    assert document.is_file()
+    assert "murmur quota" in document.read_text(encoding="utf-8")
+
+
 def test_a_calendar_id_too_long_to_be_a_path_is_hashed(
     scene: Callable[..., tuple],
 ) -> None:
@@ -844,7 +919,7 @@ def test_screen_context_appears_only_when_opted_in(
 def test_dictation_blobs_are_written_as_sidecars(
     scene: Callable[..., tuple],
 ) -> None:
-    """raw payloads stay readable, so binary goes beside them, not inside."""
+    """Raw payloads stay readable, so binary goes beside them, not inside."""
     archive, resolved, _ = scene(
         rows=[],
         tables={"History": [_history_row(audio=b"OggS" + bytes(64))]},
