@@ -38,9 +38,10 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from . import USER_AGENT
-from .cloud_api import BACKOFF, MAX_RETRIES, MIN_INTERVAL, _retry_after
+from .cloud_api import BACKOFF, MAX_RETRIES, MIN_INTERVAL, _Retry, _retry_after
 from .local_config import redact
 from .mcp_auth import McpCredential
+from .transport import read_capped
 
 #: The revision of the MCP spec this client speaks.
 PROTOCOL_VERSION = "2025-06-18"
@@ -299,9 +300,37 @@ class McpClient:
         for attempt in range(MAX_RETRIES):
             self._pace()
             try:
-                response = self._client.request(
+                # Streamed so the body is bounded as it is read. A transcript
+                # is the largest thing this client legitimately receives, and
+                # even that sits far under the cap.
+                with self._client.stream(
                     "POST", self.endpoint, json=message, headers=headers
-                )
+                ) as response:
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        if attempt == MAX_RETRIES - 1:
+                            raise McpError(f"HTTP {response.status_code}")
+                        wait = _retry_after(response.headers.get("Retry-After"))
+                        raise _Retry(
+                            wait if wait is not None else BACKOFF[attempt]
+                        )
+
+                    if response.status_code in (401, 403):
+                        raise McpError(
+                            f"HTTP {response.status_code}: the MCP authorization "
+                            "was rejected. Run `wispr-export login` again."
+                        )
+                    if response.status_code >= 400:
+                        raise McpError(f"HTTP {response.status_code}")
+
+                    session = response.headers.get("Mcp-Session-Id")
+                    if session:
+                        self._session = session
+                    status = response.status_code
+                    kind = response.headers.get("Content-Type", "")
+                    raw = read_capped(response)
+            except _Retry as retry:
+                time.sleep(retry.wait)
+                continue
             except httpx.HTTPError as error:
                 if attempt == MAX_RETRIES - 1:
                     raise McpError(
@@ -310,33 +339,14 @@ class McpClient:
                 time.sleep(BACKOFF[attempt])
                 continue
 
-            if response.status_code in (429, 500, 502, 503, 504):
-                if attempt == MAX_RETRIES - 1:
-                    raise McpError(f"HTTP {response.status_code}")
-                wait = _retry_after(response.headers.get("Retry-After"))
-                time.sleep(wait if wait is not None else BACKOFF[attempt])
-                continue
-
-            if response.status_code in (401, 403):
-                raise McpError(
-                    f"HTTP {response.status_code}: the MCP authorization was "
-                    "rejected. Run `wispr-export login` again."
-                )
-            if response.status_code >= 400:
-                raise McpError(f"HTTP {response.status_code}")
-
-            session = response.headers.get("Mcp-Session-Id")
-            if session:
-                self._session = session
-            if notify or response.status_code == 202 or not response.content:
+            if notify or status == 202 or not raw:
                 return None
 
-            kind = response.headers.get("Content-Type", "")
             if "text/event-stream" in kind:
-                payload = _parse_sse(response.text)
+                payload = _parse_sse(raw.decode("utf-8", errors="replace"))
             else:
                 try:
-                    payload = response.json()
+                    payload = json.loads(raw)
                 except ValueError as error:
                     raise McpError("response was not JSON") from error
             if not isinstance(payload, dict):

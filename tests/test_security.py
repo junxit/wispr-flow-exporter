@@ -17,15 +17,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-
-from wispr_flow_exporter import paths
-from wispr_flow_exporter.local_config import Policy, redact
-from wispr_flow_exporter.schema import EXPECTED
-from wispr_flow_exporter.secure_io import DIR_MODE, FILE_MODE
-from wispr_flow_exporter.sqlite_source import open_source
-from wispr_flow_exporter.store import Archive, UnsafeArchivePathError
-from wispr_flow_exporter.sync import SyncOptions, sync_local
-
 from conftest import (
     FAKE_JWT,
     FAKE_SESSION_KEY,
@@ -36,6 +27,14 @@ from conftest import (
     TITLE_FRONTMATTER,
     TITLE_TRAVERSAL,
 )
+
+from wispr_flow_exporter import paths
+from wispr_flow_exporter.local_config import Policy, redact
+from wispr_flow_exporter.schema import EXPECTED
+from wispr_flow_exporter.secure_io import DIR_MODE, FILE_MODE, secure_write_text
+from wispr_flow_exporter.sqlite_source import open_source
+from wispr_flow_exporter.store import Archive, UnsafeArchivePathError
+from wispr_flow_exporter.sync import SyncOptions, sync_local
 
 SPEAKER_MAP = json.dumps(
     {
@@ -230,10 +229,60 @@ def test_every_archived_path_is_owner_only(synced: Callable[..., Archive]) -> No
     """
     archive = synced()
 
-    for path in archive.root.rglob("*"):
+    # rglob("*") does not yield the root, which is the one directory holding
+    # index.json and .sync-state.json directly -- so checking only the walk
+    # left the most-exposed directory unasserted.
+    for path in [archive.root, *archive.root.rglob("*")]:
         mode = stat.S_IMODE(path.stat().st_mode)
         expected = DIR_MODE if path.is_dir() else FILE_MODE
-        assert mode == expected, f"{path.relative_to(archive.root)} is {oct(mode)}"
+        assert mode == expected, f"{path} is {oct(mode)}"
+
+
+def test_an_operator_created_root_is_narrowed(tmp_path: Path) -> None:
+    """`mkdir archive` at a default umask makes it 0755, and then we own it.
+
+    The tool's other directories are created by the tool, so they are 0700 by
+    construction. The root is the one an operator is likely to have made first.
+    """
+    root = tmp_path / "archive"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+    Archive(root=root).save()
+
+    assert stat.S_IMODE(root.stat().st_mode) == DIR_MODE
+
+
+def test_a_written_file_is_never_briefly_world_readable(tmp_path: Path) -> None:
+    """0600 at rest is not the claim; 0600 at every instant is.
+
+    Writing and then chmodding leaves a window. Asserting on the finished file
+    cannot see it, so this asserts on the mode the file is *created* with, by
+    writing under a umask that would widen anything not opened with a mode.
+    """
+    target = tmp_path / "secret.json"
+    previous = os.umask(0o000)
+    try:
+        secure_write_text(target, "{}")
+        assert stat.S_IMODE(target.stat().st_mode) == FILE_MODE
+    finally:
+        os.umask(previous)
+
+
+def test_a_symlink_at_the_destination_is_not_written_through(
+    tmp_path: Path,
+) -> None:
+    """Temp-file names are predictable, so the target must not be followed."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("original", encoding="utf-8")
+    planted = tmp_path / "planted.json"
+    planted.symlink_to(outside)
+
+    with pytest.raises(OSError):
+        secure_write_text(planted, "captured")
+
+    assert outside.read_text(encoding="utf-8") == "original"
 
 
 def test_a_copied_recording_does_not_inherit_its_source_mode(

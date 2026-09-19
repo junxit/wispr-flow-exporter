@@ -467,8 +467,12 @@ def render_dictionary(rows: Iterable[Mapping[str, Any]]) -> str:
             return []
         lines = [f"## {heading}", "", "| Phrase | Replacement |", "| --- | --- |"]
         for row in sorted(items, key=lambda item: str(item.get("phrase", "")).lower()):
-            phrase = str(row.get("phrase", ""))
-            replacement = str(row.get("replacement") or "")
+            # Flattened before escaping: a pipe is not the only way out of a
+            # table row. A newline ends the row outright, and everything after
+            # it lands in the document as its own Markdown -- which for the
+            # shared and team dictionaries is text this account did not write.
+            phrase = inline(str(row.get("phrase", "")))
+            replacement = inline(str(row.get("replacement") or ""))
             if row.get("isDeleted"):
                 phrase, replacement = f"~~{phrase}~~", f"~~{replacement}~~"
             lines.append(

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ DIR_MODE = 0o700
 CHUNK_SIZE = 1024 * 1024
 
 
-def secure_mkdir(path: Path) -> None:
+def secure_mkdir(path: Path, *, narrow_existing: bool = False) -> None:
     """Create a directory tree, owner-accessible only at every level.
 
     ``Path.mkdir(parents=True, mode=...)`` applies the mode to the **leaf
@@ -51,8 +52,18 @@ def secure_mkdir(path: Path) -> None:
     individually. Directories that already existed are left alone -- their
     permissions are not ours to change.
 
+    The archive root is the one exception, via ``narrow_existing``. The default
+    root is the *relative* ``./archive``, which an operator naturally creates
+    themselves before the first run, and a directory made at a default umask is
+    0755. Everything inside is still 0600 or 0700, so this is a listing that
+    leaks rather than contents -- but "directories are 0700" is a promise this
+    tool makes, and a root it was pointed at is a directory it has been told to
+    own.
+
     Args:
         path: Directory to create.
+        narrow_existing: Also narrow ``path`` itself when it already exists.
+            Applies to the leaf only; ancestors are still left as they are.
     """
     missing: list[Path] = []
     probe = path
@@ -70,33 +81,53 @@ def secure_mkdir(path: Path) -> None:
         except OSError:
             pass
 
-
-def secure_write_text(path: Path, text: str) -> None:
-    """Write text to ``path`` with owner-only permissions.
-
-    Args:
-        path: Destination file.
-        text: Contents to write.
-    """
-    path.write_text(text, encoding="utf-8")
-    try:
-        os.chmod(path, FILE_MODE)
-    except OSError:
-        pass
+    if narrow_existing and not missing:
+        try:
+            if stat.S_IMODE(path.stat().st_mode) != DIR_MODE:
+                os.chmod(path, DIR_MODE)
+        except OSError:
+            pass
 
 
 def secure_write_bytes(path: Path, payload: bytes) -> None:
-    """Write bytes to ``path`` with owner-only permissions.
+    """Write bytes to ``path``, owner-only from the moment it exists.
+
+    The mode is passed to ``open`` rather than applied afterwards. Writing
+    first and chmodding second leaves a real window -- short, but a window --
+    in which the file exists at whatever the umask allows, typically 0644, and
+    everything this package writes goes through here: the index, the sync
+    state, every rendered document, and the MCP token store.
+
+    ``O_NOFOLLOW`` refuses to write through a symlink planted at the
+    destination, which matters because temp-file names are predictable.
+    ``os.open`` still masks the mode by the umask, so it is reapplied on the
+    open descriptor -- ``fchmod``, not ``chmod``, so the thing being narrowed
+    is provably the file just created and not whatever now sits at that name.
 
     Args:
         path: Destination file.
         payload: Contents to write.
     """
-    path.write_bytes(payload)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, FILE_MODE)
     try:
-        os.chmod(path, FILE_MODE)
-    except OSError:
-        pass
+        try:
+            os.fchmod(fd, FILE_MODE)
+        except OSError:
+            pass
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
+def secure_write_text(path: Path, text: str) -> None:
+    """Write text to ``path``, owner-only from the moment it exists.
+
+    Args:
+        path: Destination file.
+        text: Contents to write.
+    """
+    secure_write_bytes(path, text.encode("utf-8"))
 
 
 def read_json(path: Path, default: Any) -> Any:

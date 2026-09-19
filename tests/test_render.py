@@ -5,6 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import (
+    MEETING_A,
+    OWNER,
+    SECOND,
+    TITLE_AMPERSAND,
+    TITLE_FRONTMATTER,
+    TITLE_PLAIN,
+)
 
 from wispr_flow_exporter.files_source import Turn
 from wispr_flow_exporter.normalize import SpeakerMap
@@ -18,15 +26,6 @@ from wispr_flow_exporter.render import (
     render_transcript,
     yaml_block,
     yaml_scalar,
-)
-
-from conftest import (
-    MEETING_A,
-    OWNER,
-    SECOND,
-    TITLE_AMPERSAND,
-    TITLE_FRONTMATTER,
-    TITLE_PLAIN,
 )
 
 WHEN = datetime(2026, 8, 21, 21, 0, 58, tzinfo=UTC)
@@ -361,6 +360,37 @@ def test_a_dictionary_phrase_cannot_break_the_table() -> None:
     """A pipe in a phrase would otherwise add a column."""
     document = render_dictionary([{"phrase": "a|b", "replacement": "c"}])
     assert r"a\|b" in document
+
+
+def test_a_dictionary_entry_cannot_end_its_row() -> None:
+    """A newline leaves the table entirely, which escaping pipes does not stop.
+
+    Shared and team dictionary entries are not written by this account, so the
+    text arriving here is someone else's. A row that ends early turns the rest
+    of the value into document structure.
+    """
+    document = render_dictionary(
+        [{"phrase": "ok\n\n## Injected heading", "replacement": "fine"}]
+    )
+
+    # The text survives -- this is an archive -- but only inside its cell. What
+    # must not happen is it reaching the start of a line, which is the only
+    # position where "##" means anything.
+    assert not any(
+        line.startswith("## Injected") for line in document.splitlines()
+    )
+    assert "| ok ## Injected heading | fine |" in document
+
+
+def test_a_dictionary_replacement_cannot_end_its_row() -> None:
+    """The same hole on the other column, which is the likelier one."""
+    document = render_dictionary(
+        [{"phrase": "ok", "replacement": "a\n---\ntitle: spoofed"}]
+    )
+
+    body = document.split("---\n", 2)[-1]
+    assert not any(line.strip() == "---" for line in body.splitlines())
+    assert "| ok | a --- title: spoofed |" in document
 
 
 def test_dictation_renders_one_document_per_day() -> None:

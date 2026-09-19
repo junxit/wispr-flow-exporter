@@ -293,7 +293,8 @@ class Archive:
         Returns:
             The mutable namespace.
         """
-        return self.index["entities"].setdefault(entity, {})
+        namespace: dict[str, Any] = self.index["entities"].setdefault(entity, {})
+        return namespace
 
     def entry(self, entity: str, key: str) -> dict[str, Any] | None:
         """Look up one record's index entry.
@@ -345,7 +346,7 @@ class Archive:
         Returns:
             The stored entry.
         """
-        entry = self._namespace(entity).setdefault(key, {})
+        entry: dict[str, Any] = self._namespace(entity).setdefault(key, {})
         for name, value in fields.items():
             if value is None:
                 entry.pop(name, None)
@@ -485,7 +486,8 @@ class Archive:
         Returns:
             The namespace, created on first use.
         """
-        return self.state["sources"].setdefault(source, {})
+        namespace: dict[str, Any] = self.state["sources"].setdefault(source, {})
+        return namespace
 
     def watermark(self, source: str, entity: str) -> Any:
         """Return the stored watermark value for one entity.
@@ -531,7 +533,8 @@ class Archive:
             The cursor, empty when the meeting is new.
         """
         cursors = self.source_state(source).setdefault("artifact_cursors", {})
-        return cursors.setdefault(key, {})
+        cursor: dict[str, Any] = cursors.setdefault(key, {})
+        return cursor
 
     # --- persistence ------------------------------------------------------
 
@@ -542,7 +545,10 @@ class Archive:
         periodically during long runs, so an interrupted archive is always
         resumable rather than merely usually resumable.
         """
-        secure_mkdir(self.root)
+        # The root is narrowed even when it already existed: it holds the index
+        # and the sync state directly, and an operator who ran `mkdir archive`
+        # before the first run left it 0755.
+        secure_mkdir(self.root, narrow_existing=True)
         self.index["schema_version"] = SCHEMA_VERSION
         self.index["tool_version"] = __version__
         self.state["schema_version"] = SCHEMA_VERSION

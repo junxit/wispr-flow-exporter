@@ -33,6 +33,7 @@ code path that writes to Wispr Flow's servers.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from typing import Any, Protocol
 from . import USER_AGENT
 from .cloud_auth import Credential
 from .local_config import redact
+from .transport import ResponseTooLarge, read_capped
 
 DEFAULT_BASE = "https://api.wisprflow.ai"
 DEFAULT_TIMEOUT = 30.0
@@ -49,6 +51,19 @@ MAX_RETRIES = 4
 # never urgent; being a quiet client is worth more than being a fast one.
 MIN_INTERVAL = 0.25
 BACKOFF = (2.0, 5.0, 15.0, 30.0)
+
+
+class _Retry(Exception):
+    """Internal: leave the streaming block, then wait and try again.
+
+    Streaming means the retry decision is made inside a ``with``. Raising is
+    how the response gets closed before the sleep, rather than being held open
+    across it.
+    """
+
+    def __init__(self, wait: float) -> None:
+        super().__init__(wait)
+        self.wait = wait
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -83,7 +98,7 @@ class Endpoint:
 # partial one. Incremental cursors and one-file-per-endpoint verbatim archiving
 # are incompatible, and the zero-bytes invariant already makes a full re-fetch
 # free on disk. The parameter names are recorded so the choice stays visible.
-# Every status below was measured against the live service on app 1.6.721, not
+# Every status below was measured against the live service on app 1.6.897, not
 # inferred from the bundle. MAINTENANCE.md has the procedure for re-measuring.
 ENDPOINTS: Mapping[str, Endpoint] = {
     "user_profile": Endpoint("/api/v1/user/profile"),
@@ -142,7 +157,7 @@ ENDPOINTS: Mapping[str, Endpoint] = {
 # Paths read from the bundle and probed, but deliberately not archived. Kept so
 # `schema --source cloud --candidates` can re-check them after an app update,
 # and so the reason for each omission survives longer than the decision to omit
-# it. Statuses measured on app 1.6.721.
+# it. Statuses measured on app 1.6.897.
 CANDIDATES: Mapping[str, Endpoint] = {
     # Answers, but only usefully when sent the client's own timestamp map,
     # which this tool does not maintain. The same information is archived from
@@ -356,7 +371,47 @@ class CloudClient:
         for attempt in range(MAX_RETRIES):
             self._pace()
             try:
-                response = self._client.get(path)
+                # Streamed so the body is bounded while it is read. A status
+                # this loop is going to discard never gets its body read at
+                # all, which also means a huge error page costs nothing.
+                with self._client.stream("GET", path) as response:
+                    status = response.status_code
+                    if status in (429, 500, 502, 503, 504):
+                        if attempt == MAX_RETRIES - 1:
+                            return self._record(
+                                name, path, status, reason=f"HTTP {status}"
+                            )
+                        # Honour Retry-After when the server sends one; it
+                        # knows more about its own load than a fixed ladder.
+                        wait = _retry_after(response.headers.get("Retry-After"))
+                        sleep_for = wait if wait is not None else BACKOFF[attempt]
+                        raise _Retry(sleep_for)
+
+                    if status in (401, 403):
+                        # Not retryable, and the likeliest cause is an access
+                        # token that expired while the run was in flight.
+                        return self._record(
+                            name,
+                            path,
+                            status,
+                            reason=(
+                                f"HTTP {status}: the access token was rejected. "
+                                "Open Wispr Flow to refresh its session."
+                            ),
+                        )
+                    if status >= 400:
+                        return self._record(
+                            name, path, status, reason=f"HTTP {status}"
+                        )
+
+                    raw = read_capped(response)
+            except _Retry as retry:
+                time.sleep(retry.wait)
+                continue
+            except ResponseTooLarge as error:
+                # Not retried: a server that answered this way once will do it
+                # again, and the point of the cap is to stop allocating.
+                return self._record(name, path, None, reason=str(error))
             except httpx.HTTPError as error:
                 reason = redact(str(error)) or error.__class__.__name__
                 if attempt == MAX_RETRIES - 1:
@@ -364,38 +419,13 @@ class CloudClient:
                 time.sleep(BACKOFF[attempt])
                 continue
 
-            status = response.status_code
-            if status in (429, 500, 502, 503, 504):
-                if attempt == MAX_RETRIES - 1:
-                    return self._record(name, path, status, reason=f"HTTP {status}")
-                # Honour Retry-After when the server sends one; it knows more
-                # about its own load than a fixed ladder does.
-                wait = _retry_after(response.headers.get("Retry-After"))
-                time.sleep(wait if wait is not None else BACKOFF[attempt])
-                continue
-
-            if status in (401, 403):
-                # Not retryable, and the likeliest cause is an access token
-                # that expired while the run was in flight.
-                return self._record(
-                    name,
-                    path,
-                    status,
-                    reason=(
-                        f"HTTP {status}: the access token was rejected. Open "
-                        "Wispr Flow to refresh its session."
-                    ),
-                )
-            if status >= 400:
-                return self._record(name, path, status, reason=f"HTTP {status}")
-
-            if status == 204 or not response.content:
+            if status == 204 or not raw:
                 # A legitimate answer meaning "nothing here", not a failure to
                 # parse. Reported as its own thing so the two are never
                 # confused in a diagnosis.
                 return self._record(name, path, status, reason="no content")
             try:
-                body = response.json()
+                body = json.loads(raw)
             except ValueError:
                 return self._record(
                     name, path, status, reason="response was not JSON"
