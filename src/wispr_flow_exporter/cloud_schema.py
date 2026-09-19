@@ -49,9 +49,9 @@ from .schema import DriftClass
 # consumer, and callers that had imported them from here keep working.
 __all__ = [
     "CLIENT_PIN",
+    "MAX_DEPTH",
     "ClientPin",
     "CloudDrift",
-    "MAX_DEPTH",
     "detect_cloud_drift",
     "field_names",
     "fingerprint",
@@ -276,7 +276,7 @@ def _declared_lines(endpoints: Iterable[tuple[str, Endpoint]]) -> list[str]:
 # the classification above -- but it is always reported. Refresh it with
 # `wispr-export schema --source cloud`; MAINTENANCE.md has the procedure.
 CLIENT_PIN = ClientPin(
-    app_version="1.6.721",
+    app_version="1.6.897",
     count=18,
     sha256="926960a4f81461ba363213ee8cc02ad35835d0d18cf8166e5b9d036694e319bc",
 )

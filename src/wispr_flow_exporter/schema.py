@@ -18,8 +18,8 @@ exceptional, so a design that had to be updated before it could read a new
 column would be permanently out of date, and an archive that stopped when it
 fell behind would be useless on the one day it was needed.
 
-Column lists were read from a live installation of Wispr Flow v1.6.721 at
-migration 149.
+Column lists were read from a live installation of Wispr Flow v1.6.897 at
+migration 152.
 """
 
 from __future__ import annotations
@@ -111,9 +111,9 @@ def pin_from_migrations(names: Iterable[str]) -> SchemaPin:
 # Read from a live installation. A mismatch is not an error -- see the drift
 # classification in sqlite_source -- but it is always reported.
 MIGRATION_PIN = SchemaPin(
-    count=149,
-    latest="20260821120001-add-meetings-calendar-occurrence-start-index.js",
-    sha256="bbc0c3726dacd8031a7f2ca875078b43d3378908883301b99a08e8d24377ee6a",
+    count=152,
+    latest="20260915120000-add-meetings-recorded-ms.js",
+    sha256="655d5ff0f8e6c3e41ac95a2d539c7eec5157c4a1e9208f2de00893ea15ebaaaa",
 )
 
 
@@ -308,6 +308,10 @@ EXPECTED: Mapping[str, TableSpec] = {
             "isTourDemo", "serverRefinedUploadedAt", "refinedFetchedThroughAt",
             "shareSlug", "shareVisibility", "refinedFetchRetries",
             "refineUploadFailureReason", "calendarOccurrenceStartAtUtc",
+            # A duration in milliseconds, not a timestamp, so it is absent from
+            # _MEETING_TIMESTAMPS. Content rather than churn: how long a meeting
+            # recorded is a fact about the meeting, so it stays in the digest.
+            "recordedMs",
         ),
         required=frozenset({"id", "title", "createdAt", "modifiedAt"}),
         volatile=_CHURN
@@ -386,7 +390,7 @@ EXPECTED: Mapping[str, TableSpec] = {
         # Usage counters tick on every dictation; they say nothing about the
         # entry itself.
         volatile=frozenset({"lastUsed", "frequencyUsed", "remoteFrequencyUsed"}),
-        timestamps=_SEQUELIZE_TIMES | {"lastUsed": TimestampKind.SEQUELIZE},
+        timestamps={**_SEQUELIZE_TIMES, "lastUsed": TimestampKind.SEQUELIZE},
         soft_delete=("isDeleted",),
     ),
     "Todos": _spec(
@@ -667,6 +671,20 @@ EXPECTED: Mapping[str, TableSpec] = {
             "createdAt", "updatedAt",
         ),
         volatile=frozenset({"attempts", "state", "lastErrorCode"}),
+        timestamps=_SEQUELIZE_TIMES,
+    ),
+    # Arrived in migration 150 and holds no rows on the installation this was
+    # read from, so the columns come from the table's DDL rather than from
+    # observed data. Nothing else references a folder id yet -- not Notes, not
+    # Meetings -- so how folders attach to content is still unmeasured, and
+    # this declaration deliberately claims nothing about it.
+    "Folders": _spec(
+        pk="id",
+        layout=Layout.SNAPSHOT,
+        columns=(
+            "id", "ownerUserId", "name", "description", "isOwner",
+            "createdAt", "modifiedAt",
+        ),
         timestamps=_SEQUELIZE_TIMES,
     ),
     "SequelizeMeta": _spec(

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .drift import fingerprint, version_tuple
@@ -214,5 +214,5 @@ MCP_PIN = McpPin(
     version="1",
     protocol_version="2025-06-18",
     tool_count=14,
-    sha256="12849ed4225542bb47104e3e6ce7c9332f598504734fb7ff1e0cfef244dae9db",
+    sha256="a1fc1063a4cfbd1849d050debda1b74d775a3c1152eaaa8f57d40528e5cb4843",
 )
