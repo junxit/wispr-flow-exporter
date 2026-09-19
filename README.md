@@ -52,7 +52,7 @@ disk, in formats you can still read in ten years.
 | Meeting audio | yes, while the app still has it | no | no |
 | Transcript fidelity | raw turns, speakers, timestamps | — | normalized plaintext only |
 | Stability | app schema, ~20 migrations/month | undocumented, unversioned | versioned, but no stability promise |
-| Confirmed live | yes | yes, on app 1.6.721 | yes, on `wispr-meetings` 1 |
+| Confirmed live | yes | yes, on app 1.6.897 | yes, on `wispr-meetings` 1 |
 
 The local backend is the primary one and is fully functional on its own. The two
 remote backends are reached only when you ask for them, and each announces
@@ -279,7 +279,7 @@ archive/
 ```
 
 Both backends record the Wispr Flow build that produced the archive
-(`prefs.version`, `1.6.721` here), because a future reader looking at these
+(`prefs.version`, `1.6.897` here), because a future reader looking at these
 files otherwise has no way to tell which client wrote them.
 
 Frontmatter is Obsidian-friendly: `aliases` so `[[` autocomplete finds a meeting
@@ -343,6 +343,20 @@ See `.env.example` for the full set. Precedence is **CLI flag > environment >
   run with no code change — but *renderers* can fall behind. Additive drift warns
   and completes; breaking drift still archives raw and exits non-zero naming what
   broke. For an archival tool, "fail loud" must never mean "fail closed."
+
+  What breaking drift additionally does is leave existing Markdown alone.
+  Renderers read declared columns by name and are written defensively, so a
+  column that vanished makes them render *less* rather than raise — and writing
+  that over yesterday's good document would be the one loss the raw path cannot
+  undo for you. A record archived for the first time during breaking drift is
+  still rendered, because the alternative is an index entry pointing at a file
+  that was never written. Held-back documents are stale, not lost: fix the
+  declaration and run `wispr-export render`.
+- **Nothing automated will tell you the declaration is stale.** The tests that
+  compare this tool against a live Wispr Flow skip when it is not installed, and
+  CI has no installation, so a green badge says nothing about drift.
+  [MAINTENANCE.md](MAINTENANCE.md) names the two commands to run after every
+  Wispr Flow update and before every release.
 - **Live-transcript speaker names are wrong, and are not used.** `live.ndjson`
   carries a `speaker.name` populated from the meeting platform's active-speaker
   marker, which lags — a verified line in the development dataset attributes one
@@ -425,6 +439,28 @@ file is ever committed; every fixture is a Python literal.
 
 `tests/test_privacy.py` enforces that: it fails on real names, absolute home
 paths, JWT-shaped strings, and any UUID outside an approved fixture table.
+
+Lint and types run separately, and CI enforces both:
+
+```bash
+uv run ruff check .
+uv run mypy            # strict, over the package
+```
+
+`ruff format` is deliberately not part of this. It would reflow the column
+tuples in `schema.py`, which are packed several names to a line because they
+transcribe a table definition and are meant to read as one.
+
+Two checks cannot run in CI at all, because they need Wispr Flow installed:
+
+```bash
+uv run pytest -q -k "pin or live"   # skips silently without the app
+uv run wispr-export schema          # all three backends, read-only
+```
+
+Run those after every Wispr Flow update and before every release — a green CI
+badge says nothing about whether the declaration still matches the app. See
+[MAINTENANCE.md](MAINTENANCE.md).
 
 ## Delete
 

@@ -19,9 +19,15 @@ you were dictating, so answering yes asks for a second, typed confirmation.
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
+
+#: How a question reaches the operator. ``input`` in production; the tests
+#: substitute a scripted answer list, which is the only reason it is a
+#: parameter at all.
+Reader = Callable[[str], str]
 
 
 class PromptAborted(Exception):
@@ -89,7 +95,7 @@ class Answers:
         return argv
 
 
-def _ask(question: str, default: str, *, reader=input) -> str:
+def _ask(question: str, default: str, *, reader: Reader = input) -> str:
     """Ask for a value, offering a default.
 
     Args:
@@ -110,7 +116,7 @@ def _ask(question: str, default: str, *, reader=input) -> str:
     return answer or default
 
 
-def _ask_bool(question: str, default: bool, *, reader=input) -> bool:
+def _ask_bool(question: str, default: bool, *, reader: Reader = input) -> bool:
     """Ask a yes/no question.
 
     Args:
@@ -132,7 +138,7 @@ def _ask_bool(question: str, default: bool, *, reader=input) -> bool:
 
 
 def _ask_choice(
-    question: str, default: str, options: Sequence[str], *, reader=input
+    question: str, default: str, options: Sequence[str], *, reader: Reader = input
 ) -> str:
     """Ask for one of a fixed set of values.
 
@@ -153,7 +159,7 @@ def _ask_choice(
         print(f"    choose one of: {', '.join(options)}")
 
 
-def _ask_int(question: str, default: int, *, reader=input) -> int:
+def _ask_int(question: str, default: int, *, reader: Reader = input) -> int:
     """Ask for a whole number.
 
     Args:
@@ -172,7 +178,9 @@ def _ask_int(question: str, default: int, *, reader=input) -> int:
             print("    please enter a whole number")
 
 
-def collect(defaults: Answers, *, reader=input, stream=None) -> Answers:
+def collect(
+    defaults: Answers, *, reader: Reader = input, stream: TextIO | None = None
+) -> Answers:
     """Run the interactive setup and return the chosen settings.
 
     Args:
@@ -284,7 +292,7 @@ def collect(defaults: Answers, *, reader=input, stream=None) -> Answers:
     return answers
 
 
-def ensure_ignored(archive_dir: Path, *, stream=None) -> None:
+def ensure_ignored(archive_dir: Path, *, stream: TextIO | None = None) -> None:
     """Make sure the archive cannot be committed to a git repository.
 
     The archive holds verbatim transcripts of real conversations and, when the

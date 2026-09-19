@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER, OWNER_EMAIL
 
 from wispr_flow_exporter.local_config import (
     account_profile,
@@ -15,8 +16,6 @@ from wispr_flow_exporter.local_config import (
     read_session,
     redact,
 )
-
-from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER, OWNER_EMAIL
 
 ACCOUNT_ID = "user-0001"
 

@@ -36,6 +36,15 @@ spoke.
   `session.json` are mode `0666`; `shutil.copy2` would preserve that, so
   archived copies are written through a helper that forces `0600` instead.
 
+  The mode is applied by `os.open`, not by a `chmod` afterwards, so there is no
+  instant at which the file exists more widely readable than it should be —
+  writing first and narrowing second leaves a window, and a test now asserts
+  the mode under a permissive umask rather than only at rest. The same open
+  refuses to follow a symlink at the destination, because temp-file names are
+  predictable. The archive root is narrowed even when it already existed: the
+  default root is the relative `./archive`, which an operator who runs `mkdir
+  archive` first leaves at `0755`.
+
 - **The plaintext session token.** `session.json` is a bare, unencrypted
   Supabase GoTrue session — a bearer `access_token`, a refresh token, and the
   account's email, id and full name — with no keychain entry guarding it. Its
@@ -47,17 +56,28 @@ spoke.
   backend never opens it, the MCP backend cannot reach it at all, and there
   are regression tests asserting both.
 
-  **Invariant:** no byte originating in `session.json` is ever written to a file
-  this tool creates, printed to a stream it writes, or included in an exception
-  message or traceback. The only place the token may appear is an outbound
-  `Authorization` header; it is held in a local and never stored.
+  **Invariant:** no *credential* byte from `session.json` — the access token or
+  the refresh token — is ever written to a file this tool creates, printed to a
+  stream it writes, or included in an exception message or traceback. The only
+  place the token may appear is an outbound `Authorization` header; it is held
+  in a local and never stored. `Credential` overrides `__repr__` so a traceback
+  or a `--showlocals` dump cannot render it, and the client that holds one is
+  covered by the same test.
+
+  The invariant is about the credential, not about every byte in the file: the
+  account's `user_id`, `email` and Supabase project ref *are* archived, to
+  `account/profile.json`, so an archive can say whose it is.
 
   This extends to the cloud backend's drift machinery. The per-endpoint
   response fingerprints in `.sync-state.json` are digests of *structure* —
   field names and types, with every value discarded and dictionary keys that do
   not look like field names collapsed to `<dynamic>`, so a response keyed by
-  UUID cannot put an id into the state file. That is a privacy property first
-  and a stability property second.
+  UUID or by an email address cannot put one in the state file. The pattern
+  admits any key shaped like an identifier (`[A-Za-z_][A-Za-z0-9_]*`), so a
+  purely alphanumeric id — Wispr Flow's 181-character base32
+  `CalendarEvents.externalId` is exactly that shape — would survive as a *key
+  name*, never as a value. That is a privacy property first and a stability
+  property second.
 
 - **The tool never refreshes the *borrowed* session.** Supabase GoTrue rotates
   refresh tokens and detects reuse, so a second client calling the refresh
@@ -150,6 +170,17 @@ spoke.
   excluded from `raw.json` and redacted from output, on the same footing as the
   session token.
 
+  This filter is **column-keyed and applies to the local backend only** — the
+  cloud backend archives each response verbatim, by design, so a credential in
+  a response body would be archived with it. That is stated rather than fixed
+  because it was measured: every one of the 18 archived endpoints was probed on
+  a real account against app 1.6.897 and scanned recursively for
+  credential-shaped keys. What exists is `conferenceUrl`, `photoUrl` and
+  `connectorKey`; there is no token, signature or presigned URL anywhere in the
+  set. Note that a `conferenceUrl` is a join link, which is its own kind of
+  bearer capability — it is content you asked to archive, not a leak, but it is
+  worth knowing it is in there.
+
 - **Screen context is excluded by default.** `History` and `FlowLensHistory`
   each carry `screenshot`, `axText` and `axHTML`: a bitmap and a full
   accessibility-tree capture of whatever application had focus when you spoke.
@@ -173,8 +204,10 @@ spoke.
   columns (`Meetings.speakerMap`, `Meetings.participantNames`,
   `CalendarEvents.participants`, `History.additionalContext`,
   `History.toneMatchPairs`, `History.opusChunks`) are parsed as untrusted data.
-  They are read a line at a time under a per-line byte cap and a per-file line
-  cap; parsed with `json.loads` only, never `eval` and never `pickle`; and
+  They are read under a whole-file size gate, then split and parsed under a
+  per-line byte cap and a per-file line cap — the caps bound what is *parsed*,
+  not peak memory, because the file is decoded before it is split; parsed with
+  `json.loads` only, never `eval` and never `pickle`; and
   type-checked before use, so a `speakerMap` that is a list where a mapping was
   expected is treated as absent rather than raising from four frames deep. A
   malformed line is skipped rather than aborting the file — but it is
@@ -237,6 +270,17 @@ spoke.
 Out of scope: the security of the Wispr Flow service itself, and anything
 requiring an attacker who already has code execution as your user — who can
 simply read `~/Library/Application Support/Wispr Flow/` directly.
+
+A file is not code execution, and that distinction cost this tool a real hole.
+`load_dotenv()` with no argument searches the working directory **and every
+ancestor**, so a `.env` anywhere above wherever you happened to run could set
+`WISPR_API_BASE`. Measured: a `.env` two directories up resolved the API base
+to `http://evil.example`, and the borrowed bearer token would have gone there
+in cleartext. Both remote base URLs are now checked before a credential is
+attached — `https` required, and the host must be the one this tool ships
+unless `WISPR_ALLOW_ENDPOINT_OVERRIDE` is also set — and the `.env` search no
+longer walks up. Placing a file in a directory you run commands from remains
+**in** scope.
 
 ## Dependencies
 

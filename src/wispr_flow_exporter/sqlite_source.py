@@ -28,7 +28,6 @@ import hashlib
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, Self
 
@@ -43,7 +42,7 @@ from .schema import (
     pin_from_migrations,
 )
 
-__all__ = ["DriftClass", "Drift", "SourceError", "SqliteSource", "open_source"]
+__all__ = ["Drift", "DriftClass", "SourceError", "SqliteSource", "open_source"]
 
 # A single value large enough to be a problem in memory. Meeting audio blobs
 # and screenshots are the realistic cases.

@@ -8,6 +8,84 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.4.0
+-----
+- Re-pinned against Wispr Flow 1.6.897 at migration 152, three weeks and
+  three migrations after the 1.6.721/149 the declaration still described.
+  New since the pin: a `Folders` table, a `Meetings.recordedMs` column,
+  and -- over MCP -- `get_meeting_attendee_emails` replaced by
+  `get_meeting_participants_enriched`. Nothing was lost in the interval.
+  The reader is driven by `PRAGMA table_info` and synthesizes a spec for
+  an undeclared table, so both new shapes were already being archived;
+  what was stale was the declaration, and therefore every drift report
+  measured against it. The MCP swap is worth noting on its own: the tool
+  count stayed at 14, so the count fence saw nothing and the digest over
+  input schemas is what caught it.
+- The cloud endpoint table was re-probed against 1.6.897 and needed no
+  change. All 18 endpoints answer as recorded, including the three that
+  are declared knowing they cannot -- meetings 404, notes 405, todos 405.
+  Only `CLIENT_PIN.app_version` moved; count and digest are identical.
+- Breaking drift now actually skips renderers, which three documents have
+  claimed since 0.1.0 and no code did. `blocks_rendering` existed on all
+  three drift types and was asserted by six tests, but had no production
+  call site and neither sync nor render referenced drift at all.
+  Renderers are defensive rather than strict, so a missing required
+  column made them render less instead of raising -- and that less was
+  being written over the good document from the previous run. The gate is
+  narrow: only a rendering that already exists is protected. A record
+  first seen during breaking drift is still rendered, because the
+  alternative is an index entry pointing at a file nobody wrote.
+- Fixed: verify reported a healthy archive as broken when any meeting had
+  no resolvable creation time. Dated meetings are filed under
+  `YYYY/MM/<record>` and undated ones under `undated/<record>`, one level
+  shallower, so the single `*/*/*` glob that looks for unindexed
+  directories reached past every undated record onto its `raw/` and
+  reported that as data the index had lost. One such meeting was enough
+  to print "archive has problems". Found by a test written to cover the
+  verify command through `main()`, which nothing had done before.
+- Closed a path that sent the account's bearer token to an arbitrary host
+  in cleartext. `load_dotenv()` was called with no argument, so it
+  searched the working directory and every ancestor; a `.env` two
+  directories up resolved `WISPR_API_BASE` to `http://evil.example` and
+  nothing objected. Measured, then fixed twice over: the search no longer
+  walks up, and both remote base URLs are now checked before a credential
+  is attached -- https required, host must be the shipped one unless
+  `WISPR_ALLOW_ENDPOINT_OVERRIDE` is also set. SECURITY.md said an
+  attacker needed code execution; this needed a file, so the out-of-scope
+  clause was wrong and now says so.
+- The borrowed credential renders as `Credential(origin=...)` rather than
+  as itself. The MCP credential had that guard and this one did not, and
+  `CloudClient` is a dataclass holding it as the first field -- so its
+  generated repr printed the account's token in full, one
+  `pytest --showlocals` away from a log.
+- Responses are read under a 64 MiB cap while streaming, on all three
+  HTTP clients. Every read previously materialized the whole body, and
+  httpx decompresses before returning it, so the bytes on the wire and
+  the bytes allocated were not the same number.
+- Archive files are 0600 from the instant they exist. The write was
+  `write_text` followed by `chmod`, which leaves a real window at the
+  umask default -- and that path covered the index, the sync state, every
+  rendered document and the MCP token store. Now opened with the mode and
+  `O_NOFOLLOW`, so a symlink planted at a predictable temp name is not
+  written through either. The test that should have caught the archive
+  root's own mode used `rglob("*")`, which does not yield the root.
+- A dictionary entry can no longer end its own table row. Pipes were
+  escaped and newlines were not, so a phrase from the shared or team
+  dictionary -- text this account did not write -- could leave the table
+  and land in the document as Markdown.
+- Added ruff and mypy as dev dependencies, both enforced in CI. mypy runs
+  `strict` over the package and passes; the 46 findings it started with
+  were annotation debt rather than defects, and fixing them removed seven
+  `# type: ignore` comments aimed at a checker that had never run. CI now
+  pins the Python version instead of letting uv resolve whatever is
+  newest, and tests 3.13 and 3.14.
+- MAINTENANCE.md now states a cadence. It documented a thorough manual
+  procedure with no trigger other than "when something stops working",
+  which at roughly twenty migrations a month is too late. The four tests
+  that compare against a live installation skip when Wispr Flow is absent
+  and CI has no installation, so the weekly cron is a CVE canary and not
+  a schema one -- that is now said plainly rather than implied.
+
 0.3.1
 -----
 - Fixed: verify reported a healthy archive as broken. The count check

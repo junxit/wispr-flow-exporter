@@ -10,7 +10,7 @@ from wispr_flow_exporter import paths
 
 
 def test_macos_data_dir(monkeypatch: pytest.MonkeyPatch) -> None:
-    """macOS resolves to the Application Support directory."""
+    """MacOS resolves to the Application Support directory."""
     monkeypatch.setattr(paths.sys, "platform", "darwin")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/tmp/home")))
     assert paths.default_data_dir() == Path(

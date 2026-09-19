@@ -7,6 +7,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import (
+    DEFAULT_MIGRATIONS,
+    HISTORY_A,
+    MEETING_A,
+    MEETING_B,
+    OWNER,
+    SECOND,
+    TITLE_PLAIN,
+)
 
 from wispr_flow_exporter import sqlite_source
 from wispr_flow_exporter.schema import pin_from_migrations
@@ -16,16 +25,6 @@ from wispr_flow_exporter.sqlite_source import (
     SqliteSource,
     fingerprint,
     open_source,
-)
-
-from conftest import (
-    DEFAULT_MIGRATIONS,
-    HISTORY_A,
-    MEETING_A,
-    MEETING_B,
-    OWNER,
-    SECOND,
-    TITLE_PLAIN,
 )
 
 MEETING_ROW = {

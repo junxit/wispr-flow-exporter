@@ -179,16 +179,20 @@ def observe(
         shape = fingerprint(result.payload) if result.ok else None
         keys = list(field_names(result.payload)) if result.ok else []
         was = earlier.get(name)
+        # Bound separately from the isinstance test so the carry-forward below
+        # has something non-optional to read. The test still gates it: a
+        # previous entry that is not a mapping cannot make anything unchanged.
+        recorded: Mapping[str, Any] = was if isinstance(was, Mapping) else {}
         unchanged = (
             isinstance(was, Mapping)
-            and was.get("status") == result.status
-            and was.get("shape") == shape
+            and recorded.get("status") == result.status
+            and recorded.get("shape") == shape
         )
         ledger[name] = {
             "status": result.status,
             "shape": shape,
             "keys": keys,
-            "observed_at": was.get("observed_at", now) if unchanged else now,
+            "observed_at": recorded.get("observed_at", now) if unchanged else now,
         }
     return ledger
 

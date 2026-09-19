@@ -152,6 +152,22 @@ class LocalConfig:
     present: bool = True
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    """Return ``value`` when it is a mapping, and an empty one otherwise.
+
+    Every nested read of ``config.json`` needs the same guard, and writing it
+    inline meant calling ``.get`` twice per field -- once to test the shape and
+    once to use it -- which reads as though the two could disagree.
+
+    Args:
+        value: A decoded JSON value.
+
+    Returns:
+        The mapping, or ``{}``.
+    """
+    return value if isinstance(value, dict) else {}
+
+
 def read_config(path: Path) -> LocalConfig:
     """Read ``config.json``, tolerating absence and corruption.
 
@@ -174,14 +190,10 @@ def read_config(path: Path) -> LocalConfig:
     if not isinstance(payload, dict):
         return LocalConfig(policy=Policy(None, None, observed_at), present=False)
 
-    prefs = payload.get("prefs") if isinstance(payload.get("prefs"), dict) else {}
-    user = prefs.get("user") if isinstance(prefs.get("user"), dict) else {}
-    context = prefs.get("context") if isinstance(prefs.get("context"), dict) else {}
-    coordinator = (
-        payload.get("syncCoordinator")
-        if isinstance(payload.get("syncCoordinator"), dict)
-        else {}
-    )
+    prefs = _mapping(payload.get("prefs"))
+    user = _mapping(prefs.get("user"))
+    context = _mapping(prefs.get("context"))
+    coordinator = _mapping(payload.get("syncCoordinator"))
 
     version = prefs.get("version")
 
@@ -291,7 +303,7 @@ def read_session(path: Path) -> SessionInfo:
     if isinstance(raw_expiry, (int, float)) and not isinstance(raw_expiry, bool):
         expires_at = datetime.fromtimestamp(raw_expiry, tz=UTC)
 
-    user = session.get("user") if isinstance(session.get("user"), dict) else {}
+    user = _mapping(session.get("user"))
     return SessionInfo(
         present=True,
         project_ref=project_ref,

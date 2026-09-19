@@ -7,6 +7,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import (
+    MEETING_A,
+    MEETING_B,
+    TITLE_EMPTY,
+    TITLE_FRONTMATTER,
+    TITLE_PLAIN,
+    TITLE_TRAVERSAL,
+)
 
 from wispr_flow_exporter.schema import EXPECTED, Layout, TableSpec
 from wispr_flow_exporter.store import (
@@ -19,15 +27,6 @@ from wispr_flow_exporter.store import (
     entity_name,
     record_dir_name,
     shard_name,
-)
-
-from conftest import (
-    MEETING_A,
-    MEETING_B,
-    TITLE_EMPTY,
-    TITLE_FRONTMATTER,
-    TITLE_PLAIN,
-    TITLE_TRAVERSAL,
 )
 
 WHEN = datetime(2026, 8, 21, 21, 0, 58, tzinfo=UTC)

@@ -43,7 +43,11 @@ from typing import Any
 
 from .files_source import MEETING_DIR_RE, read_transcript
 from .mcp_api import PAGE_SIZE, TRANSCRIPT_CHARS, McpProtocol
-from .secure_io import write_json_if_changed, write_ndjson_if_changed, write_text_if_changed
+from .secure_io import (
+    write_json_if_changed,
+    write_ndjson_if_changed,
+    write_text_if_changed,
+)
 from .store import Archive, dated_prefix, record_dir_name
 from .sync import SyncCounts, SyncOptions, _now
 
@@ -336,8 +340,9 @@ def _transcript_text(payload: Any) -> str:
             return value
         if isinstance(value, dict):
             for inner in ("text", "content"):
-                if isinstance(value.get(inner), str):
-                    return value[inner]
+                nested = value.get(inner)
+                if isinstance(nested, str):
+                    return nested
     return ""
 
 
@@ -355,11 +360,13 @@ def _transcript_total(payload: Any) -> int | None:
     value = payload.get("transcript")
     if isinstance(value, dict):
         for key in ("total_chars", "total", "length"):
-            if isinstance(value.get(key), int):
-                return value[key]
+            nested = value.get(key)
+            if isinstance(nested, int):
+                return nested
     for key in ("transcript_total_chars", "transcript_chars"):
-        if isinstance(payload.get(key), int):
-            return payload[key]
+        total = payload.get(key)
+        if isinstance(total, int):
+            return total
     return None
 
 

@@ -16,7 +16,33 @@ permissions:
 
 jobs:
   test:
-    name: Tests
+    name: Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned rather than left to float. Without this uv resolves whatever
+        # the newest interpreter satisfying `requires-python` happens to be on
+        # the day the job runs, so the declared floor was never exercised and
+        # the tested version could change between two runs of the same commit.
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync (locked)
+        run: uv sync --locked --dev
+
+      - name: Run tests
+        run: uv run pytest -q
+
+  checks:
+    name: Lint and types
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,12 +51,19 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.13"
 
       - name: Sync (locked)
         run: uv sync --locked --dev
 
-      - name: Run tests
-        run: uv run pytest -q
+      # Lint and types only. `ruff format` is deliberately not run: it would
+      # reflow the column tuples in schema.py, which are packed several names
+      # to a line because they transcribe a table definition and read as one.
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Types
+        run: uv run mypy
 
   audit:
     name: Dependency audit

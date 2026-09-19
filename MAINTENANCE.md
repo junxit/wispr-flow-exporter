@@ -13,8 +13,41 @@ policy and no promise that any of it still exists tomorrow. **This document is
 the price of reaching data that is otherwise unreachable.** Read it when
 something stops working, or after Wispr Flow updates.
 
-Everything below was measured against **app 1.6.721** on macOS. Nothing in it is
+Everything below was measured against **app 1.6.897** on macOS. Nothing in it is
 inferred from documentation, because there is none.
+
+---
+
+## The check that has to be run by a person
+
+Nothing automated will tell you the declaration has gone stale. The four tests
+that compare this tool against a live installation —
+`test_pin_matches_the_live_database`, `test_expected_covers_the_live_database`,
+`test_the_pin_matches_the_installed_app` and
+`test_the_recorded_app_version_matches_the_bundle` — all call `pytest.skip`
+when Wispr Flow is not installed, and CI runs on `ubuntu-latest`, where it
+never is. **A green CI badge says nothing about schema drift.** The weekly cron
+is a CVE canary; it is not a schema canary, and it cannot be made into one
+without a runner that has the app on it.
+
+So the cadence is manual, and it is short because the drift is not:
+
+```bash
+uv run pytest -q -k "pin or live"   # the four that only run here
+uv run wispr-export schema          # all three backends, read-only
+```
+
+Run it **after every Wispr Flow update, and before every release.** Wispr Flow
+ships roughly twenty migrations a month, so "when something breaks" is too late
+a trigger — by then the pin is months behind and the diff is no longer one
+migration you can reason about.
+
+That is not hypothetical. This document previously said 1.6.721 at migration
+149; the check was not run for three weeks, and by then the app was at 1.6.897
+at migration 152, with a new `Folders` table, a new `Meetings.recordedMs`
+column, and an MCP tool swapped for another one. Nothing was lost — the reader
+is `PRAGMA`-driven and archived all of it — but every drift report in that
+window was measured against a declaration that no longer described anything.
 
 ---
 
@@ -151,7 +184,7 @@ print(d[i-200:i+3000].decode('utf-8','replace'))
 "
 ```
 
-On 1.6.721 the split was:
+On 1.6.897 the split was:
 
 - **pull** (`fetch()`) — `subscription`, `preferences`, `notifications`, `notes`,
   `meetings`, `meetings_shared`, `todos`, `calendar`, `agentic_prereads`,
@@ -301,7 +334,7 @@ make a change pass, stop.
 
 ---
 
-## Measured endpoint table (app 1.6.721)
+## Measured endpoint table (app 1.6.897)
 
 Archived. Every status observed against the live service.
 

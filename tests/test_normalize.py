@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import MEETING_A, OWNER, SECOND, THIRD
 
 from wispr_flow_exporter.normalize import (
     SpeakerMap,
@@ -28,8 +29,6 @@ from wispr_flow_exporter.normalize import (
     slugify,
     to_instant,
 )
-
-from conftest import MEETING_A, OWNER, SECOND, THIRD
 
 # --- timestamps -----------------------------------------------------------
 
@@ -86,7 +85,7 @@ def test_sequelize_rejects_junk(value: object) -> None:
 
 
 def test_epoch_ms_parses_milliseconds() -> None:
-    """endedAt is unix milliseconds, not seconds."""
+    """EndedAt is unix milliseconds, not seconds."""
     assert parse_epoch_ms(1787257992365) == datetime.fromtimestamp(
         1787257992.365, tz=UTC
     )
@@ -177,7 +176,7 @@ PEOPLE_MAP = {
 
 
 def test_speaker_map_parses_the_current_shape() -> None:
-    """people plus assignments resolves a refined id to a name."""
+    """People plus assignments resolves a refined id to a name."""
     speakers = SpeakerMap.parse(PEOPLE_MAP)
     assert speakers.name_for(1) == OWNER
     assert speakers.name_for(2) == SECOND
@@ -285,7 +284,7 @@ def test_live_speaker_label_survives_junk(value: object) -> None:
 
 
 def test_dictation_cascade_prefers_the_most_processed_text() -> None:
-    """serverFinalizedText wins over every earlier stage."""
+    """ServerFinalizedText wins over every earlier stage."""
     row = {
         "asrText": "send the whisper budget to hush",
         "formattedText": "Send the whisper budget to Hush.",

@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import MEETING_A
 
 from wispr_flow_exporter import paths
 from wispr_flow_exporter.cloud_api import ENDPOINTS, Endpoint, EndpointResult
@@ -29,8 +30,6 @@ from wispr_flow_exporter.cloud_schema import (
 )
 from wispr_flow_exporter.local_config import read_config
 from wispr_flow_exporter.schema import DriftClass
-
-from conftest import MEETING_A
 
 _TABLE = {
     "good": Endpoint("/api/v1/user/profile"),
@@ -97,7 +96,7 @@ def test_a_retyped_field_moves_the_fingerprint() -> None:
 
 
 def test_a_boolean_is_not_an_integer() -> None:
-    """bool subclasses int in Python, so the naive check erases the difference."""
+    """Bool subclasses int in Python, so the naive check erases the difference."""
     assert skeleton(True) == "bool"
     assert fingerprint({"ok": True}) != fingerprint({"ok": 1})
 

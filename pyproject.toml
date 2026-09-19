@@ -1,6 +1,6 @@
 [project]
 name = "wispr-flow-exporter"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local, incremental archive of Wispr Flow dictation history, meetings, transcripts and dictionary."
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE.md"]
@@ -21,6 +21,10 @@ wispr-export = "wispr_flow_exporter.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # Dev-only. The runtime dependency set stays at two: a local-only run still
+    # loads nothing but the standard library.
+    "ruff>=0.14",
+    "mypy>=1.18",
 ]
 
 [build-system]
@@ -32,3 +36,39 @@ packages = ["src/wispr_flow_exporter"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+# N is here because the source already carries a `# noqa: N802`, and D because
+# every docstring in the package is already Google-style. Both were being
+# honoured by hand; this is what makes them checked.
+select = ["E", "F", "I", "N", "UP", "B", "D", "RUF"]
+ignore = [
+    # The column tuples in schema.py are deliberately packed several names to a
+    # line: they are a transcription of a table definition, and one name per
+    # line would make a 40-column table unreadable as the table it is.
+    "E501",
+    # "Exception names should end in Error." Two of the three this flags are
+    # control flow rather than failure -- PromptAborted is the operator saying
+    # no, and _Retry leaves a streaming block so the response closes before the
+    # backoff sleep. Naming those "...Error" would describe them wrongly.
+    "N818",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves in prose and do not need module/class docstrings
+# enforced the same way, and their long assertion lines carry fixture data.
+"tests/*" = ["D100", "D103", "D104"]
+
+[tool.mypy]
+python_version = "3.13"
+# The package only. The tests are deliberately loose about types -- they build
+# malformed records on purpose, which is the point of them.
+files = ["src/wispr_flow_exporter"]
+strict = true
