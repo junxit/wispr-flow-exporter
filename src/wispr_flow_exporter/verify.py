@@ -21,12 +21,20 @@ the live table rather than inferred from the previous run's own counts.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .schema import EXPECTED
 from .secure_io import read_json
 from .sqlite_source import SqliteSource
-from .store import STATE_ABSENT, Archive, UnsafeArchivePathError, content_hash
+from .store import (
+    STATE_ABSENT,
+    UNDATED,
+    Archive,
+    UnsafeArchivePathError,
+    content_hash,
+)
 
 # Entities whose records are indexed one-per-record, and the table each comes
 # from. Snapshot entities are reconciled by count instead.
@@ -186,6 +194,33 @@ def _check_entries(archive: Archive, report: VerifyReport, *, deep: bool) -> Non
                         report.stale_hashes.append(f"{entity}/{key}")
 
 
+def _record_directories(meetings_root: Path) -> Iterator[Path]:
+    """Yield the meeting directories under ``meetings/``, at either depth.
+
+    Meetings are filed under ``YYYY/MM/<record>``, except those whose creation
+    time could not be resolved, which are filed under ``undated/<record>`` --
+    one level shallower, because inventing a date would invent provenance.
+
+    A single ``*/*/*`` glob therefore reaches one level *past* every undated
+    record and lands on its ``raw/`` directory, which the index has no reason
+    to name. That made one undated meeting enough to report a healthy archive
+    as broken, which is the same failure 0.3.1 fixed from the count side.
+
+    Args:
+        meetings_root: The ``meetings/`` directory.
+
+    Yields:
+        Each record directory.
+    """
+    for candidate in sorted(meetings_root.glob("*/*")):
+        if not candidate.is_dir():
+            continue
+        if candidate.parent.name == UNDATED:
+            yield candidate
+        else:
+            yield from (child for child in sorted(candidate.glob("*")) if child.is_dir())
+
+
 def _check_untracked(archive: Archive, report: VerifyReport) -> None:
     """Find meeting directories the index does not know about.
 
@@ -201,8 +236,8 @@ def _check_untracked(archive: Archive, report: VerifyReport) -> None:
         for entry in archive.entries("meetings").values()
         if isinstance(entry, dict)
     }
-    for candidate in sorted(meetings_root.glob("*/*/*")):
-        if candidate.is_dir() and archive.relative(candidate) not in indexed:
+    for candidate in _record_directories(meetings_root):
+        if archive.relative(candidate) not in indexed:
             report.untracked.append(archive.relative(candidate))
 
 

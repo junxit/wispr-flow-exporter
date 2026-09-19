@@ -7,14 +7,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import MEETING_A, OWNER, SECOND, TITLE_PLAIN
 
 from wispr_flow_exporter import paths
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import Archive
 from wispr_flow_exporter.sync import SyncOptions, rerender, sync_local
 from wispr_flow_exporter.verify import verify_archive
-
-from conftest import MEETING_A, OWNER, SECOND, TITLE_PLAIN
 
 SPEAKER_MAP = json.dumps(
     {
@@ -126,6 +125,41 @@ def test_an_untracked_directory_is_reported(
     """A meeting on disk the index forgot is data nobody can find."""
     archive, resolved = archived
     orphan = archive.root / "meetings" / "2026" / "08" / "2026-08-01--orphan--x"
+    orphan.mkdir(parents=True)
+
+    report = _verify(archive, resolved)
+
+    assert any("orphan" in path for path in report.untracked)
+
+
+def test_an_undated_meeting_is_not_mistaken_for_an_orphan(
+    archived: tuple[Archive, object],
+) -> None:
+    """A meeting with no resolvable createdAt must not break verification.
+
+    Dated meetings are filed under ``YYYY/MM/<record>`` and undated ones under
+    ``undated/<record>``, one level shallower -- so a single ``*/*/*`` glob
+    reached past every undated record onto its ``raw/`` directory and reported
+    it as data the index had lost track of. One such meeting was enough to make
+    a healthy archive report "archive has problems", which is the same shape of
+    failure 0.3.1 fixed from the count side.
+    """
+    archive, resolved = archived
+    record = archive.root / "meetings" / "undated" / "undated--no-date--abc123"
+    (record / "raw").mkdir(parents=True)
+    archive.put("meetings", "no-date", path=archive.relative(record))
+
+    report = _verify(archive, resolved)
+
+    assert report.untracked == []
+
+
+def test_an_untracked_undated_meeting_is_still_reported(
+    archived: tuple[Archive, object],
+) -> None:
+    """Tolerating the shallower layout must not blind the check inside it."""
+    archive, resolved = archived
+    orphan = archive.root / "meetings" / "undated" / "undated--orphan--zzz999"
     orphan.mkdir(parents=True)
 
     report = _verify(archive, resolved)
