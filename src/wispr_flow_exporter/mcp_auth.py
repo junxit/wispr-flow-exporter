@@ -50,13 +50,13 @@ import secrets
 import socket
 import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlencode, urlparse
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, ClassVar
+from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import USER_AGENT, paths
+from . import paths
+from .endpoints import OVERRIDE_ENV, validated_endpoint
 from .secure_io import write_json
 
 #: The MCP endpoint, from the desktop app bundle. Overridable for testing.
@@ -126,10 +126,24 @@ class McpCredential:
 def mcp_endpoint() -> str:
     """Return the MCP endpoint to talk to.
 
+    Checked rather than taken as given: this value decides who receives a
+    minted token, and ``login`` reaches here without going through ``cli``, so
+    validating only there would leave the shorter path open.
+
     Returns:
         The configured endpoint, or the app's own.
+
+    Raises:
+        EndpointError: The configured endpoint is not https, or names a host
+            this tool does not ship without the override also set.
     """
-    return os.environ.get(ENDPOINT_ENV, "").strip() or DEFAULT_MCP_ENDPOINT
+    return validated_endpoint(
+        os.environ.get(ENDPOINT_ENV, "").strip(),
+        default=DEFAULT_MCP_ENDPOINT,
+        variable=ENDPOINT_ENV,
+        allow_override=os.environ.get(OVERRIDE_ENV, "").strip().lower()
+        in {"1", "true", "yes", "on"},
+    )
 
 
 # --- discovery ------------------------------------------------------------
@@ -202,6 +216,14 @@ def discover(client: Any, endpoint: str | None = None) -> dict[str, Any]:
     if not isinstance(servers, list) or not servers:
         raise McpAuthError("the resource named no authorization server")
     issuer = str(servers[0]).rstrip("/")
+    # The resource document decides where this client will register and where
+    # it will exchange a code for a token. PKCE and `state` protect the code in
+    # flight; neither helps if the issuer itself is the attacker, so the hop is
+    # checked rather than followed on trust.
+    if httpx.URL(issuer).scheme != "https":
+        raise McpAuthError(
+            f"the resource named a non-https authorization server: {issuer}"
+        )
 
     metadata: dict[str, Any] | None = None
     for url in (
@@ -215,6 +237,16 @@ def discover(client: Any, endpoint: str | None = None) -> dict[str, Any]:
             continue
     if metadata is None:
         raise McpAuthError(f"{issuer} published no authorization server metadata")
+
+    # RFC 8414 section 3.3: the issuer in the metadata must be identical to the
+    # one whose well-known path produced it. Without this, a document served at
+    # one issuer can name another's endpoints and the mismatch goes unnoticed.
+    published = str(metadata.get("issuer", "")).rstrip("/")
+    if published != issuer:
+        raise McpAuthError(
+            f"authorization server metadata claims issuer {published!r}, "
+            f"fetched from {issuer!r}"
+        )
 
     metadata["resource"] = protected.get("resource", resource)
     return metadata
@@ -347,9 +379,12 @@ def _pkce_pair() -> tuple[str, str]:
 class _Callback(BaseHTTPRequestHandler):
     """A one-shot handler that captures the authorization code."""
 
-    query: dict[str, list[str]] = {}
+    # Class state on purpose: this is the channel from the handler, which
+    # BaseHTTPRequestHandler instantiates itself, back to _await_code. Safe
+    # because exactly one request is ever served, by one thread, per login.
+    query: ClassVar[dict[str, list[str]]] = {}
 
-    def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+    def do_GET(self) -> None:
         """Record the query string and tell the browser it can close."""
         _Callback.query = parse_qs(urlparse(self.path).query)
         body = (
@@ -401,7 +436,7 @@ def _await_code(port: int, state: str, timeout: float) -> str:
         raise McpAuthError(f"authorization failed: {query['error'][0]}")
     # Checked before the code is used: a mismatch means this response belongs
     # to a different request than the one this process started.
-    if query.get("state", [""])[0] != state:
+    if not secrets.compare_digest(query.get("state", [""])[0], state):
         raise McpAuthError("the authorization response did not match the request")
     code = query.get("code", [""])[0]
     if not code:

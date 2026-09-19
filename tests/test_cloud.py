@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot
 
 from wispr_flow_exporter import cloud_auth
 from wispr_flow_exporter.cloud_api import (
@@ -27,8 +28,8 @@ from wispr_flow_exporter.cloud_api import (
     EndpointResult,
 )
 from wispr_flow_exporter.cloud_auth import (
-    Credential,
     CloudAuthError,
+    Credential,
     resolve_credential,
 )
 from wispr_flow_exporter.store import Archive
@@ -39,8 +40,6 @@ from wispr_flow_exporter.sync_cloud import (
     sync_cloud,
     truncated,
 )
-
-from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot
 
 CREDENTIAL = Credential(token=FAKE_JWT, origin="test")
 
@@ -196,6 +195,31 @@ def test_no_refresh_endpoint_appears_anywhere_in_the_backend() -> None:
         assert "/auth/v1/token" not in body
 
 
+def test_the_borrowed_credential_never_renders_itself() -> None:
+    """A traceback that printed the token would defeat the whole redaction.
+
+    The MCP side has always asserted this. The borrowed credential needs it
+    more, not less: it cannot be refreshed and is not this tool's to reissue,
+    so a leak is unrecoverable rather than inconvenient.
+    """
+    credential = Credential(FAKE_JWT, "session.json")
+
+    assert FAKE_JWT not in repr(credential)
+    assert "session.json" in repr(credential)
+
+
+def test_a_client_cannot_render_the_token_it_holds() -> None:
+    """The reason the guard matters, rather than the guard itself.
+
+    ``CloudClient`` is a dataclass with the credential as its first field, so
+    a generated repr would print the token in full -- ``pytest --showlocals``
+    on any failing transport test would be enough.
+    """
+    client = CloudClient(Credential(FAKE_JWT, "session.json"))
+
+    assert FAKE_JWT not in repr(client)
+
+
 def test_every_declared_endpoint_is_read_only() -> None:
     """The client issues GET only; nothing here can write to Wispr Flow."""
     body = (Path(cloud_auth.__file__).parent / "cloud_api.py").read_text(
@@ -219,6 +243,44 @@ def test_a_successful_fetch_returns_the_body() -> None:
     client = _client(handler)
     assert client.fetch("meetings") == {"items": [{"id": "m-1"}]}
     assert client.failures == []
+
+
+def test_an_oversized_response_is_refused_rather_than_allocated() -> None:
+    """The bound that makes a hostile or broken host cost bounded memory.
+
+    httpx decompresses before this sees a byte, so the number being capped is
+    what the process allocates -- which is the number a compression bomb is
+    trying to make large.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 4096)
+
+    client = _client(handler)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("wispr_flow_exporter.cloud_api.read_capped", _capped_at_1k)
+        assert client.fetch("meetings") is None
+
+    assert client.failures == [
+        ("meetings", "response exceeded 1024 bytes and was not read further")
+    ]
+
+
+def _capped_at_1k(response: httpx.Response) -> bytes:
+    """Read with a 1 KiB cap, so a test need not build a 64 MiB body."""
+    from wispr_flow_exporter.transport import read_capped
+
+    return read_capped(response, limit=1024)
+
+
+def test_the_cap_admits_a_body_that_fits() -> None:
+    """The limit must bound the hostile case without breaking the normal one."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": [{"id": "m-1"}]})
+
+    client = _client(handler)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("wispr_flow_exporter.cloud_api.read_capped", _capped_at_1k)
+        assert client.fetch("meetings") == {"items": [{"id": "m-1"}]}
 
 
 def test_a_server_error_is_retried_then_recorded() -> None:

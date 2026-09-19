@@ -13,6 +13,8 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+from conftest import MEETING_A, MEETING_B, NOTE_A, OWNER
+
 from wispr_flow_exporter.files_source import (
     AUDIO_NAME,
     LIVE_NAME,
@@ -23,8 +25,6 @@ from wispr_flow_exporter.files_source import (
     inventory,
     read_transcript,
 )
-
-from conftest import MEETING_A, MEETING_B, NOTE_A, OWNER
 
 
 def _meeting(root: Path, meeting_id: str, *names: str) -> Path:
@@ -115,7 +115,7 @@ def test_a_symlinked_artifact_is_refused(tmp_path: Path) -> None:
 def test_a_missing_meetings_directory_is_not_an_error(tmp_path: Path) -> None:
     """An account that has never recorded a meeting is a normal state."""
     assert list(discover_meetings(tmp_path / "nope")) == []
-    assert inventory(tmp_path / "nope")["directories"] == 0
+    assert inventory(tmp_path / "nope").directories == 0
 
 
 def test_discovery_is_ordered_so_runs_are_reproducible(tmp_path: Path) -> None:
@@ -129,21 +129,21 @@ def test_discovery_is_ordered_so_runs_are_reproducible(tmp_path: Path) -> None:
 
 
 def test_inventory_counts_artifacts_and_audio_bytes(tmp_path: Path) -> None:
-    """doctor reports what exists before anything is written."""
+    """Doctor reports what exists before anything is written."""
     root = tmp_path / "meetings"
     _meeting(root, MEETING_A, REFINED_NAME)
     _meeting(root, MEETING_B, REFINED_NAME, LIVE_NAME, AUDIO_NAME)
 
     marks = inventory(root)
 
-    assert marks["directories"] == 2
-    assert marks["artifacts"] == {
+    assert marks.directories == 2
+    assert marks.artifacts == {
         "refined": 2,
         "live": 1,
         "observations": 0,
         "audio": 1,
     }
-    assert marks["audio_bytes"] == 16
+    assert marks.audio_bytes == 16
 
 
 def test_size_of_a_missing_artifact_is_zero(tmp_path: Path) -> None:
@@ -278,7 +278,7 @@ def test_a_live_speaker_name_is_never_used_as_an_attribution(
 
 
 def test_both_padded_and_unpadded_offsets_parse(tmp_path: Path) -> None:
-    """refined zero-pads and live does not; both are real."""
+    """Refined zero-pads and live does not; both are real."""
     path = _ndjson(tmp_path / LIVE_NAME, *LIVE_LINES)
     read = read_transcript(path)
 
@@ -289,7 +289,7 @@ def test_both_padded_and_unpadded_offsets_parse(tmp_path: Path) -> None:
 def test_observations_are_preserved_even_without_a_renderer(
     tmp_path: Path,
 ) -> None:
-    """obs and participant records are archived rather than dropped."""
+    """Obs and participant records are archived rather than dropped."""
     path = _ndjson(
         tmp_path / OBSERVATIONS_NAME,
         {"meta": {"platform": "zoom", "segment": 0}},

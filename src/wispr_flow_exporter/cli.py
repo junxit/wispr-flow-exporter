@@ -29,11 +29,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from . import files_source, paths
+from .endpoints import OVERRIDE_ENV, EndpointError, validated_endpoint
+from .local_config import LocalConfig, read_config, read_session, redact
 from .prompts import Answers, PromptAborted, collect, ensure_ignored
-from .local_config import read_config, read_session, redact
 from .schema import EXPECTED, MIGRATION_PIN
 from .sqlite_source import DriftClass, SourceError, open_source
 from .store import Archive
+
 # Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
 # sync's is the backend key "wispr-local" that namespaces sync state.
 from .sync import SOURCE_LOCAL as LOCAL_BACKEND
@@ -165,13 +167,23 @@ def _config(args: argparse.Namespace) -> Config:
     ``load_dotenv`` does not override an already-set variable, which is what
     makes the middle two orderings hold.
 
+    The ``.env`` is read from the working directory and nowhere else. The
+    default search walks up to the filesystem root, which meant a file in any
+    ancestor directory could set ``WISPR_API_BASE`` -- see ``endpoints`` for
+    the measurement and for the check that now guards both remote base URLs.
+
     Args:
         args: Parsed arguments.
 
     Returns:
         The resolved configuration.
+
+    Raises:
+        EndpointError: A configured base URL is not one a credential may be
+            sent to.
     """
-    load_dotenv()
+    load_dotenv(dotenv_path=Path.cwd() / ".env")
+    allow_override = _flag(OVERRIDE_ENV)
     return Config(
         data_dir=getattr(args, "data_dir", None)
         or os.environ.get("WISPR_DATA_DIR", "").strip()
@@ -205,10 +217,18 @@ def _config(args: argparse.Namespace) -> Config:
         recheck_days=_int("WISPR_RECHECK_DAYS", DEFAULT_RECHECK_DAYS),
         strict_schema=getattr(args, "strict_schema", False)
         or _flag("WISPR_STRICT_SCHEMA"),
-        api_base=os.environ.get("WISPR_API_BASE", DEFAULT_API_BASE).strip()
-        or DEFAULT_API_BASE,
-        mcp_endpoint=os.environ.get(MCP_ENDPOINT_ENV, DEFAULT_MCP_ENDPOINT).strip()
-        or DEFAULT_MCP_ENDPOINT,
+        api_base=validated_endpoint(
+            os.environ.get("WISPR_API_BASE", "").strip(),
+            default=DEFAULT_API_BASE,
+            variable="WISPR_API_BASE",
+            allow_override=allow_override,
+        ),
+        mcp_endpoint=validated_endpoint(
+            os.environ.get(MCP_ENDPOINT_ENV, "").strip(),
+            default=DEFAULT_MCP_ENDPOINT,
+            variable=MCP_ENDPOINT_ENV,
+            allow_override=allow_override,
+        ),
         session_file=os.environ.get("WISPR_SESSION_FILE", "").strip() or None,
     )
 
@@ -344,13 +364,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
 
     marks = files_source.inventory(resolved.meetings)
-    artifacts = marks["artifacts"]
-    total = marks["directories"]
+    total = marks.directories
     _say(
         "meeting files",
         f"{total} dirs; "
-        + ", ".join(f"{name} {artifacts[name]}/{total}" for name in artifacts)
-        + f" ({_human_bytes(int(marks['audio_bytes']))} audio)",
+        + ", ".join(
+            f"{name} {count}/{total}" for name, count in marks.artifacts.items()
+        )
+        + f" ({_human_bytes(marks.audio_bytes)} audio)",
     )
 
     session = read_session(
@@ -478,8 +499,8 @@ def _run_local(
     config: Config,
     options: SyncOptions,
     entities: tuple[str, ...],
-    config_state: object,
-    result: object,
+    config_state: LocalConfig,
+    result: SyncResult,
 ) -> int:
     """Run the local pass, recording schema drift and the app build.
 
@@ -508,6 +529,16 @@ def _run_local(
             # For an archival tool, failing loud must never mean failing
             # closed, so this is reported and the pass continues.
             exit_code = EXIT_BREAKING_DRIFT
+            # Renderers read declared columns by name and degrade quietly when
+            # one is gone, so an existing document is kept rather than
+            # overwritten with less. Said out loud because the held-back
+            # renderings stay stale until someone acts on this line.
+            options.drift_blocks_rendering = drift.blocks_rendering
+            _say(
+                "render",
+                "existing documents kept as they are; re-run "
+                "`wispr-export render` once the declaration is updated",
+            )
         elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
             exit_code = EXIT_ADDITIVE_DRIFT
 
@@ -540,18 +571,18 @@ def _run_local(
                 else resolved.session
             ),
         )
-    result.counts.update(local.counts)  # type: ignore[attr-defined]
-    result.failures.extend(local.failures)  # type: ignore[attr-defined]
-    result.interrupted = local.interrupted  # type: ignore[attr-defined]
+    result.counts.update(local.counts)
+    result.failures.extend(local.failures)
+    result.interrupted = local.interrupted
     return exit_code
 
 
 def _run_cloud(
     archive: Archive,
-    resolved: object,
+    resolved: paths.WisprPaths,
     config: Config,
     options: SyncOptions,
-    result: object,
+    result: SyncResult,
     *,
     explicit: bool = True,
 ) -> int:
@@ -584,7 +615,7 @@ def _run_cloud(
     session_path = (
         Path(config.session_file).expanduser()
         if config.session_file
-        else resolved.session  # type: ignore[attr-defined]
+        else resolved.session
     )
     try:
         credential = resolve_credential(session_path)
@@ -598,7 +629,7 @@ def _run_cloud(
         failures = list(client.failures)
         results = dict(client.results)
 
-    app_version = read_config(resolved.config).app_version  # type: ignore[attr-defined]
+    app_version = read_config(resolved.config).app_version
     state = archive.source_state(CLOUD_BACKEND)
     drift = detect_cloud_drift(
         results, state.get("endpoint_shapes"), ENDPOINTS, app_version
@@ -633,7 +664,7 @@ def _run_cloud(
     if drift.kind is not DriftClass.OK:
         _say("cloud schema", drift.summary())
 
-    result.counts["cloud"] = counts  # type: ignore[attr-defined]
+    result.counts["cloud"] = counts
     if drift.kind is DriftClass.BREAKING:
         # Everything reachable was still archived. Failing loud must not mean
         # failing closed for this backend either.
@@ -647,7 +678,7 @@ def _run_mcp(
     archive: Archive,
     config: Config,
     options: SyncOptions,
-    result: object,
+    result: SyncResult,
     *,
     explicit: bool = True,
 ) -> int:
@@ -706,7 +737,7 @@ def _run_mcp(
     if drift.kind is not DriftClass.OK:
         _say("mcp schema", drift.summary())
 
-    result.counts["mcp"] = counts  # type: ignore[attr-defined]
+    result.counts["mcp"] = counts
     if drift.kind is DriftClass.BREAKING:
         return EXIT_BREAKING_DRIFT
     if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
@@ -1296,7 +1327,12 @@ def main(argv: list[str] | None = None) -> int:
             "while you dictated"
         )
 
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except EndpointError as error:
+        # Refused before any request, so the token was never attached to it.
+        print(f"  {error}")
+        return EXIT_FAILURE
 
 
 if __name__ == "__main__":

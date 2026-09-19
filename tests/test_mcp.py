@@ -8,10 +8,18 @@ prove it had not spent one.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import stat
+import threading
+import time
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pytest
+from conftest import FAKE_JWT, MEETING_A, MEETING_B, archive_snapshot
 
 from wispr_flow_exporter import mcp_api, mcp_auth
 from wispr_flow_exporter.mcp_api import ALLOWED_METHODS, READ_TOOLS, McpError, unwrap
@@ -26,13 +34,10 @@ from wispr_flow_exporter.schema import DriftClass
 from wispr_flow_exporter.store import Archive
 from wispr_flow_exporter.sync import SyncOptions
 from wispr_flow_exporter.sync_mcp import (
-    SOURCE_MCP,
     local_transcript_state,
     sync_mcp,
     truncated,
 )
-
-from conftest import FAKE_JWT, MEETING_A, MEETING_B, archive_snapshot
 
 _TOOLS = [
     {"name": name, "inputSchema": {"type": "object", "properties": {}}}
@@ -289,7 +294,7 @@ def test_the_pass_adds_no_meetings_key_and_only_the_mcp_subkey(
 def test_a_meeting_the_local_store_lacks_stays_out_of_meetings(
     tmp_path: Path,
 ) -> None:
-    """verify counts meetings/ against the database; MCP must not inflate it."""
+    """Verify counts meetings/ against the database; MCP must not inflate it."""
     archive = Archive(root=tmp_path / "archive")
     client = _Fake(
         {
@@ -459,3 +464,222 @@ def test_the_state_ledger_carries_no_timestamp() -> None:
 
     assert shapes == tool_shapes(_TOOLS)
     assert all(isinstance(value, str) for value in shapes.values())
+
+
+# --- the authorization flow -----------------------------------------------
+#
+# This module is the one that mints a credential rather than borrowing one, and
+# until now it was covered only by a source-text scan. The tests below exercise
+# the decisions that scan cannot see: the CSRF check on the redirect, the PKCE
+# relationship, where the token lands, and the two discovery hops that decide
+# who this client will talk to.
+
+
+def _serve(state: str, timeout: float = 5.0) -> tuple[threading.Thread, list[Any]]:
+    """Run ``_await_code`` on a free port in a thread.
+
+    Args:
+        state: The value the callback must echo back.
+        timeout: How long the listener waits.
+
+    Returns:
+        The running thread and a one-slot list that receives the outcome.
+    """
+    port = mcp_auth._free_port()
+    outcome: list[Any] = []
+
+    def run() -> None:
+        try:
+            outcome.append(mcp_auth._await_code(port, state, timeout))
+        except Exception as error:
+            outcome.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    return thread, outcome, port  # type: ignore[return-value]
+
+
+def test_a_matching_state_yields_the_code() -> None:
+    """The happy path, so the refusals below are known not to be vacuous."""
+    thread, outcome, port = _serve("the-state")
+
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/?code=the-code&state=the-state", timeout=5
+    ).read()
+    thread.join(timeout=5)
+
+    assert outcome == ["the-code"]
+
+
+def test_a_mismatched_state_is_refused() -> None:
+    """The CSRF check: a redirect this process did not start is not accepted.
+
+    Without it, anyone able to reach the loopback listener during the seconds
+    it exists could feed in an authorization code of their choosing, and the
+    token minted from it would be for their account, not this one.
+    """
+    thread, outcome, port = _serve("the-state")
+
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/?code=the-code&state=not-the-state", timeout=5
+    ).read()
+    thread.join(timeout=5)
+
+    assert isinstance(outcome[0], mcp_auth.McpAuthError)
+    assert "did not match" in str(outcome[0])
+
+
+def test_an_authorization_error_is_reported_not_swallowed() -> None:
+    """A refusal upstream must not look like a timeout."""
+    thread, outcome, port = _serve("the-state")
+
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/?error=access_denied&state=the-state", timeout=5
+    ).read()
+    thread.join(timeout=5)
+
+    assert isinstance(outcome[0], mcp_auth.McpAuthError)
+    assert "access_denied" in str(outcome[0])
+
+
+def test_a_response_with_no_code_is_refused() -> None:
+    """A 200 that carried nothing usable is still a failure."""
+    thread, outcome, port = _serve("the-state")
+
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/?state=the-state", timeout=5
+    ).read()
+    thread.join(timeout=5)
+
+    assert isinstance(outcome[0], mcp_auth.McpAuthError)
+    assert "no code" in str(outcome[0])
+
+
+def test_the_pkce_challenge_is_the_s256_of_the_verifier() -> None:
+    """S256, not plain: the challenge must not be the secret it protects."""
+    verifier, challenge = mcp_auth._pkce_pair()
+
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    assert challenge == expected
+    assert challenge != verifier
+    assert "=" not in challenge
+
+
+def test_two_logins_do_not_share_a_verifier() -> None:
+    """A predictable verifier would make PKCE decorative."""
+    assert mcp_auth._pkce_pair()[0] != mcp_auth._pkce_pair()[0]
+
+
+def test_the_token_store_is_owner_only(tmp_path: Path) -> None:
+    """The minted token is the one credential this tool does write down."""
+    target = tmp_path / "nested" / "tokens.json"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(mcp_auth.paths, "token_store_path", lambda: target)
+        mcp_auth.write_store({"refresh_token": FAKE_JWT})
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+
+
+def test_a_corrupt_token_store_reads_as_absent(tmp_path: Path) -> None:
+    """Another login is the remedy; refusing to run would be worse."""
+    target = tmp_path / "tokens.json"
+    target.write_text("{not json", encoding="utf-8")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(mcp_auth.paths, "token_store_path", lambda: target)
+
+        assert mcp_auth.read_store() == {}
+
+
+class _FakeResponse:
+    """The two attributes ``_get_json`` reads."""
+
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> Any:
+        """Return the decoded document."""
+        return self._payload
+
+    @property
+    def text(self) -> str:
+        """Return the body, for the error path."""
+        return json.dumps(self._payload)
+
+
+class _FakeClient:
+    """Serves a fixed map of URL to document."""
+
+    def __init__(self, documents: dict[str, Any]) -> None:
+        self.documents = documents
+
+    def get(self, url: str, **_: Any) -> _FakeResponse:
+        """Return the document registered for ``url``, or a 404."""
+        if url in self.documents:
+            return _FakeResponse(self.documents[url])
+        return _FakeResponse({"error": "not found"}, status_code=404)
+
+
+_RESOURCE = "https://api.wisprflow.ai/connect/mcp"
+_PROTECTED = "https://api.wisprflow.ai/.well-known/oauth-protected-resource/connect/mcp"
+
+
+def test_discovery_refuses_a_non_https_authorization_server() -> None:
+    """The resource document chooses where a token is exchanged.
+
+    PKCE and ``state`` protect the code in flight. Neither helps when the
+    issuer itself is the attacker, so the hop is checked rather than followed.
+    """
+    client = _FakeClient(
+        {_PROTECTED: {"authorization_servers": ["http://issuer.example"]}}
+    )
+
+    with pytest.raises(mcp_auth.McpAuthError, match="non-https"):
+        mcp_auth.discover(client, _RESOURCE)
+
+
+def test_discovery_refuses_metadata_that_names_another_issuer() -> None:
+    """RFC 8414 section 3.3: the issuer must match where it was fetched from.
+
+    Without the check, a document served at one issuer can name a different
+    one's endpoints and nothing notices.
+    """
+    client = _FakeClient(
+        {
+            _PROTECTED: {"authorization_servers": ["https://issuer.example"]},
+            "https://issuer.example/.well-known/oauth-authorization-server": {
+                "issuer": "https://somewhere-else.example",
+                "token_endpoint": "https://somewhere-else.example/token",
+            },
+        }
+    )
+
+    with pytest.raises(mcp_auth.McpAuthError, match="claims issuer"):
+        mcp_auth.discover(client, _RESOURCE)
+
+
+def test_discovery_accepts_a_consistent_advertisement() -> None:
+    """The refusals above must not be refusing everything."""
+    client = _FakeClient(
+        {
+            _PROTECTED: {
+                "authorization_servers": ["https://issuer.example"],
+                "resource": _RESOURCE,
+            },
+            "https://issuer.example/.well-known/oauth-authorization-server": {
+                "issuer": "https://issuer.example",
+                "token_endpoint": "https://issuer.example/token",
+            },
+        }
+    )
+
+    metadata = mcp_auth.discover(client, _RESOURCE)
+
+    assert metadata["token_endpoint"] == "https://issuer.example/token"
+    assert metadata["resource"] == _RESOURCE

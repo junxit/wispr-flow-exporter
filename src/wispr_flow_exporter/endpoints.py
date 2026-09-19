@@ -1,0 +1,94 @@
+"""Where this tool is willing to send a credential.
+
+Both remote backends read their base URL from the environment, and both attach
+a bearer token to every request made against it. That combination is the one
+place where a configuration value decides who receives a secret, so it is
+checked here rather than at either call site.
+
+The check exists because the environment is wider than it looks. ``cli`` loads
+a ``.env`` before reading these variables, and python-dotenv's search walks
+*up* from the working directory -- so a file placed in any ancestor of wherever
+the operator happens to run can set ``WISPR_API_BASE``. Measured, not assumed:
+a ``.env`` two directories up resolved the API base to ``http://evil.example``
+and nothing objected. An override that redirects the account token to another
+host over cleartext should not be something a stray file can do quietly.
+
+This module is deliberately free of both backends' vocabulary so either may
+import it. The MCP modules may not reference the borrowed credential's path at
+all -- an invariant asserted against the source in ``tests/test_mcp.py`` -- and
+a shared helper that named it would break that separation.
+"""
+
+from __future__ import annotations
+
+from urllib.parse import urlsplit
+
+#: Set to opt into a host this tool does not ship as a default. Requiring a
+#: second variable is the point: one stray value can no longer redirect a
+#: credential, because the redirect and the consent cannot both be accidents.
+OVERRIDE_ENV = "WISPR_ALLOW_ENDPOINT_OVERRIDE"
+
+
+class EndpointError(Exception):
+    """A configured endpoint is not one a credential may be sent to."""
+
+
+def host_of(url: str) -> str:
+    """Return the lowercase host of a URL, or the empty string.
+
+    Args:
+        url: Any URL.
+
+    Returns:
+        The hostname, lowercased, or ``""`` when there is none.
+    """
+    return (urlsplit(url).hostname or "").lower()
+
+
+def validated_endpoint(
+    raw: str, *, default: str, variable: str, allow_override: bool = False
+) -> str:
+    """Check a configured endpoint before a credential is attached to it.
+
+    Two rules, in order. The transport must be ``https``, with no exception --
+    a bearer token does not travel in cleartext even to the right host. And the
+    host must be the one this tool ships, unless the operator has separately set
+    :data:`OVERRIDE_ENV`, which keeps a staging host reachable while making it a
+    decision rather than a side effect.
+
+    The default is returned unexamined when nothing overrode it, so the common
+    path cannot be broken by a parsing disagreement.
+
+    Args:
+        raw: The configured value, already stripped. Empty means unset.
+        default: The value this tool ships.
+        variable: Environment variable name, for the error message.
+        allow_override: Whether :data:`OVERRIDE_ENV` is set for this run.
+
+    Returns:
+        The endpoint to use.
+
+    Raises:
+        EndpointError: The value is not https, has no host, or names a
+            different host without the override.
+    """
+    if not raw or raw == default:
+        return default
+
+    split = urlsplit(raw)
+    if split.scheme != "https":
+        raise EndpointError(
+            f"{variable} must use https, got {split.scheme or 'no scheme'!r}. "
+            "A bearer token is attached to every request made against it."
+        )
+    if not split.hostname:
+        raise EndpointError(f"{variable} has no host: {raw!r}")
+
+    expected = host_of(default)
+    if split.hostname.lower() != expected and not allow_override:
+        raise EndpointError(
+            f"{variable} points at {split.hostname.lower()!r}, not {expected!r}. "
+            f"Set {OVERRIDE_ENV}=1 as well if that is deliberate -- this tool "
+            "sends the account's bearer token to whatever host it is given."
+        )
+    return raw

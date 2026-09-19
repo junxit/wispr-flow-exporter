@@ -68,6 +68,20 @@ class Credential:
         """
         return {"Authorization": self.token}
 
+    def __repr__(self) -> str:
+        """Render without the token, so a traceback cannot leak it.
+
+        This is not hypothetical for the borrowed credential specifically:
+        ``CloudClient`` is a dataclass holding one as its first field, so its
+        generated repr would print the account's bearer token in full -- into a
+        ``pytest --showlocals`` dump, a debugger, or any log line that
+        interpolated the client.
+
+        Returns:
+            The origin and nothing else.
+        """
+        return f"Credential(origin={self.origin!r})"
+
 
 def resolve_credential(session_path: Path) -> Credential:
     """Find a usable bearer token, or explain why there is not one.

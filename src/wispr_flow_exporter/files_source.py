@@ -93,7 +93,7 @@ class MeetingArtifacts:
         Returns:
             The size, or ``0`` when the artifact is absent or unreadable.
         """
-        path = getattr(self, artifact, None)
+        path: Path | None = getattr(self, artifact, None)
         if path is None:
             return 0
         try:
@@ -264,7 +264,7 @@ def _as_turn(payload: dict[str, Any]) -> Turn:
 
     return Turn(
         turn_id=str(payload.get("id", "")),
-        text=payload.get("text") if isinstance(payload.get("text"), str) else "",
+        text=raw_text if isinstance(raw_text := payload.get("text"), str) else "",
         offset=parse_clock(payload.get("timestamp")),
         speaker_id=speaker_id,
         speaker_source=source if isinstance(source, str) else None,
@@ -372,7 +372,27 @@ def read_transcript(path: Path | None) -> Transcript:
     return result
 
 
-def inventory(meetings_dir: Path) -> dict[str, object]:
+@dataclass(frozen=True, slots=True)
+class Inventory:
+    """What the meetings directory holds, for ``doctor``.
+
+    A record rather than a ``dict[str, object]``: the three values have three
+    different types, so every reader had to cast one of them back before using
+    it, and ``int(marks["audio_bytes"])`` is not a cast anyone should have to
+    write to print a number.
+
+    Attributes:
+        directories: Meeting directories discovered.
+        artifacts: Per-artifact count of the directories carrying it.
+        audio_bytes: Total size of every recording found.
+    """
+
+    directories: int
+    artifacts: dict[str, int]
+    audio_bytes: int
+
+
+def inventory(meetings_dir: Path) -> Inventory:
     """Summarize what the meetings directory holds, for ``doctor``.
 
     Args:
@@ -382,12 +402,11 @@ def inventory(meetings_dir: Path) -> dict[str, object]:
         Directory count, a per-artifact present count, and total audio bytes.
     """
     found = list(discover_meetings(meetings_dir))
-    counts = {
-        name: sum(1 for item in found if name in item.present)
-        for name in ARTIFACT_NAMES
-    }
-    return {
-        "directories": len(found),
-        "artifacts": counts,
-        "audio_bytes": sum(item.size_of("audio") for item in found),
-    }
+    return Inventory(
+        directories=len(found),
+        artifacts={
+            name: sum(1 for item in found if name in item.present)
+            for name in ARTIFACT_NAMES
+        },
+        audio_bytes=sum(item.size_of("audio") for item in found),
+    )
