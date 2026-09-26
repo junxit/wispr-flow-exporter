@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from wispr_flow_exporter.schema import EXPECTED
@@ -321,3 +322,32 @@ def archive_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def network(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.MockTransport:
+    """Serve a handler's responses the way a socket does: unread.
+
+    Both HTTP clients read the raw body, so they can bound what it inflates
+    to, and ``httpx.Response(200, json=...)`` arrives already read -- a client
+    streaming it would find nothing left. Re-streaming keeps handlers short. A
+    handler testing a content encoding passes ``stream=`` itself, because a
+    body given as ``content=`` has already been decoded.
+
+    Args:
+        handler: Answers one request.
+
+    Returns:
+        A transport to inject into ``CloudClient`` or ``McpClient``.
+    """
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        response = handler(request)
+        if not response.is_stream_consumed:
+            return response
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=httpx.ByteStream(response.content),
+        )
+
+    return httpx.MockTransport(serve)

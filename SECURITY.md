@@ -121,7 +121,10 @@ spoke.
   Enforced by test on both sides: `cloud_auth.py` still may not contain
   `grant_type` or `/auth/v1/token`, and the four MCP modules may not reference
   `read_access_token`, `cloud_auth`, the Supabase issuer, or `session.json` —
-  so the minting path cannot reach the borrowed one at all.
+  so the minting path cannot reach the borrowed one at all. Nor may importing
+  them load `cloud_auth` or `cloud_api`, asserted in a fresh interpreter: the
+  source scan alone passed through 0.4.1 while `mcp_api` took its retry
+  constants from `cloud_api`, which loads `cloud_auth`.
 
 - **Where the minted token lives.** `~/.config/wispr-flow-exporter/`
   (`XDG_CONFIG_HOME` when set), file `0600` in a directory `0700`. Deliberately
@@ -163,6 +166,22 @@ spoke.
   (`has_more`, `next_cursor`, `nextCursor`) and reports loudly when a response
   says it withheld records. An archive holding one page and saying nothing would
   be indistinguishable from a complete one.
+
+- **A remote host decides neither how much this tool allocates nor how long it
+  waits.** Both API clients read through `transport.py`. A body is streamed and
+  inflated there rather than by httpx, under a 64 MiB cap on what it *inflates
+  to*, and no single inflation step may produce more than the cap still allows.
+  Only `gzip` and `deflate` are offered; a response declaring anything else, or
+  more than one encoding, is refused before its body is read — stacking is how
+  a 590-byte body made 0.4.1 allocate 558 MiB. A body that is not JSON,
+  including one nested too deeply to decode, is that request's failure rather
+  than the run's. `Retry-After` is honored up to 60 seconds, as seconds or as a
+  date; a negative, non-finite or unreadable value means the client's own
+  backoff, never an immediate retry.
+
+  The OAuth requests `login` and token refresh make, in `mcp_auth.py`, do not
+  go through this path yet and still read whole bodies. 0.4.0's changelog said
+  all three HTTP clients were capped; it was true of two.
 
 - **Redaction is at the sink, not the source.** Every diagnostic stream — log
   lines, `--verbose` output, exception messages, the run summary — passes

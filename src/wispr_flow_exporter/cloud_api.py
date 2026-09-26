@@ -33,7 +33,6 @@ code path that writes to Wispr Flow's servers.
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -42,28 +41,22 @@ from typing import Any, Protocol
 from . import USER_AGENT
 from .cloud_auth import Credential
 from .local_config import redact
-from .transport import ResponseTooLarge, read_capped
+from .transport import (
+    ACCEPT_ENCODING,
+    BACKOFF,
+    MAX_RETRIES,
+    MIN_INTERVAL,
+    NotJson,
+    ResponseRefused,
+    Retry,
+    decode_json,
+    read_capped,
+    retry_after,
+)
 
 DEFAULT_BASE = "https://api.wisprflow.ai"
 DEFAULT_TIMEOUT = 30.0
-MAX_RETRIES = 4
-# Paced conservatively. This is someone else's private API and the archive is
-# never urgent; being a quiet client is worth more than being a fast one.
-MIN_INTERVAL = 0.25
-BACKOFF = (2.0, 5.0, 15.0, 30.0)
 
-
-class _Retry(Exception):
-    """Internal: leave the streaming block, then wait and try again.
-
-    Streaming means the retry decision is made inside a ``with``. Raising is
-    how the response gets closed before the sleep, rather than being held open
-    across it.
-    """
-
-    def __init__(self, wait: float) -> None:
-        super().__init__(wait)
-        self.wait = wait
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -271,6 +264,9 @@ class CloudClient:
         timeout: Per-request timeout in seconds.
         endpoints: The table names are resolved against. Defaults to the
             archived set; the discovery probe passes a wider one.
+        transport: An httpx transport to use instead of the network. Tests
+            inject one, so entering the client builds the same headers a real
+            run sends.
         failures: Endpoints that failed, with redacted reasons.
         results: What each attempted endpoint returned, structurally.
     """
@@ -279,6 +275,7 @@ class CloudClient:
     base_url: str = DEFAULT_BASE
     timeout: float = DEFAULT_TIMEOUT
     endpoints: Mapping[str, Endpoint] = field(default_factory=lambda: ENDPOINTS)
+    transport: Any = None
     failures: list[tuple[str, str]] = field(default_factory=list)
     results: dict[str, EndpointResult] = field(default_factory=dict)
     _client: Any = None
@@ -300,9 +297,11 @@ class CloudClient:
             timeout=self.timeout,
             headers={
                 "Accept": "application/json",
+                "Accept-Encoding": ACCEPT_ENCODING,
                 "User-Agent": USER_AGENT,
                 **self.credential.header(),
             },
+            transport=self.transport,
         )
         return self
 
@@ -383,9 +382,9 @@ class CloudClient:
                             )
                         # Honour Retry-After when the server sends one; it
                         # knows more about its own load than a fixed ladder.
-                        wait = _retry_after(response.headers.get("Retry-After"))
+                        wait = retry_after(response.headers.get("Retry-After"))
                         sleep_for = wait if wait is not None else BACKOFF[attempt]
-                        raise _Retry(sleep_for)
+                        raise Retry(sleep_for)
 
                     if status in (401, 403):
                         # Not retryable, and the likeliest cause is an access
@@ -405,12 +404,12 @@ class CloudClient:
                         )
 
                     raw = read_capped(response)
-            except _Retry as retry:
+            except Retry as retry:
                 time.sleep(retry.wait)
                 continue
-            except ResponseTooLarge as error:
+            except ResponseRefused as error:
                 # Not retried: a server that answered this way once will do it
-                # again, and the point of the cap is to stop allocating.
+                # again, and the point of the cap is to stop reading.
                 return self._record(name, path, None, reason=str(error))
             except httpx.HTTPError as error:
                 reason = redact(str(error)) or error.__class__.__name__
@@ -425,29 +424,10 @@ class CloudClient:
                 # confused in a diagnosis.
                 return self._record(name, path, status, reason="no content")
             try:
-                body = json.loads(raw)
-            except ValueError:
+                body = decode_json(raw)
+            except NotJson:
                 return self._record(
                     name, path, status, reason="response was not JSON"
                 )
             return self._record(name, path, status, payload=body)
         return None
-
-
-def _retry_after(value: str | None) -> float | None:
-    """Parse a ``Retry-After`` header expressed in seconds.
-
-    Args:
-        value: The header value, if present.
-
-    Returns:
-        Seconds to wait, or ``None`` when absent or not a number.
-    """
-    if not value:
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        return None
-    # A hostile or broken header must not park the run for an hour.
-    return max(0.0, min(seconds, 60.0))

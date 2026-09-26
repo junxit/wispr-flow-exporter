@@ -8,6 +8,7 @@ endpoint, and a test that reached the network could not prove it did not.
 
 from __future__ import annotations
 
+import gzip
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,11 +16,12 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot
+from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot, network
 
-from wispr_flow_exporter import cloud_api, cloud_auth
+from wispr_flow_exporter import USER_AGENT, cloud_api, cloud_auth
 from wispr_flow_exporter.cloud_api import (
     ALLOWED_PREFIXES,
+    BACKOFF,
     CANDIDATES,
     DENIED,
     ENDPOINTS,
@@ -99,27 +101,22 @@ class _Recorder:
 
 
 def _client(handler: Any, **kwargs: Any) -> CloudClient:
-    """Build a client wired to a mock transport.
+    """Build an open client whose requests reach ``handler`` instead of a host.
 
-    Deliberately not used with ``with``: entering the context builds a real
-    httpx.Client, which would replace the mock installed here. An earlier
-    version of this helper did exactly that and four tests silently exercised
-    a live transport instead of the handler.
+    The handler is injected as the client's transport, so entering the client
+    builds exactly the httpx.Client a real run does and only the socket is
+    replaced. This helper used to install a hand-built client instead, which
+    sent a ``Bearer`` scheme the real one never does -- so no test exercised
+    the headers the service actually receives.
 
     Args:
         handler: A MockTransport handler.
         **kwargs: Passed to :class:`CloudClient`.
 
     Returns:
-        A client ready to fetch, which the caller closes.
+        A client ready to fetch.
     """
-    client = CloudClient(CREDENTIAL, **kwargs)
-    client._client = httpx.Client(
-        transport=httpx.MockTransport(handler),
-        base_url=client.base_url,
-        headers={"Authorization": f"Bearer {FAKE_JWT}"},
-    )
-    return client
+    return CloudClient(CREDENTIAL, transport=network(handler), **kwargs).__enter__()
 
 
 # --- credentials ----------------------------------------------------------
@@ -246,15 +243,40 @@ def test_a_successful_fetch_returns_the_body() -> None:
     assert client.failures == []
 
 
+def test_the_request_carries_what_a_real_run_sends() -> None:
+    """The headers the service receives, as the client itself builds them.
+
+    The token goes bare -- the service answers 401 to a Bearer scheme -- and
+    only the encodings the client can inflate under its cap are offered.
+    """
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    _client(handler).fetch("user_profile")
+
+    (request,) = seen
+    assert request.method == "GET"
+    assert str(request.url) == "https://api.wisprflow.ai/api/v1/user/profile"
+    assert request.headers["Authorization"] == FAKE_JWT
+    assert request.headers["Accept-Encoding"] == "gzip, deflate"
+    assert request.headers["User-Agent"] == USER_AGENT
+
+
 def test_an_oversized_response_is_refused_rather_than_allocated() -> None:
     """The bound that makes a hostile or broken host cost bounded memory.
 
-    httpx decompresses before this sees a byte, so the number being capped is
-    what the process allocates -- which is the number a compression bomb is
-    trying to make large.
+    What is capped is what the body inflates to -- the number a compression
+    bomb is trying to make large -- not what crossed the wire.
     """
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"x" * 4096)
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(gzip.compress(b"x" * 4096)),
+        )
 
     client = _client(handler)
     with pytest.MonkeyPatch.context() as patch:
@@ -284,6 +306,33 @@ def test_the_cap_admits_a_body_that_fits() -> None:
         assert client.fetch("meetings") == {"items": [{"id": "m-1"}]}
 
 
+def test_stacked_encodings_are_refused_and_not_retried() -> None:
+    """Each layer multiplies the last, so no cap on the result could hold.
+
+    Measured on 0.4.1: a 590-byte body declaring ``gzip, gzip`` allocated
+    558 MiB before the 64 MiB cap refused it, because each read was inflated
+    whole, through both layers, before the cap saw a byte.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        body = gzip.compress(gzip.compress(b"{}"))
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip, gzip"},
+            stream=httpx.ByteStream(body),
+        )
+
+    client = _client(handler)
+    assert client.fetch("user_profile") is None
+
+    assert calls["n"] == 1
+    assert client.failures == [
+        ("user_profile", "refusing stacked content encodings: gzip, gzip")
+    ]
+
+
 def test_a_server_error_is_retried_then_recorded() -> None:
     """Transient failures get a ladder; a persistent one is reported."""
     calls = {"n": 0}
@@ -300,6 +349,30 @@ def test_a_server_error_is_retried_then_recorded() -> None:
 
     assert calls["n"] == MAX_RETRIES
     assert client.failures == [("notes", "HTTP 503")]
+
+
+def test_a_retry_after_that_says_nothing_usable_waits_the_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that asked for a pause gets one, even when it asked badly.
+
+    Measured on 0.4.1: ``Retry-After: -5`` and ``Retry-After: nan`` both
+    meant retry at once, against a server that had just said to wait.
+    """
+    slept: list[float] = []
+    monkeypatch.setattr(cloud_api.time, "sleep", slept.append)
+    monkeypatch.setattr(cloud_api, "MIN_INTERVAL", 0)
+    replies = iter(
+        [
+            httpx.Response(503, headers={"Retry-After": "-5"}),
+            httpx.Response(503, headers={"Retry-After": "nan"}),
+            httpx.Response(200, json={}),
+        ]
+    )
+    client = _client(lambda request: next(replies))
+
+    assert client.fetch("user_profile") == {}
+    assert slept == [BACKOFF[0], BACKOFF[1]]
 
 
 def test_requests_are_paced_to_four_a_second(
@@ -349,6 +422,18 @@ def test_a_non_json_response_is_reported_not_guessed() -> None:
     assert client.failures == [("todos", "response was not JSON")]
 
 
+def test_a_body_nested_too_deep_to_decode_is_reported_not_raised() -> None:
+    """Measured on 0.4.1: 100 kB of brackets ended the run with a traceback.
+
+    ``json.loads`` raises RecursionError, not ValueError, past a few thousand
+    levels, and ``fetch`` caught only ValueError.
+    """
+    client = _client(lambda request: httpx.Response(200, content=b"[" * 100_000))
+
+    assert client.fetch("user_profile") is None
+    assert client.failures == [("user_profile", "response was not JSON")]
+
+
 def test_an_unknown_endpoint_is_a_programming_error() -> None:
     """The endpoint set is data, and asking outside it is a bug not a request."""
     def handler(request: httpx.Request) -> httpx.Response:
@@ -363,17 +448,6 @@ def test_the_client_refuses_to_work_unopened() -> None:
     """Using the transport without entering the context is a bug."""
     with pytest.raises(CloudError, match="context manager"):
         CloudClient(CREDENTIAL).fetch("meetings")
-
-
-def test_a_hostile_retry_after_cannot_park_the_run() -> None:
-    """A broken header must not stop a backup for an hour."""
-    from wispr_flow_exporter.cloud_api import _retry_after
-
-    assert _retry_after("3") == 3.0
-    assert _retry_after("100000") == 60.0
-    assert _retry_after("-5") == 0.0
-    assert _retry_after("soon") is None
-    assert _retry_after(None) is None
 
 
 # --- the pass -------------------------------------------------------------

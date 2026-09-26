@@ -175,6 +175,42 @@ wrapped at 72 columns, US English.
   stayed on disk. A sync or a render now takes an advisory lock on .lock
   in the archive root and a second one exits 1 saying why. Dry runs and
   verify take no lock.
+- The response cap counts what a body inflates to, and this tool now
+  does the inflating. 0.4.0 capped httpx's decoded output, but httpx
+  inflates each network read whole before handing it over, and chains
+  one decoder per declared encoding. Measured on 0.4.1: a 590-byte body
+  declaring `Content-Encoding: gzip, gzip` allocated 558 MiB before the
+  64 MiB cap refused it, and 32 KB of gzip arriving in one read peaked
+  at 77 MiB against a 1 MiB cap. No inflation step may now produce more
+  than the cap still allows -- that body peaks at 2 MiB -- only gzip and
+  deflate are offered, and a response declaring more than one encoding,
+  or one this client never offered, is refused before it is read.
+- A body too large or too deeply nested is that request's failure, not
+  the run's. json.loads raises RecursionError, not ValueError, past a
+  few thousand levels, and neither client caught it; nor did the MCP
+  client catch a reply over the cap, which the REST client had always
+  recorded against its endpoint. Measured on 0.4.1: 100 kB of brackets
+  from either backend, or one oversized MCP reply, ended the run with a
+  traceback. Each is now recorded against the endpoint or call that
+  returned it, and the pass goes on.
+- Retry-After is read in both its forms, and a value that says nothing
+  usable no longer means "now". Measured on 0.4.1: -5 and nan both
+  became a zero wait -- an immediate retry against a server that had
+  just asked for a pause -- and an HTTP date was ignored. Unusable
+  values fall back to the backoff ladder; dates are honored up to the
+  same 60-second ceiling as seconds.
+- The MCP backend no longer loads the borrowed credential's module. It
+  took its retry constants from cloud_api, which imports cloud_auth, so
+  importing the MCP backend imported the code that reads Wispr Flow's
+  own session -- measured in a fresh interpreter on 0.4.1 -- while the
+  test asserting that the two never meet scanned source text and
+  passed. Retries, pacing and the cap now live in transport.py, which
+  both clients share, and the separation is asserted on what Python
+  actually imports.
+- The cloud client's tests sent their requests through a hand-built
+  httpx client carrying a Bearer scheme the real one never sends, so no
+  test saw the headers the service receives. Both clients now take an
+  injected transport, and the tests open them exactly as a run does.
 
 0.4.1
 -----

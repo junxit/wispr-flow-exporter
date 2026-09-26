@@ -9,19 +9,24 @@ prove it had not spent one.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 import stat
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
-from conftest import FAKE_JWT, MEETING_A, MEETING_B, archive_snapshot
+from conftest import FAKE_JWT, MEETING_A, MEETING_B, archive_snapshot, network
 
-from wispr_flow_exporter import mcp_api, mcp_auth
+from wispr_flow_exporter import USER_AGENT, mcp_api, mcp_auth
 from wispr_flow_exporter.mcp_api import ALLOWED_METHODS, READ_TOOLS, McpError, unwrap
 from wispr_flow_exporter.mcp_auth import McpCredential
 from wispr_flow_exporter.mcp_schema import (
@@ -38,6 +43,7 @@ from wispr_flow_exporter.sync_mcp import (
     sync_mcp,
     truncated,
 )
+from wispr_flow_exporter.transport import read_capped
 
 _TOOLS = [
     {"name": name, "inputSchema": {"type": "object", "properties": {}}}
@@ -184,6 +190,33 @@ def test_the_mcp_backend_never_touches_the_borrowed_session() -> None:
             assert quoted not in raw, f"{module}: {quoted}"
 
 
+def test_the_mcp_backend_does_not_even_load_the_borrowed_credentials_module() -> None:
+    """The same rule, asserted on what Python imports rather than on text.
+
+    The source scan above passed on 0.4.1 while ``mcp_api`` imported its retry
+    constants from ``cloud_api``, which imports ``cloud_auth`` -- so loading
+    the MCP backend loaded the borrowed credential's module with it. A fresh
+    interpreter is the only place the question has an honest answer; in this
+    one, other tests have imported everything already.
+    """
+    modules = ("mcp_api", "mcp_auth", "mcp_schema", "sync_mcp")
+    probe = "\n".join(
+        [
+            "import json, sys",
+            *(f"import wispr_flow_exporter.{name}" for name in modules),
+            "print(json.dumps(sorted(sys.modules)))",
+        ]
+    )
+    loaded = json.loads(
+        subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+        ).stdout
+    )
+
+    assert "wispr_flow_exporter.sync_mcp" in loaded
+    assert not [name for name in loaded if name.startswith("wispr_flow_exporter.cloud")]
+
+
 def test_the_borrowed_credential_module_is_unchanged_in_strength() -> None:
     """Adding a backend that refreshes must not relax the one that must not.
 
@@ -226,6 +259,9 @@ def test_a_tool_result_is_unwrapped_one_parse_deeper() -> None:
     assert unwrap({"content": [{"type": "text", "text": '{"a": 1}'}]}) == {"a": 1}
     assert unwrap({"structuredContent": {"b": 2}}) == {"b": 2}
     assert unwrap({"content": [{"type": "text", "text": "plain"}]}) == "plain"
+    # Text too deeply nested to decode is text, not a RecursionError.
+    deep = "[" * 100_000
+    assert unwrap({"content": [{"type": "text", "text": deep}]}) == deep
 
 
 def test_an_event_stream_body_is_parsed() -> None:
@@ -245,6 +281,135 @@ def test_a_short_response_is_reported_not_absorbed() -> None:
     assert truncated({"meetings": [], "has_more": True})
     assert truncated({"meetings": [], "next_cursor": "more"})
     assert not truncated({"meetings": [], "has_more": False, "next_cursor": None})
+
+
+# --- transport ------------------------------------------------------------
+
+
+class _Server:
+    """The server's side of the wire: the handshake, then ``reply`` for tools."""
+
+    def __init__(self, reply: Callable[[dict[str, Any]], httpx.Response]) -> None:
+        """Remember how to answer tool calls.
+
+        Args:
+            reply: Answers one ``tools/call`` message.
+        """
+        self.reply = reply
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request.
+
+        Args:
+            request: What the client sent.
+
+        Returns:
+            The server's answer.
+        """
+        self.requests.append(request)
+        message = json.loads(request.content)
+        if message["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        if message["method"] == "tools/call":
+            return self.reply(message)
+        result = (
+            {"tools": _TOOLS}
+            if message["method"] == "tools/list"
+            else {"protocolVersion": "2025-06-18", "serverInfo": {"name": "wispr"}}
+        )
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": message["id"], "result": result}
+        )
+
+
+def _open(server: _Server, monkeypatch: pytest.MonkeyPatch) -> mcp_api.McpClient:
+    """Open a client against ``server``, handshake included, without pacing.
+
+    Args:
+        server: The fake server.
+        monkeypatch: Used to drop the request interval to zero.
+
+    Returns:
+        The open client.
+    """
+    monkeypatch.setattr(mcp_api, "MIN_INTERVAL", 0)
+    client = mcp_api.McpClient(
+        McpCredential(FAKE_JWT, "test"),
+        endpoint="https://mcp.example.invalid/mcp",
+        transport=network(server),
+    )
+    return client.__enter__()
+
+
+def test_the_handshake_carries_what_a_real_run_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headers as the client builds them: a Bearer, and only boundable encodings."""
+    server = _Server(lambda message: httpx.Response(500))
+    _open(server, monkeypatch)
+
+    methods = [json.loads(request.content)["method"] for request in server.requests]
+    assert methods == ["initialize", "notifications/initialized", "tools/list"]
+    for request in server.requests:
+        assert request.method == "POST"
+        assert request.headers["Authorization"] == f"Bearer {FAKE_JWT}"
+        assert request.headers["Accept-Encoding"] == "gzip, deflate"
+        assert request.headers["User-Agent"] == USER_AGENT
+
+
+def test_an_oversized_reply_is_one_failure_not_the_end_of_the_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on 0.4.1: ResponseTooLarge escaped ``call`` with a traceback.
+
+    The REST client recorded it as that endpoint's failure; this client did
+    not handle it at all, so one oversized meeting ended the whole pass.
+    """
+    def reply(message: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(gzip.compress(b" " * 4096)),
+        )
+
+    client = _open(_Server(reply), monkeypatch)
+    monkeypatch.setattr(
+        mcp_api, "read_capped", lambda response: read_capped(response, limit=1024)
+    )
+
+    assert client.call("get_meeting", {"meeting_id": MEETING_A}) is None
+    assert client.failures == [
+        (
+            f"get_meeting:{MEETING_A}",
+            "response exceeded 1024 bytes and was not read further",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "body", "reason"),
+    [
+        ("application/json", b"[" * 100_000, "response was not JSON"),
+        (
+            "text/event-stream",
+            b"event: message\ndata: " + b"[" * 100_000 + b"\n\n",
+            "response was not a JSON-RPC message",
+        ),
+    ],
+    ids=["json", "event-stream"],
+)
+def test_a_reply_nested_too_deep_is_one_failure_not_the_end_of_the_pass(
+    monkeypatch: pytest.MonkeyPatch, kind: str, body: bytes, reason: str
+) -> None:
+    """Measured on 0.4.1: RecursionError escaped ``call`` from either parser."""
+    def reply(message: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": kind}, content=body)
+
+    client = _open(_Server(reply), monkeypatch)
+
+    assert client.call("get_meeting", {"meeting_id": MEETING_A}) is None
+    assert client.failures == [(f"get_meeting:{MEETING_A}", reason)]
 
 
 # --- the two ownership rules ----------------------------------------------

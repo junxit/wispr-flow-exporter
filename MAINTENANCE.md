@@ -325,8 +325,10 @@ make a change pass, stop.
 - **Never write to `session.json`,** never copy it into the archive, never log a
   token. `redact()` in `local_config.py` runs at the output sink so a new code
   path cannot forget it.
-- **Stay a quiet client.** 4 req/s (`MIN_INTERVAL = 0.25`), `Retry-After`
-  honoured up to 60s. Do not raise it. The archive is never urgent.
+- **Stay a quiet client.** 4 req/s (`MIN_INTERVAL = 0.25` in `transport.py`,
+  which both remote clients share). Do not raise it. `Retry-After` is honored
+  up to 60 s, as seconds or as a date; a value that cannot be used means the
+  backoff ladder, never zero. The archive is never urgent.
 - **The zero-bytes invariant.** A second sync with nothing changed upstream must
   write no byte and no mtime anywhere, for both backends. If a new endpoint
   breaks it, the cause is almost certainly a self-moving field — add it to

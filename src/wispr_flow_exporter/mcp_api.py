@@ -31,17 +31,26 @@ the REST ones are: the shapes are not a contract.
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from . import USER_AGENT
-from .cloud_api import BACKOFF, MAX_RETRIES, MIN_INTERVAL, _Retry, _retry_after
 from .local_config import redact
 from .mcp_auth import McpCredential
-from .transport import read_capped
+from .transport import (
+    ACCEPT_ENCODING,
+    BACKOFF,
+    MAX_RETRIES,
+    MIN_INTERVAL,
+    NotJson,
+    ResponseRefused,
+    Retry,
+    decode_json,
+    read_capped,
+    retry_after,
+)
 
 #: The revision of the MCP spec this client speaks.
 PROTOCOL_VERSION = "2025-06-18"
@@ -142,8 +151,8 @@ def _parse_sse(text: str) -> Any:
             if not chunk:
                 continue
             try:
-                return json.loads(chunk)
-            except ValueError:
+                return decode_json(chunk)
+            except NotJson:
                 continue
     return None
 
@@ -170,8 +179,8 @@ def unwrap(result: Any) -> Any:
         for block in content:
             if isinstance(block, dict) and isinstance(block.get("text"), str):
                 try:
-                    return json.loads(block["text"])
-                except ValueError:
+                    return decode_json(block["text"])
+                except NotJson:
                     return block["text"]
     return result
 
@@ -211,6 +220,8 @@ class McpClient:
         credential: The minted token, held for the lifetime of the client.
         endpoint: The MCP resource URL.
         timeout: Per-request timeout in seconds.
+        transport: An httpx transport to use instead of the network, for
+            tests.
         failures: Calls that failed, with redacted reasons.
         results: What each attempted call returned.
         server: Server name, version and protocol from the handshake.
@@ -220,6 +231,7 @@ class McpClient:
     credential: McpCredential
     endpoint: str
     timeout: float = DEFAULT_TIMEOUT
+    transport: Any = None
     failures: list[tuple[str, str]] = field(default_factory=list)
     results: dict[str, ToolResult] = field(default_factory=dict)
     server: dict[str, Any] = field(default_factory=dict)
@@ -244,10 +256,12 @@ class McpClient:
             timeout=self.timeout,
             headers={
                 "Accept": "application/json, text/event-stream",
+                "Accept-Encoding": ACCEPT_ENCODING,
                 "Content-Type": "application/json",
                 "User-Agent": USER_AGENT,
                 **self.credential.header(),
             },
+            transport=self.transport,
         )
         self._handshake()
         return self
@@ -309,10 +323,8 @@ class McpClient:
                     if response.status_code in (429, 500, 502, 503, 504):
                         if attempt == MAX_RETRIES - 1:
                             raise McpError(f"HTTP {response.status_code}")
-                        wait = _retry_after(response.headers.get("Retry-After"))
-                        raise _Retry(
-                            wait if wait is not None else BACKOFF[attempt]
-                        )
+                        wait = retry_after(response.headers.get("Retry-After"))
+                        raise Retry(wait if wait is not None else BACKOFF[attempt])
 
                     if response.status_code in (401, 403):
                         raise McpError(
@@ -328,9 +340,13 @@ class McpClient:
                     status = response.status_code
                     kind = response.headers.get("Content-Type", "")
                     raw = read_capped(response)
-            except _Retry as retry:
+            except Retry as retry:
                 time.sleep(retry.wait)
                 continue
+            except ResponseRefused as error:
+                # This call's failure, not retried. It used to escape call()
+                # and end the run with a traceback.
+                raise McpError(str(error)) from error
             except httpx.HTTPError as error:
                 if attempt == MAX_RETRIES - 1:
                     raise McpError(
@@ -346,8 +362,8 @@ class McpClient:
                 payload = _parse_sse(raw.decode("utf-8", errors="replace"))
             else:
                 try:
-                    payload = json.loads(raw)
-                except ValueError as error:
+                    payload = decode_json(raw)
+                except NotJson as error:
                     raise McpError("response was not JSON") from error
             if not isinstance(payload, dict):
                 raise McpError("response was not a JSON-RPC message")
