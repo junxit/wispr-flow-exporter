@@ -38,12 +38,19 @@ spoke.
 
   The mode is applied by `os.open`, not by a `chmod` afterwards, so there is no
   instant at which the file exists more widely readable than it should be —
-  writing first and narrowing second leaves a window, and a test now asserts
-  the mode under a permissive umask rather than only at rest. The same open
-  refuses to follow a symlink at the destination, because temp-file names are
-  predictable. The archive root is narrowed even when it already existed: the
-  default root is the relative `./archive`, which an operator who runs `mkdir
-  archive` first leaves at `0755`.
+  writing first and narrowing second leaves a window, and a test captures the
+  mode each file is created with rather than checking it only at rest. Every
+  write, the copy of a meeting's audio included, goes to a fresh temp name no
+  one can predict, opened with `O_EXCL` and `O_NOFOLLOW` and renamed into
+  place, so a file or symlink planted ahead of time is never written through
+  and two writers of one file never share a temp file. The archive root is
+  narrowed even when it already existed: the default root is the relative
+  `./archive`, which an operator who runs `mkdir archive` first leaves at
+  `0755`.
+
+  A sync or a render holds an advisory lock on `.lock` in the archive root, so
+  a second one — a scheduled run overlapping a manual one — is turned away
+  rather than saving an index that silently drops the first one's records.
 
 - **The plaintext session token.** `session.json` is a bare, unencrypted
   Supabase GoTrue session — a bearer `access_token`, a refresh token, and the

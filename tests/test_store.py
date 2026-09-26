@@ -22,6 +22,7 @@ from wispr_flow_exporter.store import (
     STATE_PRESENT,
     STATE_SOFT_DELETED,
     Archive,
+    ArchiveBusy,
     UnsafeArchivePathError,
     content_hash,
     entity_name,
@@ -514,3 +515,32 @@ def test_snapshot_layout_ignores_dates(archive: Archive) -> None:
     spec = TableSpec(pk="id", layout=Layout.SNAPSHOT, columns=("id",))
     path = archive.record_path("Todos", spec, "x", when=WHEN)
     assert archive.relative(path) == "todos/todos.ndjson"
+
+
+# --- one writer at a time -------------------------------------------------
+
+
+def test_a_second_writer_is_turned_away(tmp_path: Path) -> None:
+    """Two syncs saving one index would each drop the other's records."""
+    first = Archive(root=tmp_path / "archive")
+    second = Archive(root=tmp_path / "archive")
+
+    with first.lock():
+        with pytest.raises(ArchiveBusy, match="another sync or render"):
+            with second.lock():
+                pass
+
+    with second.lock():
+        pass
+
+
+def test_a_read_only_archive_takes_no_lock_and_creates_nothing(tmp_path: Path) -> None:
+    """A dry run or a verify beside a sync is fine; neither writes."""
+    writer = Archive(root=tmp_path / "archive")
+    with writer.lock():
+        with Archive(root=tmp_path / "archive", read_only=True).lock():
+            pass
+
+    with Archive(root=tmp_path / "other", read_only=True).lock():
+        pass
+    assert not (tmp_path / "other").exists()

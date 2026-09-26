@@ -159,6 +159,22 @@ wrapped at 72 columns, US English.
   every write is compare-then-write, and rewriting identical bytes would
   only move mtimes -- it only reported every meeting as written. It now
   says it is no longer needed.
+- Every write goes through a temp name no one can predict. Temp files
+  were <name>.tmp, a fixed name opened with O_TRUNC, so two writers of
+  one file -- two runs refreshing the MCP token at once -- could
+  interleave their bytes in one inode, and a file planted at that name
+  was truncated and written through. Each write now opens a fresh hidden
+  name with O_EXCL and O_NOFOLLOW, renames it into place, and removes it
+  if anything fails, which also ends the debris a failed write used to
+  leave. copy_file_secure, which carries meeting audio, gets the same
+  open and an fchmod on the descriptor: it was the one write the 0.4.0
+  fix missed, and still opened a predictable name with neither flag.
+- Two syncs can no longer write one archive at the same time. Each
+  loaded the index, changed it and saved it, so whichever saved last
+  silently dropped the other's records from the index while their files
+  stayed on disk. A sync or a render now takes an advisory lock on .lock
+  in the archive root and a second one exits 1 saying why. Dry runs and
+  verify take no lock.
 
 0.4.1
 -----

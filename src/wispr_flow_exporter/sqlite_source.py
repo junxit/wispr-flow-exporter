@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -582,41 +582,3 @@ def open_source(path: Path, *, immutable: bool = False) -> SqliteSource:
         An unopened reader, to be used as a context manager.
     """
     return SqliteSource(path, immutable=immutable)
-
-
-def fingerprint(path: Path) -> dict[str, Any]:
-    """Cheaply describe a database's on-disk state.
-
-    Used to short-circuit an entire sync pass when nothing has changed. This
-    is an optimization and never a correctness mechanism: the WAL's modified
-    time moves constantly while the app is running, so a mismatch only means
-    "do the real work".
-
-    Args:
-        path: The database file.
-
-    Returns:
-        Sizes and modification times for the database and its write-ahead log.
-    """
-    result: dict[str, Any] = {}
-    for label, candidate in (("db", path), ("wal", path.with_name(path.name + "-wal"))):
-        try:
-            stat = candidate.stat()
-        except OSError:
-            continue
-        result[f"{label}_size"] = stat.st_size
-        result[f"{label}_mtime_ns"] = stat.st_mtime_ns
-    return result
-
-
-def table_counts(source: SqliteSource, tables: Sequence[str]) -> dict[str, int]:
-    """Count rows for several tables.
-
-    Args:
-        source: An open reader.
-        tables: Table names.
-
-    Returns:
-        Table name to row count.
-    """
-    return {table: source.row_count(table) for table in tables}

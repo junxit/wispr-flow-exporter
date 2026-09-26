@@ -23,7 +23,6 @@ from wispr_flow_exporter.sqlite_source import (
     DriftClass,
     SourceError,
     SqliteSource,
-    fingerprint,
     open_source,
 )
 
@@ -524,26 +523,6 @@ def test_records_of_an_undeclared_table_still_read(
         records = list(source.records("WhisperQuota"))
 
     assert records[0].data == {"id": "q1", "amount": 7}
-
-
-# --- fingerprint ----------------------------------------------------------
-
-
-def test_fingerprint_describes_the_files_that_exist(
-    wispr_db: Callable[..., Path],
-) -> None:
-    """The cheap short-circuit reports the database and, when present, the WAL."""
-    path = wispr_db()
-    marks = fingerprint(path)
-
-    assert marks["db_size"] > 0
-    assert "db_mtime_ns" in marks
-    assert "wal_size" not in marks
-
-
-def test_fingerprint_of_a_missing_file_is_empty(tmp_path: Path) -> None:
-    """A fingerprint is an optimization, so its absence must not raise."""
-    assert fingerprint(tmp_path / "gone.sqlite") == {}
 
 
 def test_source_is_reusable_after_exit(wispr_db: Callable[..., Path]) -> None:

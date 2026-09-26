@@ -22,6 +22,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import stat
 from collections.abc import Iterable
 from pathlib import Path
@@ -99,11 +100,15 @@ def secure_write_bytes(path: Path, payload: bytes) -> None:
     everything this package writes goes through here: the index, the sync
     state, every rendered document, and the MCP token store.
 
-    ``O_NOFOLLOW`` refuses to write through a symlink planted at the
-    destination, which matters because temp-file names are predictable.
-    ``os.open`` still masks the mode by the umask, so it is reapplied on the
-    open descriptor -- ``fchmod``, not ``chmod``, so the thing being narrowed
-    is provably the file just created and not whatever now sits at that name.
+    The path must not exist yet: ``O_EXCL`` refuses a file already there, and
+    ``O_NOFOLLOW`` a symlink. Callers write to a fresh, unpredictable temp name
+    (see :func:`_temp_for`) and rename it into place. Temp names used to be
+    ``<name>.tmp``, fixed and truncated on open, so two writers of the same
+    file -- two runs refreshing the MCP token at once -- could interleave
+    their bytes in one inode, and a file planted at that name ahead of time
+    was written into as it stood. ``os.open`` still masks the mode by the
+    umask, so it is reapplied on the open descriptor -- ``fchmod``, not
+    ``chmod``, so the thing being narrowed is provably the file just created.
 
     ``os.write`` may write less than it was given -- POSIX allows it, and a
     nearly full disk does it -- and returns how much it wrote. One call and no
@@ -119,7 +124,7 @@ def secure_write_bytes(path: Path, payload: bytes) -> None:
     Raises:
         OSError: The write could not be completed.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, FILE_MODE)
     try:
         try:
@@ -134,6 +139,39 @@ def secure_write_bytes(path: Path, payload: bytes) -> None:
             remaining = remaining[written:]
     finally:
         os.close(fd)
+
+
+def _temp_for(path: Path) -> Path:
+    """Name a temp file beside ``path`` that no other writer will choose.
+
+    Hidden, so a half-written file never shows up in a listing, and random, so
+    neither a concurrent writer nor anyone planting a file ahead of time can
+    know it.
+
+    Args:
+        path: The file about to be replaced.
+
+    Returns:
+        A sibling path that does not exist yet.
+    """
+    return path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+
+
+def _replace_with(path: Path, payload: bytes) -> None:
+    """Replace a file's contents atomically, owner-only, leaving no debris.
+
+    Args:
+        path: The file to write.
+        payload: Its new contents.
+    """
+    secure_mkdir(path.parent)
+    tmp = _temp_for(path)
+    try:
+        secure_write_bytes(tmp, payload)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def secure_write_text(path: Path, text: str) -> None:
@@ -217,36 +255,11 @@ def write_json(path: Path, payload: Any) -> None:
         path: Destination file.
         payload: JSON-serializable value.
     """
-    secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
     # Permissions are set on the temp file *before* the rename, so the final
     # path is never briefly world-readable.
-    secure_write_text(
-        tmp, json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    _replace_with(
+        path, json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode()
     )
-    tmp.replace(path)
-
-
-def write_ndjson(path: Path, records: Iterable[Any]) -> int:
-    """Write one JSON object per line, atomically.
-
-    Args:
-        path: Destination file.
-        records: JSON-serializable values, one per output line.
-
-    Returns:
-        The number of records written.
-    """
-    secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    count = 0
-    lines: list[str] = []
-    for record in records:
-        lines.append(json.dumps(record, ensure_ascii=False, default=str))
-        count += 1
-    secure_write_text(tmp, "".join(f"{line}\n" for line in lines))
-    tmp.replace(path)
-    return count
 
 
 def write_text_if_changed(path: Path, text: str) -> bool:
@@ -270,10 +283,7 @@ def write_text_if_changed(path: Path, text: str) -> bool:
             return False
     except (OSError, ValueError):
         pass
-    secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    secure_write_text(tmp, text)
-    tmp.replace(path)
+    _replace_with(path, text.encode("utf-8"))
     return True
 
 
@@ -330,24 +340,28 @@ def copy_file_secure(src: Path, dest: Path) -> str:
         Hex SHA-256 of the copied bytes.
     """
     secure_mkdir(dest.parent)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp = _temp_for(dest)
     digest = hashlib.sha256()
-    # 0600 from creation, so there is no window in which the temp file is
-    # readable by anyone else.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+    # 0600 from creation, and the same open every other write uses: a fresh
+    # name, O_EXCL, O_NOFOLLOW, fchmod on the descriptor. This path used to
+    # open a predictable name with neither flag and chmod it by path
+    # afterwards -- the one write the 0.4.0 fix to secure_write_bytes missed,
+    # although it carries the largest files the archive holds.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, FILE_MODE)
     try:
+        try:
+            os.fchmod(fd, FILE_MODE)
+        except OSError:
+            pass
         with open(fd, "wb", closefd=True) as out, src.open("rb") as handle:
             while chunk := handle.read(CHUNK_SIZE):
                 digest.update(chunk)
                 out.write(chunk)
+        tmp.replace(dest)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    try:
-        os.chmod(tmp, FILE_MODE)
-    except OSError:
-        pass
-    tmp.replace(dest)
     return digest.hexdigest()
 
 
@@ -367,27 +381,6 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def remove_stale_temp(directory: Path) -> int:
-    """Delete leftover ``.tmp`` files from an interrupted earlier run.
-
-    Args:
-        directory: Directory to sweep, non-recursively.
-
-    Returns:
-        The number of files removed.
-    """
-    removed = 0
-    if not directory.is_dir():
-        return removed
-    for candidate in directory.glob("*.tmp"):
-        try:
-            candidate.unlink()
-        except OSError:
-            continue
-        removed += 1
-    return removed
-
-
 def write_bytes_if_changed(path: Path, payload: bytes) -> bool:
     """Write bytes only when they differ from what is already there.
 
@@ -403,8 +396,5 @@ def write_bytes_if_changed(path: Path, payload: bytes) -> bool:
             return False
     except OSError:
         pass
-    secure_mkdir(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    secure_write_bytes(tmp, payload)
-    tmp.replace(path)
+    _replace_with(path, payload)
     return True

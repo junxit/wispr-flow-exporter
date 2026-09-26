@@ -266,6 +266,7 @@ archive/
   index.json                    # machine index, namespaced per entity
   .sync-state.json              # watermarks, pins, app version, observed
                                 # policy, per-endpoint response shapes
+  .lock                         # held while a sync or render writes
   meetings/2026/08/2026-08-21--<slug>--<uuid>/
     meeting.md summary.md notes.md
     transcript.refined.md transcript.live.md

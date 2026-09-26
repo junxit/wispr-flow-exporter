@@ -30,7 +30,7 @@ See ``MAINTENANCE.md`` for what to do when this reports something.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -261,14 +261,6 @@ def detect_cloud_drift(
         broke=tuple(sorted(broke)),
         recovered=tuple(sorted(recovered)),
         unreachable=tuple(sorted(unreachable)),
-    )
-
-
-def _declared_lines(endpoints: Iterable[tuple[str, Endpoint]]) -> list[str]:
-    """Render the declaration as sorted lines, for the pin and for reports."""
-    return sorted(
-        f"{name}\t{endpoint.path}\t{endpoint.expected_status}"
-        for name, endpoint in endpoints
     )
 
 

@@ -568,6 +568,36 @@ def test_a_dry_run_leaves_an_existing_archive_byte_identical(
     assert Archive(root=tmp_path / "archive").entry("meetings", MEETING_B)
 
 
+def test_a_second_sync_through_the_cli_writes_nothing(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """The invariant through main(): the lock file and the saves included."""
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+    main(["sync", "--data-dir", str(data_dir)])
+    before = archive_snapshot(tmp_path / "archive")
+
+    main(["sync", "--data-dir", str(data_dir)])
+
+    assert archive_snapshot(tmp_path / "archive") == before
+    assert (tmp_path / "archive" / ".lock").is_file()
+
+
+def test_a_sync_is_turned_away_while_another_holds_the_archive(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The second writer says why it stopped, and writes nothing."""
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+
+    with Archive(root=tmp_path / "archive").lock():
+        code = main(["sync", "--source", "local", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_FAILURE
+    assert "another sync or render" in capsys.readouterr().err
+    assert not (tmp_path / "archive" / "index.json").exists()
+
+
 def test_an_unreachable_source_is_its_own_exit_code(tmp_path: Path) -> None:
     """Code 5 distinguishes "no database" from "the run failed"."""
     code = main(["schema", "--source", "local", "--data-dir", str(tmp_path / "nope")])

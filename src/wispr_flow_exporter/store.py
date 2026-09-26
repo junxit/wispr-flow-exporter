@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +44,8 @@ from .secure_io import read_json, secure_mkdir, write_json_if_changed
 
 INDEX_NAME = "index.json"
 STATE_NAME = ".sync-state.json"
+# Held for the length of a sync or a render, so two never write one archive.
+LOCK_NAME = ".lock"
 SCHEMA_VERSION = 1
 
 # Records whose creation date cannot be resolved still have to go somewhere,
@@ -68,6 +72,10 @@ ENTITY_DIRS: Mapping[str, str] = {
 
 class UnsafeArchivePathError(Exception):
     """A path would have resolved outside the archive root."""
+
+
+class ArchiveBusy(Exception):
+    """Another process is already writing this archive."""
 
 
 def entity_name(table: str) -> str:
@@ -683,6 +691,46 @@ class Archive:
         return cursor
 
     # --- persistence ------------------------------------------------------
+
+    @contextmanager
+    def lock(self) -> Iterator[None]:
+        """Hold the archive for one writer at a time.
+
+        Two syncs against one archive -- a scheduled one and a manual one, say
+        -- each load the index, each change it, and each save it: whichever
+        saves last wins, and the other's records vanish from the index while
+        their files stay on disk. An advisory ``flock`` on ``.lock`` in the
+        root turns the second writer away instead. A read-only archive takes no
+        lock, so a dry run or a verify still runs beside a sync.
+
+        Yields:
+            Nothing; the caller writes in between.
+
+        Raises:
+            ArchiveBusy: Another process holds the lock.
+        """
+        if self.read_only:
+            yield
+            return
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - no flock on Windows
+            yield
+            return
+        secure_mkdir(self.root, narrow_existing=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.root / LOCK_NAME, flags, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ArchiveBusy(
+                    f"another sync or render is writing {self.root}; try again "
+                    "when it finishes"
+                ) from error
+            yield
+        finally:
+            os.close(fd)
 
     def save(self) -> None:
         """Write the index and sync state atomically.

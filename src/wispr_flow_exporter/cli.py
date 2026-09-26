@@ -34,7 +34,7 @@ from .local_config import LocalConfig, read_config, read_session, redact
 from .prompts import Answers, PromptAborted, collect, ensure_ignored
 from .schema import EXPECTED, MIGRATION_PIN
 from .sqlite_source import DriftClass, SourceError, open_source
-from .store import Archive
+from .store import Archive, ArchiveBusy
 
 # Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
 # sync's is the backend key "wispr-local" that namespaces sync state.
@@ -525,6 +525,37 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # what they would write, so the archive refuses to persist it.
     archive = Archive(root=config.archive_dir, read_only=options.dry_run)
     _announce(archive)
+    try:
+        with archive.lock():
+            return _sync_passes(args, config, resolved, archive, options, entities)
+    except ArchiveBusy as error:
+        print(f"  {error}", file=sys.stderr)
+        return EXIT_FAILURE
+
+
+def _sync_passes(
+    args: argparse.Namespace,
+    config: Config,
+    resolved: paths.WisprPaths,
+    archive: Archive,
+    options: SyncOptions,
+    entities: tuple[str, ...],
+) -> int:
+    """Run every selected backend's pass against an archive this run holds.
+
+    Args:
+        args: Parsed arguments.
+        config: This run's configuration.
+        resolved: Resolved source paths.
+        archive: The destination archive, already locked.
+        options: What this run was asked to do.
+        entities: Which local entity passes to perform.
+
+    Returns:
+        Process exit code.
+    """
+    backends = _backends(config.source)
+    runs_local = SOURCE_LOCAL in backends
     if not options.dry_run:
         ensure_ignored(config.archive_dir)
 
@@ -1224,9 +1255,14 @@ def cmd_render(args: argparse.Namespace) -> int:
         # every write is compare-then-write, and rewriting identical bytes
         # would only move mtimes. It used to inflate the "written" count.
         print("  note         : --force is no longer needed and changes nothing", file=sys.stderr)
-    results = rerender(archive, options)
-    if not options.dry_run:
-        archive.save()
+    try:
+        with archive.lock():
+            results = rerender(archive, options)
+            if not options.dry_run:
+                archive.save()
+    except ArchiveBusy as error:
+        print(f"  {error}", file=sys.stderr)
+        return EXIT_FAILURE
     for entity, counts in results.items():
         _say("", counts.line(entity))
     return EXIT_FAILURE if any(counts.failed for counts in results.values()) else EXIT_OK
