@@ -11,6 +11,9 @@ Every handler is a ``cmd_*(args) -> int`` returning a process exit code, and
     5    source unreachable
     130  interrupted; progress was saved
 
+When a run has several of these to report, the most severe wins, in the order
+5, 4, 1, 3, 0 -- whichever pass produced it, and whatever the output format.
+
 Code 3 is opt-in on purpose. Wispr Flow ships roughly twenty migrations a
 month, so a non-zero exit on every new column would train the operator to
 ignore the exit code -- and then to ignore code 4, which actually matters.
@@ -25,11 +28,11 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from dotenv import dotenv_values
 
-from . import files_source, paths
+from . import __version__, files_source, paths
 from .endpoints import OVERRIDE_ENV, EndpointError, validated_endpoint
 from .local_config import LocalConfig, printable, read_config, read_session, redact
 from .prompts import Answers, PromptAborted, collect, ensure_ignored
@@ -308,6 +311,39 @@ def _human_bytes(count: int) -> str:
     return f"{size:.1f} GB"
 
 
+#: Exit codes from least to most severe. When a run has several things to
+#: report, the worst is the one the exit code carries.
+_SEVERITY = (
+    EXIT_OK,
+    EXIT_ADDITIVE_DRIFT,
+    EXIT_FAILURE,
+    EXIT_BREAKING_DRIFT,
+    EXIT_SOURCE_UNREACHABLE,
+)
+
+
+def _worst(*codes: int) -> int:
+    """Return the most severe of several exit codes.
+
+    A pass used to overwrite the code of the one before it whenever it had
+    anything to say. Measured on 0.4.1: breaking drift in the local pass,
+    exit 4, came out as 1 because the cloud pass that followed had a
+    failure to report.
+
+    Args:
+        *codes: Exit codes to combine.
+
+    Returns:
+        The most severe of them; a code this ranking does not know outranks
+        every code it does.
+    """
+    return max(
+        codes,
+        key=lambda code: _SEVERITY.index(code) if code in _SEVERITY else len(_SEVERITY),
+        default=EXIT_OK,
+    )
+
+
 def _drift_exit(kind: DriftClass, strict: bool) -> int:
     """Map a drift classification to its exit code, the same way everywhere.
 
@@ -477,6 +513,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         _say("session", f"valid until {session.expires_at:%Y-%m-%dT%H:%M:%SZ}")
 
+    from .mcp_auth import login_state
+
+    # From the token store alone: doctor makes no request. Measured on 0.4.1,
+    # it said nothing about this backend at all.
+    _say("mcp", login_state(config.mcp_endpoint))
+    _say("sync reaches", ", ".join(sorted(_backends(config.source))))
+
     _say(
         "archive",
         f"{config.archive_dir}"
@@ -593,9 +636,12 @@ def _sync_passes(
     _say("backends", ", ".join(sorted(backends)))
     try:
         if runs_local:
-            exit_code = _run_local(
-                archive, resolved, config, options, entities, config_state, result
-            ) or exit_code
+            exit_code = _worst(
+                exit_code,
+                _run_local(
+                    archive, resolved, config, options, entities, config_state, result
+                ),
+            )
     except SourceError as error:
         print(f"  source unreadable: {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE
@@ -609,16 +655,16 @@ def _sync_passes(
     elif remote:
         try:
             if SOURCE_CLOUD in remote:
-                exit_code = (
+                exit_code = _worst(
+                    exit_code,
                     _run_cloud(
                         archive, resolved, config, options, result, explicit=explicit
-                    )
-                    or exit_code
+                    ),
                 )
             if SOURCE_MCP in remote:
-                exit_code = (
-                    _run_mcp(archive, config, options, result, explicit=explicit)
-                    or exit_code
+                exit_code = _worst(
+                    exit_code,
+                    _run_mcp(archive, config, options, result, explicit=explicit),
                 )
         except KeyboardInterrupt:
             result.interrupted = True
@@ -634,7 +680,7 @@ def _sync_passes(
         if counts.bytes_copied:
             _say("", f"{entity}: {_human_bytes(counts.bytes_copied)} of media copied")
         if counts.failed:
-            exit_code = EXIT_FAILURE
+            exit_code = _worst(exit_code, EXIT_FAILURE)
 
     if runs_local and not config_state.policy.records_dictation:
         _say("", "dictation: 0 records — localDataPolicy is never_store")
@@ -819,8 +865,9 @@ def _run_cloud(
     result.counts["cloud"] = counts
     # Everything reachable was still archived. Failing loud must not mean
     # failing closed for this backend either.
-    return _drift_exit(drift.kind, config.strict_schema) or (
-        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    return _worst(
+        _drift_exit(drift.kind, config.strict_schema),
+        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK,
     )
 
 
@@ -901,8 +948,9 @@ def _run_mcp(
         _say("mcp schema", drift.summary())
 
     result.counts["mcp"] = counts
-    return _drift_exit(drift.kind, config.strict_schema) or (
-        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    return _worst(
+        _drift_exit(drift.kind, config.strict_schema),
+        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK,
     )
 
 
@@ -1017,7 +1065,9 @@ def _entities(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(name for name in ENTITIES if name in chosen)
 
 
-def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
+def _schema_cloud(
+    args: argparse.Namespace, config: Config, *, explicit: bool = True
+) -> tuple[int, dict[str, Any]]:
     """Probe the live API and report its shapes against the declaration.
 
     This is the cloud half of ``schema``: the same job the local half does with
@@ -1028,9 +1078,11 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
     Args:
         args: Parsed arguments.
         config: This run's configuration.
+        explicit: Whether the operator asked for this backend by name. When
+            it was only included by default, a missing session skips it.
 
     Returns:
-        Process exit code.
+        The exit code, and the report ``--json`` prints.
     """
     from .cloud_api import CANDIDATES, ENDPOINTS, CloudClient
     from .cloud_auth import CloudAuthError, resolve_credential
@@ -1046,8 +1098,7 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
     try:
         credential = resolve_credential(session_path)
     except CloudAuthError as error:
-        print(f"  {redact(str(error))}")
-        return EXIT_SOURCE_UNREACHABLE
+        return _unchecked("cloud", redact(str(error)), args, explicit=explicit)
 
     table = dict(ENDPOINTS)
     if getattr(args, "candidates", False):
@@ -1080,33 +1131,27 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
         for name, result in results.items()
     }
 
+    report = {
+        "app_version": app_version,
+        "declared_pin": {
+            "app_version": CLIENT_PIN.app_version,
+            "count": CLIENT_PIN.count,
+            "sha256": CLIENT_PIN.sha256,
+        },
+        "drift": drift.kind,
+        "endpoints": observed,
+        "broke": list(drift.broke),
+        "recovered": list(drift.recovered),
+        "unreachable": list(drift.unreachable),
+        "unasked": list(drift.unasked),
+        "empty": list(drift.empty),
+        "new_fields": {k: list(v) for k, v in drift.new_fields.items()},
+        "missing_fields": {k: list(v) for k, v in drift.missing_fields.items()},
+        "retyped": {k: list(v) for k, v in drift.retyped.items()},
+    }
+    code = _drift_exit(drift.kind, config.strict_schema)
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "app_version": app_version,
-                    "declared_pin": {
-                        "app_version": CLIENT_PIN.app_version,
-                        "count": CLIENT_PIN.count,
-                        "sha256": CLIENT_PIN.sha256,
-                    },
-                    "drift": drift.kind,
-                    "endpoints": observed,
-                    "broke": list(drift.broke),
-                    "recovered": list(drift.recovered),
-                    "unreachable": list(drift.unreachable),
-                    "unasked": list(drift.unasked),
-                    "empty": list(drift.empty),
-                    "new_fields": {k: list(v) for k, v in drift.new_fields.items()},
-                    "missing_fields": {
-                        k: list(v) for k, v in drift.missing_fields.items()
-                    },
-                    "retyped": {k: list(v) for k, v in drift.retyped.items()},
-                },
-                indent=2,
-            )
-        )
-        return _drift_exit(drift.kind, config.strict_schema)
+        return code, report
 
     print("wispr-flow-exporter schema (cloud)")
     _say("app", f"{app_version or 'unknown'} (pinned {CLIENT_PIN.app_version})")
@@ -1117,10 +1162,12 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
         shape = seen["shape"] or "no body"
         _say("", f"{mark}{name:22} {status or 'net':>4}  {shape}")
     _say("drift", drift.summary())
-    return _drift_exit(drift.kind, config.strict_schema)
+    return code, report
 
 
-def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
+def _schema_mcp(
+    args: argparse.Namespace, config: Config, *, explicit: bool = True
+) -> tuple[int, dict[str, Any]]:
     """Handshake with the MCP server and report its tools against the pin.
 
     The cheapest useful diagnostic this backend has: it completes the MCP
@@ -1131,9 +1178,11 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
     Args:
         args: Parsed arguments.
         config: This run's configuration.
+        explicit: Whether the operator asked for this backend by name. When
+            it was only included by default, not being logged in skips it.
 
     Returns:
-        Process exit code.
+        The exit code, and the report ``--json`` prints.
     """
     from .mcp_api import READ_TOOLS, USED_TOOLS, McpClient, McpError
     from .mcp_auth import McpAuthError, open_client, resolve_credential
@@ -1144,8 +1193,7 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
         try:
             credential = resolve_credential(auth_client, config.mcp_endpoint)
         except McpAuthError as error:
-            print(f"  {redact(printable(str(error)))}")
-            return EXIT_SOURCE_UNREACHABLE
+            return _unchecked("mcp", str(error), args, explicit=explicit)
 
     try:
         with McpClient(
@@ -1156,8 +1204,8 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
             tools = list(client.tools)
             server = dict(client.server)
     except McpError as error:
-        print(f"  {redact(str(error))}")
-        return EXIT_SOURCE_UNREACHABLE
+        # Logged in and still not answering is a finding, whoever asked.
+        return _unchecked("mcp", str(error), args, explicit=True)
 
     recorded = Archive(root=config.archive_dir, read_only=True).source_state(MCP_BACKEND)
     drift = detect_mcp_drift(
@@ -1166,38 +1214,35 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
     live = pin_from_tools(tools, server)
     advertised = sorted(str(tool.get("name", "")) for tool in tools)
 
+    report = {
+        "server": server,
+        "pin": {
+            "server": live.server,
+            "version": live.version,
+            "protocol_version": live.protocol_version,
+            "tool_count": live.tool_count,
+            "sha256": live.sha256,
+            "algorithm": live.algorithm,
+        },
+        "declared_pin": {
+            "server": MCP_PIN.server,
+            "version": MCP_PIN.version,
+            "sha256": MCP_PIN.sha256,
+            "algorithm": MCP_PIN.algorithm,
+        },
+        "drift": drift.kind,
+        "tools": advertised,
+        "used": sorted(USED_TOOLS),
+        "allowlisted": sorted(READ_TOOLS),
+        "unavailable": list(drift.unavailable),
+        "broken_contracts": list(drift.broken_contracts),
+        "new_tools": list(drift.new_tools),
+        "missing_tools": list(drift.missing_tools),
+        "changed_schemas": list(drift.changed_schemas),
+    }
+    code = _drift_exit(drift.kind, config.strict_schema)
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "server": server,
-                    "pin": {
-                        "server": live.server,
-                        "version": live.version,
-                        "protocol_version": live.protocol_version,
-                        "tool_count": live.tool_count,
-                        "sha256": live.sha256,
-                    },
-                    "declared_pin": {
-                        "server": MCP_PIN.server,
-                        "version": MCP_PIN.version,
-                        "sha256": MCP_PIN.sha256,
-                        "algorithm": MCP_PIN.algorithm,
-                    },
-                    "drift": drift.kind,
-                    "tools": advertised,
-                    "used": sorted(USED_TOOLS),
-                    "allowlisted": sorted(READ_TOOLS),
-                    "unavailable": list(drift.unavailable),
-                    "broken_contracts": list(drift.broken_contracts),
-                    "new_tools": list(drift.new_tools),
-                    "missing_tools": list(drift.missing_tools),
-                    "changed_schemas": list(drift.changed_schemas),
-                },
-                indent=2,
-            )
-        )
-        return _drift_exit(drift.kind, config.strict_schema)
+        return code, report
 
     print("wispr-flow-exporter schema (mcp)")
     _say("server", f"{live.server or '?'} {live.version or ''}".strip())
@@ -1212,66 +1257,125 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
         mark = "use" if name in USED_TOOLS else "ok " if name in READ_TOOLS else "-- "
         _say("", f"{mark} {name}")
     _say("drift", drift.summary())
-    return _drift_exit(drift.kind, config.strict_schema)
+    return code, report
+
+
+def _unchecked(
+    backend: str, reason: str, args: argparse.Namespace, *, explicit: bool
+) -> tuple[int, dict[str, Any]]:
+    """Report a backend ``schema`` could not check.
+
+    Args:
+        backend: Which one.
+        reason: Why not.
+        args: Parsed arguments.
+        explicit: Whether the operator asked for it by name -- a failure then,
+            and a skip when it was only included by default.
+
+    Returns:
+        The exit code, and the report ``--json`` prints.
+    """
+    if not getattr(args, "json", False):
+        _say(backend, f"{'' if explicit else 'skipped: '}{reason}")
+    if explicit:
+        return EXIT_SOURCE_UNREACHABLE, {"error": reason}
+    return EXIT_OK, {"skipped": reason}
+
+
+def _schema_local(
+    args: argparse.Namespace, config: Config, *, explicit: bool = True
+) -> tuple[int, dict[str, Any]]:
+    """Report the local store's schema against the declaration.
+
+    Args:
+        args: Parsed arguments.
+        config: This run's configuration.
+        explicit: Unused: the local backend is never skipped, as ``sync``
+            never skips it. Accepted so every backend is called alike.
+
+    Returns:
+        The exit code, and the report ``--json`` prints.
+    """
+    resolved = paths.resolve(config.data_dir, config.db)
+    if not resolved.db.exists():
+        return _unchecked(
+            "local", f"no Wispr Flow database at {resolved.db}", args, explicit=True
+        )
+
+    with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
+        drift = source.detect_drift()
+        tables = source.tables()
+    report = {
+        "pin": {
+            "count": drift.live.count,
+            "latest": drift.live.latest,
+            "sha256": drift.live.sha256,
+        },
+        "declared_pin": {
+            "count": MIGRATION_PIN.count,
+            "sha256": MIGRATION_PIN.sha256,
+        },
+        "drift": drift.kind,
+        "new_tables": list(drift.new_tables),
+        "missing_tables": list(drift.missing_tables),
+        "new_columns": {k: list(v) for k, v in drift.new_columns.items()},
+        "missing_columns": {k: list(v) for k, v in drift.missing_columns.items()},
+        "missing_required": {k: list(v) for k, v in drift.missing_required.items()},
+    }
+    code = _drift_exit(drift.kind, config.strict_schema)
+    if getattr(args, "json", False):
+        return code, report
+
+    print("wispr-flow-exporter schema")
+    _say("tables", f"{len(tables)} live, {len(EXPECTED)} declared")
+    _say("migrations", f"{drift.live.count} (declared {MIGRATION_PIN.count})")
+    _say("pin", f"{drift.live.sha256[:12]} (declared {MIGRATION_PIN.sha256[:12]})")
+    _say("drift", drift.summary())
+    return code, report
 
 
 def cmd_schema(args: argparse.Namespace) -> int:
-    """Report the live schema against the declaration.
+    """Report each selected backend's live schema against its declaration.
+
+    Every backend by default, as ``sync`` does -- measured on 0.4.1, a bare
+    ``schema`` checked the local store alone and said nothing of the two
+    remote interfaces, which are the ones with no promise of stability. A
+    remote backend with no credential is skipped when it was only included
+    by default, and reported as unreachable when asked for by name.
 
     Args:
         args: Parsed arguments.
 
     Returns:
-        Process exit code.
+        The most severe exit code any backend produced.
     """
     config = _config(args)
-    if config.source == SOURCE_CLOUD:
-        return _schema_cloud(args, config)
-    if config.source == SOURCE_MCP:
-        return _schema_mcp(args, config)
-    resolved = paths.resolve(config.data_dir, config.db)
-    if not resolved.db.exists():
-        print(f"  no Wispr Flow database at {resolved.db}")
-        return EXIT_SOURCE_UNREACHABLE
+    selected = _backends(config.source)
+    checks = [
+        (name, check)
+        for name, check in (
+            (SOURCE_LOCAL, _schema_local),
+            (SOURCE_CLOUD, _schema_cloud),
+            (SOURCE_MCP, _schema_mcp),
+        )
+        if name in selected
+    ]
+    explicit = config.source not in (SOURCE_ALL, SOURCE_AUTO)
+    as_json = getattr(args, "json", False)
+    if not as_json and len(checks) > 1:
+        # Said before anything is contacted, as sync says it.
+        _say("backends", ", ".join(name for name, _ in checks) + "; read-only")
 
-    with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
-        drift = source.detect_drift()
-        tables = source.tables()
-        if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    {
-                        "pin": {
-                            "count": drift.live.count,
-                            "latest": drift.live.latest,
-                            "sha256": drift.live.sha256,
-                        },
-                        "declared_pin": {
-                            "count": MIGRATION_PIN.count,
-                            "sha256": MIGRATION_PIN.sha256,
-                        },
-                        "drift": drift.kind,
-                        "new_tables": list(drift.new_tables),
-                        "missing_tables": list(drift.missing_tables),
-                        "new_columns": {k: list(v) for k, v in drift.new_columns.items()},
-                        "missing_columns": {
-                            k: list(v) for k, v in drift.missing_columns.items()
-                        },
-                        "missing_required": {
-                            k: list(v) for k, v in drift.missing_required.items()
-                        },
-                    },
-                    indent=2,
-                )
-            )
-            return _drift_exit(drift.kind, config.strict_schema)
-
-        print("wispr-flow-exporter schema")
-        _say("tables", f"{len(tables)} live, {len(EXPECTED)} declared")
-        _say("migrations", f"{drift.live.count} (declared {MIGRATION_PIN.count})")
-        _say("pin", f"{drift.live.sha256[:12]} (declared {MIGRATION_PIN.sha256[:12]})")
-        _say("drift", drift.summary())
-    return _drift_exit(drift.kind, config.strict_schema)
+    codes: list[int] = []
+    reports: dict[str, Any] = {}
+    for name, check in checks:
+        code, report = check(args, config, explicit=explicit)
+        codes.append(code)
+        reports[name] = report
+    if as_json:
+        single = reports[checks[0][0]] if len(checks) == 1 else reports
+        print(json.dumps(single, indent=2))
+    return _worst(*codes)
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -1353,6 +1457,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="wispr-export",
         description="Maintain a local archive of all Wispr Flow data.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"wispr-export {__version__}"
     )
     # Not required: a bare invocation runs the interactive setup, because
     # "usage error" is the wrong answer for someone who wants a backup.

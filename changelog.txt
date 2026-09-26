@@ -398,6 +398,24 @@ wrapped at 72 columns, US English.
   --strict-schema, 0 otherwise.
 - .sync-state.json is rewritten once, as the cloud and MCP drift
   ledgers take their new form.
+- The most severe exit code wins. Each pass replaced the previous
+  pass's code whenever it had anything to report: measured on 0.4.1,
+  breaking drift in the local pass (exit 4) came out as 1 because the
+  cloud pass after it had a failure. The order is now 5, 4, 1, 3, 0,
+  whichever pass produced them.
+- `schema` checks every backend by default, as sync does. Measured on
+  0.4.1: a bare `schema` checked the local store alone and said nothing
+  of the two remote interfaces, the ones with no stability promise.
+  Which backends it will contact is said first; a remote one with no
+  credential is skipped when it was only included by default and
+  unreachable (exit 5) when named; and `--json` is keyed by backend when
+  there is more than one.
+- `doctor` says whether the MCP backend can run -- logged in, for which
+  endpoint, until when, or not at all -- from the token store alone,
+  still making no request, and names the backends a sync would reach.
+  It said nothing about MCP before.
+- `wispr-export --version` prints the version. It was an unrecognized
+  argument.
 
 0.4.1
 -----

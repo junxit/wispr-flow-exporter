@@ -352,9 +352,9 @@ connection trusts. Set them in the real environment if you need them; see
 
 | Command | Purpose |
 | --- | --- |
-| `doctor` | Report the source, schema, policy and archive. Writes nothing. |
+| `doctor` | Report the source, schema, policy, archive, MCP login and which backends a sync reaches. Writes nothing and makes no request. |
 | `sync` | Archive new and changed data. |
-| `schema` | Show the live schema against the declaration. Writes nothing. |
+| `schema` | Show every backend's live schema against its declaration: local, cloud and MCP, a remote one skipped when it has no credential. Writes nothing. `--json` is keyed by backend. |
 | `login` / `logout` | Authorize against the MCP server, or discard the token. The only credential this tool keeps. |
 | `schema --source cloud` | Probe the live API and report its response shapes against the declaration. `GET` only; writes nothing, to the archive or to Wispr Flow. Add `--candidates` to also probe paths not yet adopted. |
 | `schema --source mcp` | Handshake with the MCP server and report its tools against the pin. Calls no tool; writes nothing. |

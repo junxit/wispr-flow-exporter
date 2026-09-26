@@ -914,3 +914,120 @@ def test_every_drift_site_maps_a_kind_to_the_same_exit_code(
     from wispr_flow_exporter.schema import DriftClass
 
     assert _drift_exit(DriftClass(kind), strict) == code
+
+
+# --- what a run reports ---------------------------------------------------
+
+
+def test_breaking_drift_is_not_masked_by_a_later_failure(
+    tmp_path: Path, wispr_db: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured on 0.4.1: local drift 4, then a cloud failure 1, exited 1."""
+    from wispr_flow_exporter import cli
+
+    data_dir = _data_dir(tmp_path, wispr_db)
+    monkeypatch.setattr(cli, "_run_local", lambda *args, **kwargs: EXIT_BREAKING_DRIFT)
+    monkeypatch.setattr(cli, "_run_cloud", lambda *args, **kwargs: EXIT_FAILURE)
+    monkeypatch.setattr(cli, "_run_mcp", lambda *args, **kwargs: EXIT_OK)
+
+    assert main(["sync", "--data-dir", str(data_dir)]) == EXIT_BREAKING_DRIFT
+
+
+@pytest.mark.parametrize(
+    ("codes", "worst"),
+    [
+        ((EXIT_OK, EXIT_ADDITIVE_DRIFT), EXIT_ADDITIVE_DRIFT),
+        ((EXIT_ADDITIVE_DRIFT, EXIT_FAILURE), EXIT_FAILURE),
+        ((EXIT_BREAKING_DRIFT, EXIT_FAILURE), EXIT_BREAKING_DRIFT),
+        ((EXIT_FAILURE, EXIT_SOURCE_UNREACHABLE), EXIT_SOURCE_UNREACHABLE),
+        ((), EXIT_OK),
+    ],
+)
+def test_the_most_severe_exit_code_wins(codes: tuple[int, ...], worst: int) -> None:
+    """Whatever order the passes ran in."""
+    from wispr_flow_exporter.cli import _worst
+
+    assert _worst(*codes) == worst
+    assert _worst(*reversed(codes)) == worst
+
+
+def test_schema_checks_every_backend_by_default(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+    clean_pin: None,
+) -> None:
+    """Measured on 0.4.1: a bare schema checked the local store alone.
+
+    With no session and no login, the two remote backends are announced and
+    skipped rather than failed: they were only included by default.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db)
+
+    code = main(["schema", "--data-dir", str(data_dir)])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "local, cloud, mcp; read-only" in out
+    assert "cloud        : skipped: no Wispr Flow session" in out
+    assert "mcp          : skipped: no MCP authorization stored" in out
+
+
+def test_schema_json_is_keyed_by_backend(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+    clean_pin: None,
+) -> None:
+    """One document a script can read, with a section for each backend."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+
+    main(["schema", "--data-dir", str(data_dir), "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) == {"local", "cloud", "mcp"}
+    assert report["local"]["drift"] == "ok"
+    assert "skipped" in report["cloud"] and "skipped" in report["mcp"]
+
+
+def test_a_backend_asked_for_by_name_without_a_credential_is_unreachable(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """Named, it was expected to answer; skipping it would hide that."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+
+    code = main(["schema", "--source", "cloud", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_SOURCE_UNREACHABLE
+
+
+def test_doctor_says_whether_mcp_can_run_without_asking_anyone(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on 0.4.1: doctor did not mention MCP at all."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+
+    main(["doctor", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert "not logged in; `wispr-export login` enables this backend" in out
+    assert "sync reaches : cloud, local, mcp" in out
+
+    monkeypatch.setenv("WISPR_MCP_TOKEN", FAKE_JWT)
+    main(["doctor", "--data-dir", str(data_dir)])
+    out = capsys.readouterr().out
+    assert "using WISPR_MCP_TOKEN from the environment" in out
+    assert FAKE_JWT not in out
+
+
+def test_the_version_is_one_flag_away(capsys: pytest.CaptureFixture[str]) -> None:
+    """Measured on 0.4.1: --version was an unrecognized argument."""
+    from wispr_flow_exporter import __version__
+
+    with pytest.raises(SystemExit) as stopped:
+        main(["--version"])
+
+    assert stopped.value.code == 0
+    assert capsys.readouterr().out.strip() == f"wispr-export {__version__}"

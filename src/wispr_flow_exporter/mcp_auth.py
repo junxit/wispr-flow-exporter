@@ -1306,3 +1306,33 @@ def renew_credential(
             "environment is never refreshed"
         )
     return _refreshed(client, endpoint, rejected=rejected.token)
+
+
+def login_state(endpoint: str) -> str:
+    """Describe the stored authorization for an endpoint, contacting no one.
+
+    For ``doctor``, which makes no network request: whether this backend can
+    run, and if not, what to do about it.
+
+    Args:
+        endpoint: The MCP endpoint, already validated.
+
+    Returns:
+        One line, with no token in it.
+    """
+    if os.environ.get("WISPR_MCP_TOKEN", "").strip():
+        return "using WISPR_MCP_TOKEN from the environment; it is never refreshed"
+    store = read_store()
+    if not store.get("access_token") and not store.get("refresh_token"):
+        return "not logged in; `wispr-export login` enables this backend"
+    try:
+        bound = _bound(store, endpoint)
+    except McpAuthError as error:
+        return str(error)
+    current = _fresh(bound)
+    if current is not None and current.expires_at is not None:
+        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current.expires_at))
+        return f"logged in; access token valid until {until}"
+    if bound.get("refresh_token"):
+        return "logged in; the access token will be refreshed on the next run"
+    return "the stored authorization has expired; run `wispr-export login` again"
