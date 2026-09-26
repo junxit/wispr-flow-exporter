@@ -57,7 +57,7 @@ from .secure_io import (
     write_text_if_changed,
 )
 from .sqlite_source import Record, SqliteSource
-from .store import Archive, content_hash, entity_name
+from .store import Archive, content_hash, entity_name, row_order
 
 SOURCE_LOCAL = "wispr-local"
 
@@ -955,7 +955,7 @@ def sync_snapshot(
 
     rows = sorted(
         (record.data for record in source.records(table)),
-        key=lambda row: str(row.get(spec.pk, "")),
+        key=lambda row: row_order(spec, row),
     )
     counts.scanned = len(rows)
 

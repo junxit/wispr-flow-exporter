@@ -34,6 +34,35 @@ wrapped at 72 columns, US English.
   requests must now cost exactly one 0.25-second wait. Fixtures building
   meeting directories from hostile ids no longer create them outside the
   test's scratch directory, which they had been doing.
+- Re-pinned against Wispr Flow 1.6.957 at migration 157, five migrations
+  past 1.6.897/152. New: FolderMeetings, which files meetings into
+  folders; Folders.meetingCount and memberCount; SharedNotes.meetingId
+  and via. All four were already being archived -- the reader follows
+  PRAGMA table_info -- so what was stale was the declaration. Three of
+  the five new migrations are dated a week before the migration that was
+  latest at the old pin and shipped after it, so SchemaPin.latest is a
+  label rather than a version and the README no longer assumes migration
+  names arrive in order. The digest over the whole set is what catches
+  that, as designed.
+- Composite primary keys are modeled. FolderMeetings is keyed by
+  (folderId, meetingId), and a key with more than one column used to be
+  reported as no key at all: the table's rows had no identity, its key
+  was never checked for drift, and its snapshot followed SQLite's scan
+  order, which a VACUUM may change -- rewriting the file with nothing
+  new in it. Snapshots now sort by key and then by content, which for a
+  unique single-column key is exactly the old order, so no existing
+  snapshot is rewritten. Key columns now count as required, and a key
+  that changes shape is breaking drift.
+- Losing a column a renderer reads is breaking drift. Meetings declared
+  only id, title, createdAt and modifiedAt as required, so a migration
+  dropping summary was additive and the render gate stayed off. Measured
+  on 0.4.1: after the column went, a sync that re-read the meeting --
+  --full, or any later edit -- rewrote meeting.md and raw/meeting.json
+  without the summary; only summary.md kept it, because an empty summary
+  is never rendered. summary, notes, speakerMap, participantNames and
+  transcriptDeletedAt are now required on Meetings, the dictation text
+  cascade and app on History, and replacement, isSnippet and isDeleted
+  on Dictionary.
 
 0.4.1
 -----

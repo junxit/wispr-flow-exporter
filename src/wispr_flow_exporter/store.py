@@ -101,6 +101,26 @@ def content_hash(spec: TableSpec, data: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def row_order(spec: TableSpec, row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Sort key that makes a snapshot's line order independent of scan order.
+
+    Key columns first, then the whole row as canonical JSON. For a table with
+    a unique single-column key that is exactly the order snapshots have always
+    had; the tiebreak only decides for rows the key cannot tell apart -- a
+    keyless table, or one whose composite key used to be reported as absent --
+    where SQLite's scan order would otherwise decide, and could change.
+
+    Args:
+        spec: The table's declaration.
+        row: One archived row.
+
+    Returns:
+        A tuple that sorts rows the same way on every run.
+    """
+    canonical = json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+    return (*(str(row.get(column, "")) for column in spec.key_columns), canonical)
+
+
 def record_dir_name(when: datetime | None, title: Any, key: str) -> str:
     """Build the ``YYYY-MM-DD--slug--id`` name for one record.
 

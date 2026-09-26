@@ -85,7 +85,8 @@ def test_declared_columns_are_internally_consistent(table: str) -> None:
     spec = EXPECTED[table]
     columns = set(spec.columns)
 
-    assert spec.pk in columns, f"{table}: primary key not in columns"
+    assert spec.key_columns, f"{table}: no primary key declared"
+    assert set(spec.key_columns) <= columns, f"{table}: primary key not in columns"
     for label, named in (
         ("required", spec.required),
         ("volatile", spec.volatile),

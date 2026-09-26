@@ -245,18 +245,22 @@ class SqliteSource:
         rows = self.connection.execute(f'PRAGMA table_info("{table}")')
         return tuple(row[1] for row in rows)
 
-    def primary_key(self, table: str) -> str | None:
-        """Return a table's single-column primary key, if it has one.
+    def primary_key(self, table: str) -> tuple[str, ...]:
+        """Return a table's primary key columns, in key order.
+
+        A composite key used to be reported as no key at all, so a table like
+        ``FolderMeetings`` was archived as if its rows had no identity and its
+        drift check never ran.
 
         Args:
             table: Table name.
 
         Returns:
-            The primary key column, or ``None`` for a composite or absent key.
+            The key's columns ordered by their position in the key, or an
+            empty tuple for a table without one.
         """
-        rows = [row for row in self.connection.execute(f'PRAGMA table_info("{table}")')]
-        keys = [row[1] for row in rows if row[5]]
-        return keys[0] if len(keys) == 1 else None
+        rows = self.connection.execute(f'PRAGMA table_info("{table}")')
+        return tuple(name for _, name in sorted((row[5], row[1]) for row in rows if row[5]))
 
     def row_count(self, table: str) -> int:
         """Count a table's rows.
@@ -320,14 +324,20 @@ class SqliteSource:
                 new_columns[table] = added
             if removed := tuple(sorted(declared - live_columns)):
                 missing_columns[table] = removed
-            if absent := tuple(sorted(spec.required - live_columns)):
+            # A key column is required whether or not a renderer reads it:
+            # without it no row can be told from another.
+            needed = spec.required | set(spec.key_columns)
+            if absent := tuple(sorted(needed - live_columns)):
                 missing_required[table] = absent
             # A changed primary key relocates every record in the table, so it
-            # is breaking even when every column survives.
+            # is breaking even when every column survives. A table reporting no
+            # key at all is left to the column check above.
             live_key = self.primary_key(table)
-            if live_key is not None and live_key != spec.pk:
-                missing_required.setdefault(table, ())
-                missing_required[table] = (*missing_required[table], f"pk:{spec.pk}")
+            if live_key and set(live_key) != set(spec.key_columns):
+                missing_required[table] = (
+                    *missing_required.get(table, ()),
+                    f"pk:{'+'.join(spec.key_columns)}",
+                )
 
         # OK means "nothing differs at all", so a dropped column counts even
         # when no renderer reads it and the migration set is unchanged. A
@@ -377,7 +387,7 @@ class SqliteSource:
         if declared is not None:
             return declared
         return TableSpec(
-            pk=self.primary_key(table) or "rowid",
+            pk=self.primary_key(table),
             layout=Layout.SNAPSHOT,
             columns=self.columns(table),
         )
@@ -485,10 +495,10 @@ class SqliteSource:
 
             data[column] = value
 
-        key = data.get(spec.pk)
+        key = spec.identity(data)
         return Record(
             table=table,
-            key="" if key is None else str(key),
+            key="" if key is None else key,
             data=data,
             blobs=blobs,
             soft_deleted=spec.is_soft_deleted(data),

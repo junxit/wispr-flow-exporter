@@ -507,7 +507,10 @@ Wispr Flow's own data, so uninstalling it leaves the app exactly as it was.
 - Wispr Flow's local store stays plain SQLite plus NDJSON. If it is ever
   encrypted the way Granola's now is, the local backend stops working and only
   the cloud backend remains.
-- Migration numbering stays monotonic, so `SequelizeMeta` is a usable schema pin.
+- `SequelizeMeta` lists every applied migration, so it is a usable schema pin —
+  as a whole set. Names are dated but not applied in date order (1.6.957
+  shipped three dated before the previous pin's latest), so the pin digests
+  every name rather than trusting the count or the latest one.
 - The archive lives on a filesystem that supports POSIX modes; `0600` is a
   documented guarantee.
 

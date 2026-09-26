@@ -18,13 +18,14 @@ exceptional, so a design that had to be updated before it could read a new
 column would be permanently out of date, and an archive that stopped when it
 fell behind would be useless on the one day it was needed.
 
-Column lists were read from a live installation of Wispr Flow v1.6.897 at
-migration 152.
+Column lists were read from a live installation of Wispr Flow v1.6.957 at
+migration 157.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -80,8 +81,10 @@ class SchemaPin:
 
     Attributes:
         count: Number of rows in ``SequelizeMeta``.
-        latest: Lexicographically greatest migration name. Names are
-            date-prefixed and therefore monotonic, so this is a real version.
+        latest: Lexicographically greatest migration name. A label, not a
+            version: names are date-prefixed but do not arrive in date order
+            -- 1.6.957 shipped three dated before the previous pin's latest --
+            which is why neither this nor the count is trusted alone.
         sha256: Digest over every migration name, sorted and newline-joined.
             This catches the case the other two miss -- a migration replaced
             without changing either the count or the maximum.
@@ -111,9 +114,9 @@ def pin_from_migrations(names: Iterable[str]) -> SchemaPin:
 # Read from a live installation. A mismatch is not an error -- see the drift
 # classification in sqlite_source -- but it is always reported.
 MIGRATION_PIN = SchemaPin(
-    count=152,
-    latest="20260915120000-add-meetings-recorded-ms.js",
-    sha256="655d5ff0f8e6c3e41ac95a2d539c7eec5157c4a1e9208f2de00893ea15ebaaaa",
+    count=157,
+    latest="20260922130000-add-folders-member-count.js",
+    sha256="bc316f91725a0436a06dd212416e2f12f972d0cb5bf169d53e26bebb96793dbe",
 )
 
 
@@ -122,7 +125,8 @@ class TableSpec:
     """Everything declared about one source table.
 
     Attributes:
-        pk: Primary key column.
+        pk: Primary key column, or the key's columns in key order when it is
+            composite. Empty for a table with no key at all.
         layout: How records are written to disk.
         columns: Columns present at ``MIGRATION_PIN``. Used only to report
             drift; the reader discovers columns at runtime.
@@ -143,7 +147,7 @@ class TableSpec:
             be redacted rather than archived.
     """
 
-    pk: str
+    pk: str | tuple[str, ...]
     layout: Layout
     columns: tuple[str, ...]
     required: frozenset[str] = frozenset()
@@ -178,6 +182,37 @@ class TableSpec:
         if include_screen_context:
             return tuple(available)
         return tuple(name for name in available if name not in self.screen_context)
+
+    @property
+    def key_columns(self) -> tuple[str, ...]:
+        """Return the primary key's columns, in key order.
+
+        Returns:
+            One column for most tables, several for a composite key such as
+            ``FolderMeetings``, none for a keyless table.
+        """
+        return (self.pk,) if isinstance(self.pk, str) else self.pk
+
+    def identity(self, row: Mapping[str, object]) -> str | None:
+        """Name a row the same way on every run.
+
+        A single-column key is its value as text, exactly as ``Record.key``
+        has always been. A composite key is its values as a JSON list, which
+        cannot collide the way joining with a separator could.
+
+        Args:
+            row: The record, keyed by column name.
+
+        Returns:
+            The identity, or ``None`` when the table has no key or a key value
+            is missing -- a row that cannot be named, not one named "None".
+        """
+        values = [row.get(column) for column in self.key_columns]
+        if not values or any(value is None for value in values):
+            return None
+        if len(values) == 1:
+            return str(values[0])
+        return json.dumps(values, ensure_ascii=False, default=str)
 
     def is_soft_deleted(self, row: Mapping[str, object]) -> bool:
         """Report whether a row is tombstoned upstream.
@@ -313,7 +348,16 @@ EXPECTED: Mapping[str, TableSpec] = {
             # recorded is a fact about the meeting, so it stays in the digest.
             "recordedMs",
         ),
-        required=frozenset({"id", "title", "createdAt", "modifiedAt"}),
+        # Every column a meeting's documents are built from. Losing one does not
+        # make a renderer raise -- they are defensive -- it makes them render
+        # less, and without being breaking drift that less was written over
+        # the good document and over raw/meeting.json.
+        required=frozenset(
+            {
+                "id", "title", "createdAt", "modifiedAt", "summary", "notes",
+                "speakerMap", "participantNames", "transcriptDeletedAt",
+            }
+        ),
         volatile=_CHURN
         | {
             "refineRetries",
@@ -386,7 +430,9 @@ EXPECTED: Mapping[str, TableSpec] = {
             "modifiedAt", "isDeleted", "source", "isSnippet", "observedSource",
             "isStarred", "replacementHtml",
         ),
-        required=frozenset({"id", "phrase"}),
+        # What the rendering reads: without isDeleted a removed entry renders as
+        # live, and without isSnippet snippets land in the phrase table.
+        required=frozenset({"id", "phrase", "replacement", "isSnippet", "isDeleted"}),
         # Usage counters tick on every dictation; they say nothing about the
         # entry itself.
         volatile=frozenset({"lastUsed", "frequencyUsed", "remoteFrequencyUsed"}),
@@ -433,7 +479,16 @@ EXPECTED: Mapping[str, TableSpec] = {
             "contentObservationEndLastKeystroke", "editDistanceToDictated",
             "editedTextUnbounded",
         ),
-        required=frozenset({"transcriptEntityId", "timestamp"}),
+        # The day log shows the most processed text the cascade can find, so
+        # every cascade column is a rendering input: losing one silently
+        # downgrades what the log says was dictated.
+        required=frozenset(
+            {
+                "transcriptEntityId", "timestamp", "app", "asrText",
+                "formattedText", "toneMatchedText", "editedText",
+                "editedTextUnbounded", "serverFinalizedText",
+            }
+        ),
         volatile=_CHURN | {"editedTextStatus", "editedTextAttempts"},
         timestamps={"timestamp": TimestampKind.SEQUELIZE},
         soft_delete=("isArchived",),
@@ -545,6 +600,9 @@ EXPECTED: Mapping[str, TableSpec] = {
             "slug", "title", "notes", "summary", "searchableContent",
             "ownerEmail", "ownerFirstName", "ownerLastName", "ownerAvatarUrl",
             "callerRole", "createdAt", "modifiedAt",
+            # From 20260922120000-add-shared-notes-meeting-id: which meeting a
+            # shared note came from, and how it was shared.
+            "meetingId", "via",
         ),
         volatile=frozenset({"searchableContent"}),
         timestamps=_SEQUELIZE_TIMES,
@@ -673,19 +731,32 @@ EXPECTED: Mapping[str, TableSpec] = {
         volatile=frozenset({"attempts", "state", "lastErrorCode"}),
         timestamps=_SEQUELIZE_TIMES,
     ),
-    # Arrived in migration 150 and holds no rows on the installation this was
-    # read from, so the columns come from the table's DDL rather than from
-    # observed data. Nothing else references a folder id yet -- not Notes, not
-    # Meetings -- so how folders attach to content is still unmeasured, and
-    # this declaration deliberately claims nothing about it.
+    # Arrived in migration 150 and still holds no rows on the installation this
+    # was read from, so the columns come from the table's DDL rather than from
+    # observed data. Folders attach to meetings through FolderMeetings below.
+    # The two counters (20260909120004 and 20260922130000) are content, not
+    # churn: they move only when a folder's makeup changes, and memberCount is
+    # the only local evidence of membership -- there is no members table.
     "Folders": _spec(
         pk="id",
         layout=Layout.SNAPSHOT,
         columns=(
             "id", "ownerUserId", "name", "description", "isOwner",
-            "createdAt", "modifiedAt",
+            "createdAt", "modifiedAt", "meetingCount", "memberCount",
         ),
         timestamps=_SEQUELIZE_TIMES,
+    ),
+    # From 20260909120002-create-folder-meetings-table -- dated a week before
+    # the migration that was latest at the previous pin, and shipped after it.
+    # Which meetings are filed in which folder: the first table with a
+    # composite key, which is why TableSpec.pk may be a tuple. Empty on the
+    # measured installation; addedAt is taken to be Sequelize's encoding from
+    # the DDL (DATETIME NOT NULL) rather than from an observed value.
+    "FolderMeetings": _spec(
+        pk=("folderId", "meetingId"),
+        layout=Layout.SNAPSHOT,
+        columns=("folderId", "meetingId", "slug", "addedByUserId", "addedAt"),
+        timestamps={"addedAt": TimestampKind.SEQUELIZE},
     ),
     "SequelizeMeta": _spec(
         pk="name",

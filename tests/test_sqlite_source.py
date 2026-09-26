@@ -106,7 +106,7 @@ def test_tables_and_columns_come_from_the_database(
         assert "Meetings" in source.tables()
         assert "sqlite_sequence" not in source.tables()
         assert "speakerMap" in source.columns("Meetings")
-        assert source.primary_key("Meetings") == "id"
+        assert source.primary_key("Meetings") == ("id",)
 
 
 def test_row_counts_include_soft_deleted_rows(
@@ -208,6 +208,82 @@ def test_a_non_required_missing_column_is_not_breaking(
 
     assert drift.kind is DriftClass.ADDITIVE
     assert drift.missing_columns["Meetings"] == ("shareSlug",)
+
+
+def test_losing_a_column_a_renderer_reads_is_breaking(
+    wispr_db: Callable[..., Path], clean_pin: None
+) -> None:
+    """Summary feeds meeting.md; losing it used to be merely additive.
+
+    Additive left the render gate off, so every meeting was re-rendered
+    without its summary over the good document, and raw/meeting.json was
+    rewritten without the column.
+    """
+    path = wispr_db(drop_columns={"Meetings": ("summary",)})
+    with open_source(path) as source:
+        drift = source.detect_drift()
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.missing_required["Meetings"] == ("summary",)
+
+
+def test_a_composite_primary_key_is_reported_whole(
+    wispr_db: Callable[..., Path],
+) -> None:
+    """FolderMeetings is keyed by two columns; both are the key.
+
+    A composite key used to be reported as no key at all, so its rows had no
+    identity and its drift check never ran.
+    """
+    with open_source(wispr_db()) as source:
+        assert source.primary_key("FolderMeetings") == ("folderId", "meetingId")
+        drift = source.detect_drift()
+
+    assert "FolderMeetings" not in drift.missing_required
+
+
+def test_a_composite_key_that_changes_shape_is_breaking(
+    wispr_db: Callable[..., Path], clean_pin: None
+) -> None:
+    """A key that gains a column changes which rows are the same row."""
+    path = wispr_db(primary_keys={"FolderMeetings": ("folderId", "meetingId", "slug")})
+    with open_source(path) as source:
+        drift = source.detect_drift()
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.missing_required["FolderMeetings"] == ("pk:folderId+meetingId",)
+
+
+def test_a_dropped_key_column_is_breaking_even_when_no_renderer_reads_it(
+    wispr_db: Callable[..., Path], clean_pin: None
+) -> None:
+    """Links renders nothing, but without url no link can be told from another."""
+    path = wispr_db(drop_columns={"Links": ("url",)})
+    with open_source(path) as source:
+        drift = source.detect_drift()
+
+    assert drift.kind is DriftClass.BREAKING
+    assert "url" in drift.missing_required["Links"]
+
+
+def test_an_undeclared_composite_key_names_its_rows(
+    wispr_db: Callable[..., Path],
+) -> None:
+    """A table from a future migration keeps its key, not an invented rowid."""
+    import sqlite3
+
+    path = wispr_db(
+        extra_tables={"WhisperShelf": ("shelf", "slot", "label")},
+        primary_keys={"WhisperShelf": ("shelf", "slot")},
+    )
+    with sqlite3.connect(path) as writer:
+        writer.execute('INSERT INTO "WhisperShelf" VALUES (?, ?, ?)', ("s1", 2, "hush"))
+    with open_source(path) as source:
+        spec = source.spec_for("WhisperShelf")
+        record = next(source.records("WhisperShelf"))
+
+    assert spec.key_columns == ("shelf", "slot")
+    assert record.key == '["s1", 2]'
 
 
 def test_an_older_database_is_stale_not_broken(

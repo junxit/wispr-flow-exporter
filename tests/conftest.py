@@ -202,7 +202,7 @@ DEFAULT_MIGRATIONS = ("00000000000001-init.js", "00000000000002-add-meetings.js"
 def _create_table(
     table: str,
     columns: Sequence[str],
-    primary_key: str | None,
+    primary_key: Sequence[str],
 ) -> str:
     """Build a CREATE TABLE statement for a set of columns.
 
@@ -215,14 +215,16 @@ def _create_table(
     Args:
         table: Table name.
         columns: Column names, in order.
-        primary_key: Column to declare as the key, when it is still present.
+        primary_key: Columns to declare as the key, in key order, when every
+            one of them is still present. Empty for no key.
 
     Returns:
         The statement.
     """
     quoted = [f'"{name}"' for name in columns]
-    if primary_key and primary_key in columns:
-        quoted.append(f'PRIMARY KEY("{primary_key}")')
+    if primary_key and all(name in columns for name in primary_key):
+        keys = ", ".join(f'"{name}"' for name in primary_key)
+        quoted.append(f"PRIMARY KEY({keys})")
     return f'CREATE TABLE "{table}" ({", ".join(quoted)})'
 
 
@@ -243,7 +245,9 @@ def wispr_db(tmp_path: Path) -> Callable[..., Path]:
     Returns:
         A factory taking ``rows`` (table to list of row mappings) plus
         optional ``migrations``, ``extra_columns``, ``drop_columns``,
-        ``drop_tables`` and ``extra_tables``, and returning the database path.
+        ``drop_tables``, ``extra_tables`` and ``primary_keys`` (table to key
+        columns, overriding the declaration or keying an extra table), and
+        returning the database path.
     """
 
     def build(
@@ -254,6 +258,7 @@ def wispr_db(tmp_path: Path) -> Callable[..., Path]:
         drop_columns: Mapping[str, Sequence[str]] | None = None,
         drop_tables: Sequence[str] = (),
         extra_tables: Mapping[str, Sequence[str]] | None = None,
+        primary_keys: Mapping[str, Sequence[str]] | None = None,
         name: str = "flow.sqlite",
     ) -> Path:
         path = tmp_path / name
@@ -268,10 +273,12 @@ def wispr_db(tmp_path: Path) -> Callable[..., Path]:
                     if column not in (drop_columns or {}).get(table, ())
                 ]
                 columns.extend((extra_columns or {}).get(table, ()))
-                connection.execute(_create_table(table, columns, spec.pk))
+                key = (primary_keys or {}).get(table, spec.key_columns)
+                connection.execute(_create_table(table, columns, key))
 
             for table, columns in (extra_tables or {}).items():
-                connection.execute(_create_table(table, list(columns), None))
+                key = (primary_keys or {}).get(table, ())
+                connection.execute(_create_table(table, list(columns), key))
 
             if "SequelizeMeta" not in drop_tables:
                 connection.executemany(

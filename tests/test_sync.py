@@ -1040,6 +1040,64 @@ def test_a_table_from_a_future_migration_is_archived(
     }
 
 
+def test_a_composite_key_table_is_archived_in_key_order(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """Rows inserted out of order come out in key order, run after run.
+
+    FolderMeetings' key used to be reported as absent, so every row sorted
+    equal and SQLite's scan order decided the snapshot's line order -- an
+    order a VACUUM is free to change, rewriting the file with nothing new in it.
+    """
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    built = wispr_db()
+    import sqlite3
+
+    with sqlite3.connect(built) as writer:
+        for folder, meeting in (("f2", MEETING_A), ("f1", MEETING_B), ("f1", MEETING_A)):
+            writer.execute(
+                'INSERT INTO "FolderMeetings" ("folderId", "meetingId", "slug", '
+                '"addedAt") VALUES (?, ?, ?, ?)',
+                (folder, meeting, f"{folder}-slug", "2026-09-22 10:00:00.000 +00:00"),
+            )
+    built.replace(data_dir / "flow.sqlite")
+    resolved = paths.resolve(data_dir=data_dir)
+    archive = Archive(root=tmp_path / "archive")
+
+    _run(archive, resolved)
+
+    lines = (archive.root / "tables" / "FolderMeetings.ndjson").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    keys = [(json.loads(line)["folderId"], json.loads(line)["meetingId"]) for line in lines]
+    assert keys == sorted(keys)
+
+
+def test_a_keyless_table_is_archived_in_content_order(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """With no key at all, the whole row decides, never the scan."""
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    built = wispr_db(extra_tables={"WhisperLog": ("note",)})
+    import sqlite3
+
+    with sqlite3.connect(built) as writer:
+        for note in ("murmur", "hush", "static"):
+            writer.execute('INSERT INTO "WhisperLog" VALUES (?)', (note,))
+    built.replace(data_dir / "flow.sqlite")
+    resolved = paths.resolve(data_dir=data_dir)
+    archive = Archive(root=tmp_path / "archive")
+
+    _run(archive, resolved)
+
+    lines = (archive.root / "tables" / "WhisperLog.ndjson").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert [json.loads(line)["note"] for line in lines] == ["hush", "murmur", "static"]
+
+
 def test_a_snapshot_file_is_not_nested_under_its_own_name(
     scene: Callable[..., tuple],
 ) -> None:
