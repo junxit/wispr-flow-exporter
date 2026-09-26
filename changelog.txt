@@ -67,6 +67,10 @@ wrapped at 72 columns, US English.
   scratch directory, and a guard that fails any connection off the
   machine. A bare `pytest` no longer walks into the interactive setup
   either.
+- Three of the four live-installation tests fail on the development
+  machine, as they are meant to when the app moves: it is now at 1.6.957
+  and migration 157, past the 0.4.0 pin. Re-pinning is the next
+  release's work, not a hotfix's.
 
 0.4.0
 -----
