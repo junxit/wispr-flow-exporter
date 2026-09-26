@@ -481,12 +481,24 @@ To re-baseline, paste the values from `--json` into `MCP_PIN` in
 `READ_TOOLS` in `mcp_api.py` is the read-only guarantee. The client refuses to
 call anything not in it, and refuses to send any JSON-RPC method outside
 `initialize`, `notifications/initialized`, `tools/list` and `tools/call`. Both
-asserted by test.
+asserted by test, and a third runs a whole pass against a fake server and
+checks every request that reaches it.
 
 MCP is JSON-RPC over POST, so the REST backend's GET-only test cannot extend
 here — and should not be made to. What that test protects is *cannot mutate*,
 and the allowlist is the MCP-shaped form of it. If the server grows a write
 tool, absence from the table is what keeps it unreachable.
+
+### 5. A listing that ends early
+
+`mcp: meetings listing incomplete: …` after a run means the pass did not see
+every meeting, and it says why: a page could not be fetched (the call's own
+failure is printed too, with the server's reason), a page flagged more records
+without a cursor, the server repeated a cursor, or the server capped the
+listing with `truncated: true`, which no cursor recovers. The watermark does
+not move until a listing completes, so the next run asks again. A tool's own
+error — `isError` in the result — is always a failure with its reason, never
+archived as data.
 
 ## What cannot be reached
 

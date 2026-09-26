@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -60,6 +61,14 @@ ENTITY_MCP_MEETINGS = "mcp_meetings"
 #: A response that reports more records than it returned.
 _MORE_FLAGS = ("has_more", "hasMore")
 _CURSOR_FLAGS = ("next_cursor", "nextCursor")
+
+#: Fields of a listing page that say how to reach the next one rather than
+#: what this one lists. Left out of a page's name, so a server whose cursors
+#: are not deterministic cannot make an unchanged listing look new every run.
+_PAGING_FIELDS = (*_CURSOR_FLAGS, "more")
+
+#: Pages of one listing to follow before deciding the server is looping.
+MAX_PAGES = 64
 
 #: Refuse to assemble a transcript larger than this. Untrusted remote input
 #: gets a cap for the same reason the NDJSON reader has one.
@@ -101,20 +110,82 @@ def content_digest(payload: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def truncated(payload: Any) -> bool:
-    """Report whether a response says it withheld records.
+def more_pages(payload: Any) -> bool:
+    """Report whether a listing page says more pages follow it.
 
     Args:
         payload: A decoded response body.
 
     Returns:
-        ``True`` when the response advertises more records than it returned.
+        ``True`` when the page flags more records or carries a cursor.
     """
     if not isinstance(payload, dict):
         return False
     if any(payload.get(flag) is True for flag in _MORE_FLAGS):
         return True
-    return any(payload.get(flag) for flag in _CURSOR_FLAGS)
+    return _cursor(payload) is not None
+
+
+def capped(payload: Any) -> bool:
+    """Report whether the server stopped a listing at its own limit.
+
+    The search tools stop at a fixed number of results per query and say so
+    with ``truncated: true`` -- a different signal from a next page, and one
+    no cursor will recover.
+
+    Args:
+        payload: A decoded response body.
+
+    Returns:
+        ``True`` when the page says the listing was cut short.
+    """
+    return isinstance(payload, dict) and payload.get("truncated") is True
+
+
+@dataclass(frozen=True, slots=True)
+class Paging:
+    """What a paged listing returned, and whether that was everything.
+
+    Attributes:
+        records: Every record seen, in order.
+        complete: Whether the listing ended the way a complete one does.
+        reason: Why it is incomplete, for the operator; ``None`` when complete.
+    """
+
+    records: list[dict[str, Any]]
+    complete: bool
+    reason: str | None = None
+
+
+def _page_digest(payload: Any) -> str:
+    """Name a listing page by what it lists.
+
+    Args:
+        payload: A decoded page.
+
+    Returns:
+        A short digest over the page without its paging fields.
+    """
+    if isinstance(payload, dict):
+        payload = {k: v for k, v in payload.items() if k not in _PAGING_FIELDS}
+    return content_digest(payload)[:16]
+
+
+def _listing(payload: Any, keys: tuple[str, ...]) -> bool:
+    """Report whether a payload is a listing page at all.
+
+    Args:
+        payload: A decoded response body.
+        keys: Candidate field names holding the record list.
+
+    Returns:
+        ``True`` for a list, or an object holding a list under one of ``keys``.
+    """
+    if isinstance(payload, list):
+        return True
+    return isinstance(payload, dict) and any(
+        isinstance(payload.get(key), list) for key in keys
+    )
 
 
 def _records(payload: Any, *keys: str) -> list[dict[str, Any]]:
@@ -215,8 +286,15 @@ def _fetch_pages(
     record_keys: tuple[str, ...],
     counts: SyncCounts,
     dry_run: bool = False,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Page one search tool to exhaustion, archiving each page verbatim.
+) -> Paging:
+    """Page one search tool to its end, archiving each page verbatim.
+
+    A listing is complete only when it ends the way a complete one does: a
+    page with no cursor that does not claim more. Measured on 0.4.1, every
+    other ending counted as complete too -- ``has_more`` with no cursor, the
+    server's own ``truncated: true`` cap, an error page -- and the watermark
+    moved past records never listed, while one cursor repeated forever cost
+    64 requests and listed each record 64 times.
 
     Args:
         client: An open MCP client.
@@ -228,29 +306,41 @@ def _fetch_pages(
         dry_run: Page as usual but write no page to disk.
 
     Returns:
-        Every record seen, and whether paging completed cleanly.
+        Every record seen, and whether the listing was complete.
     """
     seen: list[dict[str, Any]] = []
+    cursors: set[str] = set()
     cursor: str | None = None
-    # Bounded so a server that always returns a cursor cannot spin forever.
-    for _ in range(64):
+    for _ in range(MAX_PAGES):
         page = dict(arguments)
         if cursor:
             page["cursor"] = cursor
         payload = client.call(tool, page)
         if payload is None:
-            return seen, False
+            return Paging(seen, False, "a page could not be fetched")
+        if not _listing(payload, record_keys):
+            return Paging(seen, False, "a page held no record list")
         counts.scanned += 1
-        digest = content_digest(payload)[:16]
-        if _archive_verbatim(archive, tool, digest, payload, dry_run=dry_run):
+        if _archive_verbatim(
+            archive, tool, _page_digest(payload), payload, dry_run=dry_run
+        ):
             counts.written += 1
         else:
             counts.unchanged += 1
         seen.extend(_records(payload, *record_keys))
+        if capped(payload):
+            return Paging(seen, False, "the server capped the listing")
         cursor = _cursor(payload)
-        if not cursor:
-            return seen, True
-    return seen, False
+        if cursor is None:
+            if more_pages(payload):
+                return Paging(
+                    seen, False, "more records were flagged but no cursor given"
+                )
+            return Paging(seen, True)
+        if cursor in cursors:
+            return Paging(seen, False, "the server repeated a cursor")
+        cursors.add(cursor)
+    return Paging(seen, False, f"the listing ran past {MAX_PAGES} pages")
 
 
 def _fetch_transcript(
@@ -423,6 +513,7 @@ def sync_mcp(
     archive: Archive,
     client: McpProtocol,
     options: SyncOptions,
+    problems: list[str] | None = None,
 ) -> SyncCounts:
     """Archive MCP responses verbatim and fill transcript gaps.
 
@@ -430,10 +521,13 @@ def sync_mcp(
         archive: The destination archive.
         client: An open MCP client, or any object satisfying the protocol.
         options: What this run was asked to do.
+        problems: Receives what went wrong that no failed call explains, such
+            as a listing the server ended early.
 
     Returns:
         What the pass did.
     """
+    problems = [] if problems is None else problems
     counts = SyncCounts()
     now = _now()
     state = archive.source_state(SOURCE_MCP)
@@ -456,7 +550,7 @@ def sync_mcp(
         # give every page a fresh digest and rewrite the archive every run.
         arguments["since"] = since
 
-    meetings, complete = _fetch_pages(
+    listing = _fetch_pages(
         client,
         archive,
         "search_meetings",
@@ -465,8 +559,10 @@ def sync_mcp(
         counts=counts,
         dry_run=options.dry_run,
     )
-    if not complete:
+    meetings = listing.records
+    if not listing.complete:
         counts.failed += 1
+        problems.append(f"meetings listing incomplete: {listing.reason}")
 
     if options.dry_run:
         counts.scanned += len(meetings)
@@ -554,7 +650,7 @@ def sync_mcp(
         counts.written += 1 if wrote else 0
         counts.unchanged += 0 if wrote else 1
 
-    notes, notes_complete = _fetch_pages(
+    notes = _fetch_pages(
         client,
         archive,
         "search_scratchpad_notes",
@@ -562,8 +658,9 @@ def sync_mcp(
         record_keys=("notes", "results", "items"),
         counts=counts,
     )
-    if not notes_complete:
+    if not notes.complete:
         counts.failed += 1
+        problems.append(f"notes listing incomplete: {notes.reason}")
 
     index = archive.resolve(ENTITY_MCP, "meetings.index.ndjson")
     if write_ndjson_if_changed(index, _summaries(meetings)):
@@ -572,7 +669,7 @@ def sync_mcp(
     if not counts.failed and highest and highest != watermark:
         archive.set_watermark(SOURCE_MCP, "meetings", "modified_at", highest)
     state["server"] = dict(getattr(client, "server", {}) or {})
-    state["notes_seen"] = len(notes)
+    state["notes_seen"] = len(notes.records)
     return counts
 
 

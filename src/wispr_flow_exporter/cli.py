@@ -844,13 +844,14 @@ def _run_mcp(
             return EXIT_FAILURE if explicit else EXIT_OK
 
     _say("mcp", f"using the token from {credential.origin}")
+    problems: list[str] = []
     try:
         with McpClient(
             credential,
             endpoint=config.mcp_endpoint,
             renew=_renewer(config.mcp_endpoint, credential),
         ) as client:
-            counts = sync_mcp(archive, client, options)
+            counts = sync_mcp(archive, client, options, problems)
             failures = list(client.failures)
             tools = list(client.tools)
             server = dict(client.server)
@@ -866,10 +867,16 @@ def _run_mcp(
             "version": MCP_PIN.version,
             "sha256": MCP_PIN.sha256,
         }
-        state["tool_shapes"] = tool_shapes(tools)
+        if tools or not state.get("tool_shapes"):
+            # An empty tool list is far likelier a server's bad moment than a
+            # server with no tools, and recording it would make every tool
+            # look new -- additive drift -- on the next run.
+            state["tool_shapes"] = tool_shapes(tools)
 
     for name, reason in failures:
         _say("", f"mcp {name}: {redact(reason)}")
+    for problem in problems:
+        _say("", f"mcp: {problem}")
     if drift.kind is not DriftClass.OK:
         _say("mcp schema", drift.summary())
 

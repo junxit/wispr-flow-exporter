@@ -31,13 +31,15 @@ the REST ones are: the shapes are not a contract.
 
 from __future__ import annotations
 
+import codecs
+import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 from . import USER_AGENT
-from .local_config import redact
+from .local_config import printable, redact
 from .mcp_auth import McpAuthError, McpCredential
 from .transport import (
     ACCEPT_ENCODING,
@@ -48,6 +50,7 @@ from .transport import (
     ResponseRefused,
     Retry,
     decode_json,
+    iter_capped,
     read_capped,
     retry_after,
 )
@@ -59,6 +62,9 @@ DEFAULT_TIMEOUT = 60.0
 
 #: Page size for the search tools. The server caps at 200.
 PAGE_SIZE = 200
+
+#: Pages of ``tools/list`` to follow before deciding the server is looping.
+TOOL_PAGES = 16
 
 #: Characters per transcript request. The server caps at 40000, and asking for
 #: the cap minimizes the number of chunks a long transcript is spliced from --
@@ -136,29 +142,165 @@ class ToolResult:
         return self.reason is None and self.payload is not None
 
 
-def _parse_sse(text: str) -> Any:
-    """Pull the JSON-RPC message out of an event-stream body.
+_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
+def _sse_messages(chunks: Iterable[bytes]) -> Iterator[Any]:
+    """Decode the JSON messages of an event stream as they arrive.
 
     Streamable HTTP may answer a POST with ``text/event-stream`` instead of
-    ``application/json``, so a client that only called ``.json()`` would work
-    against some deployments and not others.
+    ``application/json``, and an event stream is not a list of ``data:``
+    lines. Per the specification: a line ends in CRLF, LF or CR; an event's
+    ``data`` lines are joined with newlines, each losing one leading space; a
+    blank line dispatches the event; comments and other fields are ignored.
+    Measured on 0.4.1, which took the first ``data:`` line as the reply: a
+    progress notification ahead of the answer became the answer, and one
+    message split over two lines failed to parse.
 
     Args:
-        text: The raw response body.
+        chunks: The body, in pieces, already bounded by the cap.
+
+    Yields:
+        Each event's decoded JSON; events that are not JSON are skipped. An
+        event the stream ends in the middle of is dispatched too, since a
+        reply cut short cannot parse as a complete one.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    data: list[str] = []
+
+    def take(line: str) -> None:
+        if not line.startswith(":"):
+            name, _, value = line.partition(":")
+            if name == "data":
+                data.append(value.removeprefix(" "))
+
+    def dispatch() -> Iterator[Any]:
+        text = "\n".join(data)
+        data.clear()
+        try:
+            yield decode_json(text)
+        except NotJson:
+            return
+
+    for chunk in _ended(iter(chunks)):
+        final = chunk is None
+        # Only the new text can hold a line end, bar a CR held back from the
+        # previous read, so each piece is scanned once: a body that is one
+        # enormous line costs what it weighs rather than its square.
+        scan = max(len(pending) - 1, 0)
+        pending += decoder.decode(chunk or b"", final=final)
+        start = 0
+        for match in _LINE_END.finditer(pending, scan):
+            if match.group() == "\r" and match.end() == len(pending) and not final:
+                break  # possibly the first half of a CRLF split across reads
+            line = pending[start : match.start()]
+            start = match.end()
+            if line:
+                take(line)
+            elif data:
+                yield from dispatch()
+        pending = pending[start:]
+    if pending:
+        take(pending)
+    if data:
+        yield from dispatch()
+
+
+def _ended(chunks: Iterator[bytes]) -> Iterator[bytes | None]:
+    """Yield a stream's pieces and then ``None``, so the reader can flush.
+
+    Args:
+        chunks: The pieces.
+
+    Yields:
+        Each piece, then ``None``.
+    """
+    yield from chunks
+    yield None
+
+
+def _answers(message: Any, request_id: int) -> TypeGuard[dict[str, Any]]:
+    """Report whether a message is the reply to one request.
+
+    Args:
+        message: A decoded JSON-RPC message.
+        request_id: The request's ``id``.
 
     Returns:
-        The decoded message, or ``None`` when there was no data event.
+        ``True`` for a response carrying that id and a result or an error.
     """
-    for line in text.splitlines():
-        if line.startswith("data:"):
-            chunk = line[5:].strip()
-            if not chunk:
-                continue
-            try:
-                return decode_json(chunk)
-            except NotJson:
-                continue
-    return None
+    return (
+        isinstance(message, dict)
+        and message.get("id") == request_id
+        and ("result" in message or "error" in message)
+    )
+
+
+def _read_reply(response: Any, request_id: int) -> dict[str, Any]:
+    """Read the reply to one request from an open response.
+
+    Args:
+        response: The streaming response.
+        request_id: The request's ``id``.
+
+    Returns:
+        The JSON-RPC response message.
+
+    Raises:
+        McpError: The body held no reply to this request. A reply to some
+            other request is not this one's -- 0.4.1 accepted it anyway.
+    """
+    if "text/event-stream" in response.headers.get("Content-Type", ""):
+        for message in _sse_messages(iter_capped(response)):
+            if _answers(message, request_id):
+                # Returned at once: nothing after the answer is read, and the
+                # caller's `with` closes the stream.
+                return message
+        raise McpError("the event stream ended without a reply to this request")
+    raw = read_capped(response)
+    if not raw:
+        raise McpError("the server answered this request with an empty body")
+    try:
+        message = decode_json(raw)
+    except NotJson as error:
+        raise McpError("response was not JSON") from error
+    if not isinstance(message, dict):
+        raise McpError("response was not a JSON-RPC message")
+    if not _answers(message, request_id):
+        raise McpError("the response did not answer this request")
+    return message
+
+
+def tool_error(result: Any) -> str | None:
+    """Return why a ``tools/call`` result says the tool failed, if it does.
+
+    MCP reports a tool's own failure inside a successful JSON-RPC response:
+    ``isError: true``, with the reason as content. Measured: asking for a
+    meeting that does not exist answers exactly that way. Read as data, as
+    0.4.1 read it, an error became a record -- an archived listing page, or
+    a transcript chunk with no text that ended assembly early.
+
+    Args:
+        result: The ``result`` member of a ``tools/call`` response.
+
+    Returns:
+        A printable reason, or ``None`` when the tool succeeded.
+    """
+    if not isinstance(result, dict) or result.get("isError") is not True:
+        return None
+    detail = ""
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict) and isinstance(structured.get("error"), str):
+        detail = structured["error"]
+    elif isinstance(result.get("content"), list):
+        texts = [
+            block["text"]
+            for block in result["content"]
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        detail = texts[0] if texts else ""
+    return printable(" ".join(detail.split()), limit=200) or "no reason given"
 
 
 def unwrap(result: Any) -> Any:
@@ -329,9 +471,10 @@ class McpClient:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
+        self._next_id += 1
+        request_id = self._next_id
         if not notify:
-            self._next_id += 1
-            message["id"] = self._next_id
+            message["id"] = request_id
 
         headers: dict[str, str] = {"MCP-Protocol-Version": PROTOCOL_VERSION}
         if self._session:
@@ -373,9 +516,14 @@ class McpClient:
                     session = response.headers.get("Mcp-Session-Id")
                     if session:
                         self._session = session
-                    status = response.status_code
-                    kind = response.headers.get("Content-Type", "")
-                    raw = read_capped(response)
+                    if notify:
+                        return None
+                    if response.status_code == 202:
+                        # Accepted is how a server answers a notification.
+                        # For a request it means no reply is coming, which
+                        # 0.4.1 returned as a silent None.
+                        raise McpError("the server accepted the request but sent no reply")
+                    reply = _read_reply(response, request_id)
             except Retry as retry:
                 time.sleep(retry.wait)
                 continue
@@ -395,29 +543,21 @@ class McpClient:
                 time.sleep(BACKOFF[attempt])
                 continue
 
-            if notify or status == 202 or not raw:
-                return None
-
-            if "text/event-stream" in kind:
-                payload = _parse_sse(raw.decode("utf-8", errors="replace"))
-            else:
-                try:
-                    payload = decode_json(raw)
-                except NotJson as error:
-                    raise McpError("response was not JSON") from error
-            if not isinstance(payload, dict):
-                raise McpError("response was not a JSON-RPC message")
-            if payload.get("error"):
-                detail = payload["error"]
+            if "error" in reply:
+                detail = reply["error"]
                 message_text = (
                     detail.get("message") if isinstance(detail, dict) else str(detail)
                 )
-                raise McpError(redact(str(message_text)))
-            return payload.get("result")
+                raise McpError(redact(printable(str(message_text), limit=300)))
+            return reply.get("result")
         raise McpError("exhausted retries")
 
     def _handshake(self) -> None:
-        """Initialize the session and read the server's tool list."""
+        """Initialize the session and read the server's tool list.
+
+        Raises:
+            McpError: The server did not complete the handshake.
+        """
         result = self._send(
             "initialize",
             {
@@ -426,17 +566,48 @@ class McpClient:
                 "clientInfo": {"name": "wispr-flow-exporter", "version": USER_AGENT},
             },
         )
-        if isinstance(result, dict):
-            info = result.get("serverInfo") or {}
-            self.server = {
-                "name": info.get("name"),
-                "version": info.get("version"),
-                "protocol_version": result.get("protocolVersion"),
-            }
+        if not isinstance(result, dict):
+            raise McpError("the server's reply to initialize was not an object")
+        info = result.get("serverInfo")
+        info = info if isinstance(info, dict) else {}
+        self.server = {
+            "name": info.get("name"),
+            "version": info.get("version"),
+            "protocol_version": result.get("protocolVersion"),
+        }
         self._send("notifications/initialized", {}, notify=True)
-        listed = self._send("tools/list", {})
-        if isinstance(listed, dict) and isinstance(listed.get("tools"), list):
-            self.tools = listed["tools"]
+        self.tools = self._list_tools()
+
+    def _list_tools(self) -> list[dict[str, Any]]:
+        """Read the server's advertised tools, to the last page.
+
+        ``tools/list`` is paginated by ``nextCursor``, which 0.4.1 never
+        followed, so a server that paged its tools would have seemed to lose
+        all but the first page. And a reply with no tool list is an error:
+        taken as empty, as it was, it recorded every tool as gone.
+
+        Returns:
+            Every advertised tool.
+
+        Raises:
+            McpError: A reply held no tool list, or the pages did not end.
+        """
+        tools: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        for _ in range(TOOL_PAGES):
+            listed = self._send("tools/list", {"cursor": cursor} if cursor else {})
+            if not isinstance(listed, dict) or not isinstance(listed.get("tools"), list):
+                raise McpError("the server's reply to tools/list held no tool list")
+            tools.extend(tool for tool in listed["tools"] if isinstance(tool, dict))
+            following = listed.get("nextCursor")
+            if not isinstance(following, str) or not following:
+                return tools
+            if following in seen:
+                raise McpError("the server's tool list repeated a page")
+            seen.add(following)
+            cursor = following
+        raise McpError(f"the server's tool list ran past {TOOL_PAGES} pages")
 
     def call(self, name: str, arguments: Mapping[str, Any] | None = None) -> Any:
         """Invoke one allowlisted tool.
@@ -458,16 +629,51 @@ class McpClient:
             raise McpError(f"refusing to call a tool that is not read-only: {name}")
         key = _result_key(name, arguments)
         try:
-            payload = unwrap(
-                self._send("tools/call", {"name": name, "arguments": dict(arguments or {})})
+            result = self._send(
+                "tools/call", {"name": name, "arguments": dict(arguments or {})}
             )
         except McpError as error:
-            reason = redact(str(error))
-            self.results[key] = ToolResult(name=name, status=None, reason=reason)
-            self.failures.append((key, reason))
-            return None
+            return self._failed(key, name, None, redact(str(error)))
+        failure = tool_error(result)
+        if failure is not None:
+            return self._failed(key, name, 200, f"tool error: {failure}")
+        payload = unwrap(result)
+        if payload is None or _empty(result):
+            # Measured on 0.4.1: a null result was recorded as a success with
+            # no payload, and counted by no one.
+            return self._failed(key, name, 200, "empty result")
         self.results[key] = ToolResult(name=name, status=200, payload=payload)
         return payload
+
+    def _failed(self, key: str, name: str, status: int | None, reason: str) -> None:
+        """Record one call's failure.
+
+        Args:
+            key: The result key.
+            name: The tool invoked.
+            status: The HTTP status, when one arrived.
+            reason: Why the call produced nothing usable.
+        """
+        self.results[key] = ToolResult(name=name, status=status, reason=reason)
+        self.failures.append((key, reason))
+
+
+def _empty(result: Any) -> bool:
+    """Report whether a tool result carries nothing at all.
+
+    Args:
+        result: The ``result`` member of a ``tools/call`` response.
+
+    Returns:
+        ``True`` for an envelope holding nothing but an empty content list
+        and metadata. A result with fields of its own is data, even when it
+        is not shaped the way MCP describes.
+    """
+    return (
+        isinstance(result, dict)
+        and not result.get("content")
+        and set(result) <= {"content", "isError", "_meta"}
+    )
 
 
 def _result_key(name: str, arguments: Mapping[str, Any] | None) -> str:

@@ -275,6 +275,43 @@ wrapped at 72 columns, US English.
   because the save came after both. Remote passes are now skipped after
   an interrupt, an interrupt during one stops the run with 130, and what
   the passes recorded is saved however they end.
+- A tool's own error is a failure, not data. MCP reports one inside a
+  successful response, as isError with the reason as content -- the
+  server answers that way for a meeting that does not exist -- and 0.4.1
+  returned it as the result. Measured: an error listing page was
+  archived as a page and ended paging as complete, and a tool error on
+  the second chunk of a transcript committed the first 40,000
+  characters as the whole transcript, recovered, with no failure
+  counted. Each is now that call's failure with the server's reason,
+  and so is an empty result, which 0.4.1 recorded as a success.
+- Event-stream replies are read as event streams. 0.4.1 took the first
+  `data:` line as the reply. Measured: a progress notification ahead of
+  the answer became the answer, silently; one message split over two
+  data lines failed; and a reply carrying another request's id was
+  accepted as this one's. Events are now parsed per the specification
+  -- CRLF, LF and CR line endings, data lines joined -- in one pass
+  over the body, a reply must carry its request's id, and reading stops
+  at the answer. A 202 to a request, which 0.4.1 returned as a silent
+  None, is a failure.
+- tools/list is read to its last page, and a reply without a tool list
+  ends the handshake. 0.4.1 never followed nextCursor, and read a reply
+  with no tool list as no tools at all -- reporting every tool gone and
+  emptying the drift ledger, so the next run found every tool new. An
+  empty tool list no longer replaces a recorded ledger either.
+- A listing is complete only when it ends like one. Measured on 0.4.1:
+  has_more with no cursor, the server's own truncated: true result cap
+  and an error page all counted as complete, and a cursor that repeated
+  cost 64 requests and listed each record 64 times. Each now leaves the
+  listing incomplete, with the reason printed after the run, and an
+  incomplete listing moves no watermark.
+- Listing pages are named by what they list, not by their cursor.
+  Measured on 0.4.1: a cursor that changed between runs wrote an
+  unchanged listing under a new name every run. Existing pages keep
+  their names, and the first run after upgrading writes each current
+  page once more under its new one.
+- A test runs a whole MCP pass against a fake server and checks every
+  request that reaches it: only the four allowlisted JSON-RPC methods,
+  and only read tools.
 
 0.4.1
 -----
