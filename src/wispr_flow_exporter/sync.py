@@ -889,10 +889,7 @@ def sync_calendar(
 
             # The YYYY/MM shard derives from startAtUtc, which moves when an
             # event is rescheduled, so calendar records relocate too.
-            previous = archive.existing_path("calendar", key)
-            if previous is not None and previous != destination and previous.exists():
-                secure_mkdir(destination.parent)
-                previous.replace(destination)
+            if archive.relocate_file("calendar", key, destination):
                 counts.relocated += 1
 
             wrote = write_json_if_changed(destination, data)

@@ -303,6 +303,35 @@ def test_a_retitle_moves_the_directory(scene: Callable[..., tuple]) -> None:
     assert "renamed-budget-review" in moved.name
 
 
+def test_a_misfiled_index_entry_never_costs_a_record(
+    scene: Callable[..., tuple],
+) -> None:
+    """An entry pointing at another meeting's directory must not move or delete it.
+
+    Each directory holds a file standing in for the thing this archive exists
+    for: a transcript Wispr Flow has since deleted. Before the fix, a full
+    sync after this corruption deleted A's directory to make room, moved B's
+    into its place, and neither file survived where it belonged.
+    """
+    archive, resolved, _ = scene(
+        rows=[_meeting_row(), _meeting_row(id=MEETING_B, title="Hush weekly")]
+    )
+    _run(archive, resolved)
+    mine = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    theirs = archive.root / archive.entry("meetings", MEETING_B)["path"]
+    (mine / "raw" / "kept.txt").write_text("only copy of A", encoding="utf-8")
+    (theirs / "raw" / "kept.txt").write_text("only copy of B", encoding="utf-8")
+    archive.index["entities"]["meetings"][MEETING_A]["path"] = archive.entry(
+        "meetings", MEETING_B
+    )["path"]
+    archive.save()
+
+    _run(Archive(root=archive.root), resolved, full=True)
+
+    assert (mine / "raw" / "kept.txt").read_text(encoding="utf-8") == "only copy of A"
+    assert (theirs / "raw" / "kept.txt").read_text(encoding="utf-8") == "only copy of B"
+
+
 def test_a_soft_deleted_meeting_is_kept_and_flagged(
     scene: Callable[..., tuple],
 ) -> None:

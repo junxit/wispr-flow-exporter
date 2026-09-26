@@ -259,6 +259,100 @@ def test_relocation_refuses_a_tampered_source_path(archive: Archive) -> None:
     assert not archive.relocate("meetings", MEETING_A, target)
 
 
+def test_relocation_never_moves_another_records_directory(archive: Archive) -> None:
+    """An index entry naming someone else's directory is not an instruction.
+
+    A sync-conflict copy or a hand-merged index.json can file meeting A under
+    meeting B's path. The old code moved B's directory into A's place, and the
+    record it moved over was the one this archive exists to keep.
+    """
+    spec = EXPECTED["Meetings"]
+    theirs = archive.record_path("Meetings", spec, MEETING_B, when=WHEN, title="b")
+    theirs.mkdir(parents=True)
+    (theirs / "meeting.md").write_text("meeting B", encoding="utf-8")
+    archive.put("meetings", MEETING_A, path=archive.relative(theirs))
+
+    mine = archive.record_path("Meetings", spec, MEETING_A, when=WHEN, title="a")
+    assert not archive.relocate("meetings", MEETING_A, mine)
+
+    assert (theirs / "meeting.md").read_text(encoding="utf-8") == "meeting B"
+
+
+def test_relocation_never_deletes_an_existing_destination(archive: Archive) -> None:
+    """Both copies survive; verify reports the stray rather than rmtree erasing it."""
+    spec = EXPECTED["Meetings"]
+    old = archive.record_path("Meetings", spec, MEETING_A, when=WHEN, title="old")
+    new = archive.record_path("Meetings", spec, MEETING_A, when=WHEN, title="new")
+    for directory, text in ((old, "older"), (new, "newer")):
+        directory.mkdir(parents=True)
+        (directory / "meeting.md").write_text(text, encoding="utf-8")
+    archive.put("meetings", MEETING_A, path=archive.relative(old))
+
+    assert not archive.relocate("meetings", MEETING_A, new)
+
+    assert (old / "meeting.md").read_text(encoding="utf-8") == "older"
+    assert (new / "meeting.md").read_text(encoding="utf-8") == "newer"
+
+
+def test_a_document_relocation_never_overwrites_a_file(archive: Archive) -> None:
+    """A retitled note moves its files only onto names that are free."""
+    spec = EXPECTED["Notes"]
+    old = archive.record_path("Notes", spec, MEETING_A, when=WHEN, title="old")
+    new = archive.record_path("Notes", spec, MEETING_A, when=WHEN, title="new")
+    old.parent.mkdir(parents=True)
+    old.with_name(f"{old.name}.md").write_text("older", encoding="utf-8")
+    new.with_name(f"{new.name}.md").write_text("newer", encoding="utf-8")
+    archive.put("notes", MEETING_A, path=archive.relative(old.with_name(f"{old.name}.md")))
+
+    archive.relocate_document("notes", MEETING_A, new, (".md", ".raw.json"))
+
+    assert old.with_name(f"{old.name}.md").read_text(encoding="utf-8") == "older"
+    assert new.with_name(f"{new.name}.md").read_text(encoding="utf-8") == "newer"
+
+
+def test_a_document_relocation_never_moves_another_records_files(
+    archive: Archive,
+) -> None:
+    """The same ownership rule as directories, for records made of sibling files."""
+    spec = EXPECTED["Notes"]
+    theirs = archive.record_path("Notes", spec, MEETING_B, when=WHEN, title="b")
+    theirs.parent.mkdir(parents=True)
+    document = theirs.with_name(f"{theirs.name}.md")
+    document.write_text("note B", encoding="utf-8")
+    archive.put("notes", MEETING_A, path=archive.relative(document))
+
+    mine = archive.record_path("Notes", spec, MEETING_A, when=WHEN, title="a")
+    assert not archive.relocate_document("notes", MEETING_A, mine, (".md",))
+
+    assert document.read_text(encoding="utf-8") == "note B"
+
+
+def test_a_file_relocation_obeys_the_same_two_refusals(archive: Archive) -> None:
+    """Calendar events move as single files, never onto or out of another record."""
+    spec = EXPECTED["CalendarEvents"]
+    key, other = "a1b2c3d4e5f6", "0f0f0f0f0f0f"
+    theirs = archive.record_path("CalendarEvents", spec, other, when=WHEN, title="x")
+    theirs.parent.mkdir(parents=True)
+    foreign = theirs.with_name(f"{theirs.name}.json")
+    foreign.write_text("event B", encoding="utf-8")
+    archive.put("calendar", key, path=archive.relative(foreign))
+    mine = archive.record_path("CalendarEvents", spec, key, when=WHEN, title="x")
+
+    assert not archive.relocate_file("calendar", key, mine.with_name(f"{mine.name}.json"))
+    assert foreign.read_text(encoding="utf-8") == "event B"
+
+    old = mine.with_name(f"{mine.name}.json")
+    old.write_text("older", encoding="utf-8")
+    archive.put("calendar", key, path=archive.relative(old))
+    taken = archive.resolve("calendar", "2026", "09", old.name)
+    taken.parent.mkdir(parents=True)
+    taken.write_text("newer", encoding="utf-8")
+
+    assert not archive.relocate_file("calendar", key, taken)
+    assert old.read_text(encoding="utf-8") == "older"
+    assert taken.read_text(encoding="utf-8") == "newer"
+
+
 # --- tombstones -----------------------------------------------------------
 
 

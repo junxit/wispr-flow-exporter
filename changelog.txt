@@ -35,6 +35,17 @@ wrapped at 72 columns, US English.
   acknowledgement, although .env.example and SECURITY.md both said
   --i-understand was required. It now is, however screen context is
   switched on.
+- A relocation could delete a record. When a record's new path already
+  existed, relocate removed it first, on the theory that only an
+  interrupted earlier move could have left it there; and it moved
+  whatever directory the index named, whether or not that directory
+  belonged to the record. With one index entry pointing at another
+  meeting's directory -- a restored, merged or sync-conflict copy of
+  index.json -- a full sync deleted the first meeting's directory and
+  moved the second into its place. A record now moves only out of a path
+  named for its own id and only onto a path that is free; anything else
+  stays on disk for verify to report. Notes and calendar events follow
+  the same rules.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check

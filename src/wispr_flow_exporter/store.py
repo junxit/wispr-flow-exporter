@@ -151,6 +151,24 @@ def dated_prefix(when: datetime | None) -> str:
     return f"{when:%Y/%m}" if when else UNDATED
 
 
+def _named_for(path: Path, key: str) -> bool:
+    """Report whether an archived path belongs to the record with this key.
+
+    Every record's name ends ``--<key>`` (see :func:`record_dir_name`), with a
+    suffix after the first dot for single-file records. The key -- a validated
+    UUID, or a hash for calendar events -- contains no dot, so the part before
+    the first dot is where the key has to be.
+
+    Args:
+        path: A directory or file the index names.
+        key: The record key the index filed it under.
+
+    Returns:
+        ``True`` when the name ends with this record's key.
+    """
+    return path.name.split(".", 1)[0].endswith(f"--{key}")
+
+
 @dataclass(slots=True)
 class Archive:
     """An archive directory, its index and its sync state.
@@ -366,6 +384,16 @@ class Archive:
         holding two versions of a renamed meeting with no way to tell which is
         current.
 
+        Two refusals, and neither deletes anything. The path the index names
+        must be named for *this* record: an entry pointing at another record's
+        directory -- a hand edit, a restored or merged ``index.json``, a
+        sync-conflict copy -- used to move that other record over this one's
+        place, after deleting whatever was there. And an existing destination is
+        left alone rather than replaced: this used to ``rmtree`` it, on the
+        theory that only an interrupted earlier move could have put it there,
+        which is exactly the theory a corrupted index disproves. Whatever is
+        left behind stays on disk, where ``verify`` reports it.
+
         Args:
             entity: Archive directory name.
             key: Record key.
@@ -377,13 +405,30 @@ class Archive:
         current = self.existing_path(entity, key)
         if current is None or current == destination or not current.exists():
             return False
+        if not _named_for(current, key) or destination.exists():
+            return False
         secure_mkdir(destination.parent)
-        if destination.exists():
-            # The destination should not exist, but if a previous run was
-            # interrupted between the move and the index write it might. Keep
-            # the newer copy rather than failing the whole pass.
-            shutil.rmtree(destination) if destination.is_dir() else destination.unlink()
         shutil.move(str(current), str(destination))
+        return True
+
+    def relocate_file(self, entity: str, key: str, destination: Path) -> bool:
+        """Move a single-file record to a new path, under the same two refusals.
+
+        Args:
+            entity: Archive directory name.
+            key: Record key.
+            destination: Where the record's file now belongs.
+
+        Returns:
+            ``True`` when the file was moved.
+        """
+        current = self.existing_path(entity, key)
+        if current is None or current == destination or not current.is_file():
+            return False
+        if not _named_for(current, key) or destination.exists():
+            return False
+        secure_mkdir(destination.parent)
+        current.replace(destination)
         return True
 
     def relocate_document(
@@ -414,15 +459,16 @@ class Archive:
         if current is None:
             return False
         old_stem = current.parent / current.name.split(".", 1)[0]
-        if old_stem == new_stem:
+        if old_stem == new_stem or not _named_for(old_stem, key):
             return False
 
         moved = False
         for suffix in suffixes:
             source = old_stem.parent / f"{old_stem.name}{suffix}"
-            if not source.exists():
-                continue
             destination = new_stem.parent / f"{new_stem.name}{suffix}"
+            # Never over an existing file: see relocate().
+            if not source.exists() or destination.exists():
+                continue
             secure_mkdir(destination.parent)
             source.replace(destination)
             moved = True

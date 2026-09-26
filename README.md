@@ -293,7 +293,9 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
   rendered.
 - **A transcript Wispr Flow deletes stays in your archive**, flagged
   `transcript_deleted_upstream: true`. This is the whole point of the tool.
-- **A retitle moves the directory** rather than duplicating it.
+- **A retitle moves the directory** rather than duplicating it — and a move
+  never lands on, or deletes, anything already there. A record is only moved
+  out of a path named for its own id.
 - **`--dry-run` writes nothing** — not the archive, not its index, not a
   repository's `.gitignore`.
 

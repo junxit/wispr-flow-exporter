@@ -256,7 +256,10 @@ spoke.
 - **Local index tampering.** `index.json` is treated as untrusted input; entries
   resolving outside the archive root are refused rather than followed. A
   corrupted or edited index cannot redirect a write, or a rename, outside the
-  archive.
+  archive — nor, inside it, move one record over another: a record is only
+  ever moved out of a path named for its own id, and never onto a path that
+  already exists. Until 0.4.1 an existing destination was deleted to make
+  room.
 
 - **Third parties who never consented.** This is the risk most specific to this
   tool. A meeting archive contains other people's voices and words, recorded
