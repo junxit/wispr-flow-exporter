@@ -24,44 +24,8 @@ from wispr_flow_exporter.cli import (
     main,
 )
 
-_WISPR_VARS = (
-    "WISPR_DATA_DIR",
-    "WISPR_DB_PATH",
-    "WISPR_SYNC_SOURCE",
-    "WISPR_ARCHIVE_DIR",
-    "WISPR_AUDIO",
-    "WISPR_MAX_AUDIO_MB",
-    "WISPR_INCLUDE_SCREEN_CONTEXT",
-    "WISPR_INCLUDE_AUDIO_BLOBS",
-    "WISPR_INCLUDE_IMAGES",
-    "WISPR_RECHECK_DAYS",
-    "WISPR_STRICT_SCHEMA",
-    "WISPR_API_BASE",
-    "WISPR_SESSION_FILE",
-    "WISPR_ACCESS_TOKEN",
-    "WISPR_MCP_ENDPOINT",
-    "WISPR_MCP_TOKEN",
-    "WISPR_ALLOW_ENDPOINT_OVERRIDE",
-)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Keep the developer's own environment and .env out of every test."""
-    for name in _WISPR_VARS:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("WISPR_ARCHIVE_DIR", str(tmp_path / "archive"))
-    # Point the data directory at somewhere that does not exist. Without this,
-    # a test that forgets --data-dir silently falls through to the developer's
-    # own Wispr Flow store and reads real meetings; one did, and copied 15 MB
-    # of real audio into a temp archive before this guard was added.
-    monkeypatch.setenv("WISPR_DATA_DIR", str(tmp_path / "no-such-wispr-flow"))
-    # Point the credential store somewhere empty. The default source is now
-    # "all", so without this a test that runs sync would reach the live MCP
-    # server using whatever token the developer happens to have logged in with
-    # -- the same failure mode the data-directory guard above exists for.
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-config"))
-    monkeypatch.chdir(tmp_path)
+# Environment, working directory, credential store and network are isolated for
+# every test by the autouse fixture in conftest.py, which began life here.
 
 
 def _data_dir(

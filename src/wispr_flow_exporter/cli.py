@@ -1301,7 +1301,11 @@ def main(argv: list[str] | None = None) -> int:
     render_parser.add_argument("-v", "--verbose", action="store_true")
     render_parser.set_defaults(func=cmd_render)
 
-    if not argv and len(sys.argv) <= 1:
+    # Only the real entry point prompts. ``main([])`` is a programmatic call
+    # and prints help: deciding by ``len(sys.argv)`` alone made the answer
+    # depend on how the *caller* was launched, so a bare ``pytest`` walked
+    # into the interactive setup while ``pytest -q`` did not.
+    if argv is None and len(sys.argv) <= 1:
         try:
             answers = collect(_defaults())
         except PromptAborted as error:

@@ -21,14 +21,115 @@ quarterly whisper budget.
 
 from __future__ import annotations
 
+import os
+import socket
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from wispr_flow_exporter.schema import EXPECTED
+
+# --- isolation ------------------------------------------------------------
+# Variables that decide where traffic goes and whom it trusts. A developer's
+# shell may carry any of them, and a test that inherited one would be testing
+# that developer's network rather than this package.
+_NETWORK_ENV = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+
+
+def _is_local(address: object) -> bool:
+    """Report whether a socket address stays on this machine.
+
+    Args:
+        address: What was passed to ``socket.connect``.
+
+    Returns:
+        ``True`` for loopback hosts and Unix-domain socket paths -- the login
+        listener tests talk to 127.0.0.1 on purpose -- and ``False`` for
+        anything that would leave the machine.
+    """
+    if isinstance(address, (str, bytes)):
+        return True
+    if isinstance(address, tuple) and address and isinstance(address[0], str):
+        host = address[0]
+        return host in ("localhost", "::1") or host.startswith("127.")
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """Keep every test away from the developer's data, credentials and network.
+
+    This used to live in ``test_cli.py`` alone, which protected the tests that
+    remembered to be CLI tests and nothing else. ``test_security.py`` calls
+    ``main(["sync", ...])`` from the repository root expecting argparse to stop
+    it first; had that check ever regressed, the call would have read the real
+    Wispr Flow store, written into the real ``./archive`` and sent requests with
+    the developer's own tokens. Every guard below has an incident behind it: a
+    test once copied 15 MB of real meeting audio into a temp archive, and four
+    once exercised a live transport without anyone noticing.
+
+    The environment is snapshotted and restored whole rather than patched key
+    by key, because loading a ``.env`` writes to ``os.environ`` directly and
+    ``monkeypatch`` cannot undo what it did not set.
+
+    Args:
+        monkeypatch: The per-test patcher.
+        tmp_path: The test's scratch directory.
+
+    Yields:
+        Nothing; the test runs in between.
+    """
+    saved = dict(os.environ)
+    for name in list(os.environ):
+        if name.startswith("WISPR_") or name in _NETWORK_ENV:
+            del os.environ[name]
+    # Somewhere that does not exist, so a test that forgets --data-dir cannot
+    # fall through to the real store, and a credential store that is empty, so
+    # the default "all" source cannot reach the live MCP server with the
+    # developer's login.
+    os.environ["WISPR_ARCHIVE_DIR"] = str(tmp_path / "archive")
+    os.environ["WISPR_DATA_DIR"] = str(tmp_path / "no-such-wispr-flow")
+    os.environ["XDG_CONFIG_HOME"] = str(tmp_path / "no-such-config")
+    # A .env in the working directory is read by every command, so the
+    # repository's own must never be the one a test sees.
+    monkeypatch.chdir(tmp_path)
+
+    connect = socket.socket.connect
+    connect_ex = socket.socket.connect_ex
+
+    def refuse_remote(address: object) -> None:
+        if not _is_local(address):
+            raise RuntimeError(f"a test tried to reach the network: {address!r}")
+
+    def checked_connect(self: socket.socket, address: Any) -> None:
+        refuse_remote(address)
+        connect(self, address)
+
+    def checked_connect_ex(self: socket.socket, address: Any) -> int:
+        refuse_remote(address)
+        return connect_ex(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", checked_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", checked_connect_ex)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 # --- cast -----------------------------------------------------------------
 # example.invalid is reserved by RFC 2606 and can never resolve or route. This

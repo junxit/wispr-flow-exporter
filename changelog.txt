@@ -8,6 +8,18 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.4.1
+-----
+- The test suite could reach real data. Isolation lived in test_cli.py
+  alone, so a test elsewhere calling main(["sync", ...]) from the
+  repository root was relying on argparse to stop it; had that check
+  regressed, it would have read the real store and used the developer's
+  tokens. Every test now runs with WISPR_* and proxy settings cleared,
+  the data directory, archive and credential store pointed into a
+  scratch directory, and a guard that fails any connection off the
+  machine. A bare `pytest` no longer walks into the interactive setup
+  either.
+
 0.4.0
 -----
 - Re-pinned against Wispr Flow 1.6.897 at migration 152, three weeks and

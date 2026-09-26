@@ -432,7 +432,10 @@ uv run pytest -q
 ```
 
 The suite runs fully offline: no network, no database on this machine, no
-credentials. SQLite sources are built in `tmp_path` from real DDL held as string
+credentials. That is enforced rather than hoped for — an autouse fixture in
+`conftest.py` clears every `WISPR_*` and proxy setting, points the data
+directory, archive and credential store into a scratch directory, and fails any
+test that opens a connection off the machine. SQLite sources are built in `tmp_path` from real DDL held as string
 constants in `conftest.py` — the thing under test *is* SQLite metadata, so
 faking it with a stub object would fake the test. No transcript, audio or image
 file is ever committed; every fixture is a Python literal.
