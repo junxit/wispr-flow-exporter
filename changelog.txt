@@ -361,6 +361,43 @@ wrapped at 72 columns, US English.
   transcript.mcp.md -- the heading is flattened. The meeting-id check
   and the drift ledger's key check anchored with `$`, which accepted a
   trailing newline; both use `\Z`.
+- Cloud drift is measured per field path, and only evidence is
+  breaking. 0.4.1 compared top-level field names. Measured: a record
+  list that came back empty reported every field of its records gone --
+  breaking drift, exit 4; a value that was null one run and set the next
+  moved the shape each time it flipped; and a field removed from the
+  records inside a list was not seen at all. The ledger now records each
+  field path and the types seen there, and a field counts as gone only
+  when the record that held it came back without it and it was never
+  optional.
+- A failed request no longer erases the drift baseline. Measured on
+  0.4.1: fields a, b and c; then a timeout; then a and b -- reported as
+  additive, because the timeout recorded no fields and the next answer
+  was compared against nothing. A failure now carries the recorded
+  fields forward.
+- A run that could not ask is not drift. Measured on 0.4.1: a network
+  failure, a 401, 403, 429 or 5xx, and even a 204 were each breaking
+  drift, exit 4 -- the code reserved for a change a maintainer has to
+  act on. They are now reported as not answered this run, or no
+  content, and the run still fails with exit 1.
+- MCP drift follows what this tool sends. Measured on 0.4.1, whose
+  digest was a value-discarding skeleton of each input schema: an
+  argument changing type did not move it, nor did an argument becoming
+  required, while an optional argument added to list_meeting_series --
+  allowlisted, never called -- was breaking drift. Schemas are now
+  compared by their constraints (types, required lists, ranges; not
+  descriptions), each tool the pass calls declares the arguments it
+  sends, and only a used tool going missing, or a change to what it is
+  sent or to what is required beside it, is breaking. The first run
+  after upgrading compares against 0.4.x's ledger in 0.4.x's own terms,
+  so an unchanged server reports ok, and records the new one.
+- `schema --json` exits like the text form. Measured on 0.4.1: it
+  exited 0 on breaking drift where the text form exited 4. Scripts that
+  relied on --json always exiting 0 must read the exit code, which is
+  now the same at every drift site: 4 breaking, 3 additive under
+  --strict-schema, 0 otherwise.
+- .sync-state.json is rewritten once, as the cloud and MCP drift
+  ledgers take their new form.
 
 0.4.1
 -----

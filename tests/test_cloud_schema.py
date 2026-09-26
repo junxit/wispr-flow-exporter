@@ -21,6 +21,7 @@ from wispr_flow_exporter.cloud_api import ENDPOINTS, Endpoint, EndpointResult
 from wispr_flow_exporter.cloud_schema import (
     CLIENT_PIN,
     ClientPin,
+    CloudDrift,
     detect_cloud_drift,
     field_names,
     fingerprint,
@@ -191,12 +192,12 @@ def test_a_changed_shape_takes_a_new_observation() -> None:
     assert second["good"]["observed_at"] != "2020-01-01T00:00:00Z"
 
 
-def test_a_failed_endpoint_records_a_status_and_no_shape() -> None:
+def test_a_failed_endpoint_records_a_status_and_no_fields() -> None:
     """A 405 is a fact about the endpoint and belongs in the ledger."""
     ledger = observe({"gone": _result("gone", 405)})
 
     assert ledger["gone"]["status"] == 405
-    assert ledger["gone"]["shape"] is None
+    assert ledger["gone"]["fields"] == {}
 
 
 # --- classification -------------------------------------------------------
@@ -314,6 +315,156 @@ def test_the_summary_is_never_empty() -> None:
     drift = detect_cloud_drift({}, {}, _TABLE, "1.0.0", _PIN)
 
     assert drift.summary()
+
+
+# --- what counts as drift -------------------------------------------------
+
+
+def _drift_after(
+    before: object, after: object, *, between: tuple[int | None, ...] = ()
+) -> CloudDrift:
+    """Observe one answer, then optional failures, then classify another.
+
+    Args:
+        before: The first payload.
+        after: The payload classified.
+        between: Statuses of failed answers observed in between.
+
+    Returns:
+        The drift.
+    """
+    ledger = observe({"good": _result("good", 200, before)})
+    for status in between:
+        ledger = observe({"good": _result("good", status)}, ledger)
+    return detect_cloud_drift(
+        {"good": _result("good", 200, after)}, ledger, _TABLE, "1.0.0", _PIN
+    )
+
+
+def test_a_failure_between_two_observations_does_not_erase_the_baseline() -> None:
+    """Measured on 0.4.1: a, b, c; a timeout; a, b -- reported as additive.
+
+    The failed answer recorded no fields, so the next answer was compared
+    against nothing and the removal of c was never reported.
+    """
+    drift = _drift_after({"a": 1, "b": 2, "c": 3}, {"a": 1, "b": 2}, between=(None,))
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.missing_fields == {"good": ("c",)}
+
+
+@pytest.mark.parametrize("status", [None, 401, 403, 408, 429, 500, 503])
+def test_an_endpoint_that_could_not_be_asked_is_not_drift(status: int | None) -> None:
+    """Measured on 0.4.1: each of these was breaking drift, exit 4.
+
+    A lapsed token, a timeout, a rate limit or a server having a bad minute
+    says nothing about the interface. It is a failure of the run, reported as
+    one, and not a change a maintainer has to chase.
+    """
+    ledger = observe({"good": _result("good", 200, {"a": 1})})
+
+    drift = detect_cloud_drift(
+        {"good": _result("good", status)}, ledger, _TABLE, "1.0.0", _PIN
+    )
+
+    assert drift.kind is DriftClass.OK
+    assert drift.unasked == ("good",)
+    assert "not answered this run: good" in drift.summary()
+
+
+def test_a_no_content_answer_is_reported_but_not_breaking() -> None:
+    """A 204 has nothing to compare, which is not the same as broken."""
+    ledger = observe({"good": _result("good", 200, {"a": 1})})
+
+    drift = detect_cloud_drift(
+        {"good": _result("good", 204)}, ledger, _TABLE, "1.0.0", _PIN
+    )
+
+    assert drift.kind is DriftClass.OK
+    assert drift.empty == ("good",)
+
+
+def test_a_record_list_that_empties_is_not_a_removal() -> None:
+    """Measured on 0.4.1: an emptied list reported every field gone, breaking."""
+    drift = _drift_after([{"id": "x", "title": "t"}], [])
+
+    assert drift.kind is not DriftClass.BREAKING
+    assert drift.missing_fields == {}
+
+
+def test_a_null_that_becomes_a_value_is_not_drift() -> None:
+    """Measured on 0.4.1: it was a moved shape, additive, every time it flipped."""
+    assert _drift_after({"a": None}, {"a": "x"}).kind is DriftClass.OK
+    assert _drift_after({"a": "x"}, {"a": None}).kind is DriftClass.OK
+
+
+def test_a_field_removed_inside_a_record_list_is_breaking() -> None:
+    """Measured on 0.4.1: invisible -- only top-level names were compared."""
+    drift = _drift_after({"items": [{"id": "x", "title": "t"}]}, {"items": [{"id": "x"}]})
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.missing_fields == {"good": ("items[].title",)}
+
+
+def test_an_optional_field_absent_from_some_records_is_not_a_removal() -> None:
+    """A field some records never had is not missing from the ones without it."""
+    drift = _drift_after(
+        {"items": [{"id": "x", "title": "t"}, {"id": "y"}]}, {"items": [{"id": "z"}]}
+    )
+
+    assert drift.kind is not DriftClass.BREAKING
+
+
+def test_a_retyped_field_is_reported() -> None:
+    """A field that changes kind is named, not folded into "shape moved"."""
+    drift = _drift_after({"count": 3}, {"count": "three"})
+
+    assert drift.retyped == {"good": ("count",)}
+    assert "fields retyped on good: count" in drift.summary()
+
+
+def test_a_ledger_written_before_the_upgrade_is_compared_without_false_alarms() -> None:
+    """0.4.x recorded top-level names only; nested fields must not look new."""
+    legacy = {
+        "good": {
+            "status": 200,
+            "shape": "0123456789ab",
+            "keys": ["items", "total"],
+            "observed_at": "2026-09-01T00:00:00+00:00",
+        }
+    }
+    same = {"good": _result("good", 200, {"items": [{"id": "x"}], "total": 1})}
+    less = {"good": _result("good", 200, {"items": [{"id": "x"}]})}
+
+    assert detect_cloud_drift(same, legacy, _TABLE, "1.0.0", _PIN).kind is DriftClass.OK
+    gone = detect_cloud_drift(less, legacy, _TABLE, "1.0.0", _PIN)
+    assert gone.kind is DriftClass.BREAKING
+    assert gone.missing_fields == {"good": ("total",)}
+    assert "fields" in observe(same, legacy)["good"]
+
+
+def test_an_identifier_shaped_key_never_reaches_the_ledger() -> None:
+    """A map keyed by id records its shape, never an id."""
+    long_id = "a" * 181
+    payload = {"by_id": {MEETING_A: {"title": "t"}, long_id: {"title": "u"}}}
+
+    fields = observe({"good": _result("good", 200, payload)})["good"]["fields"]
+
+    assert all(MEETING_A not in path and long_id not in path for path in fields)
+    assert "$.by_id.<dynamic>.title" in fields
+
+
+def test_a_body_that_is_not_json_is_breaking() -> None:
+    """A 200 that cannot be read is the interface changing, not the network."""
+    ledger = observe({"good": _result("good", 200, {"a": 1})})
+    broken = EndpointResult(
+        name="good", path="/api/v1/x", status=200, reason="response was not JSON"
+    )
+
+    drift = detect_cloud_drift({"good": broken}, ledger, _TABLE, "1.0.0", _PIN)
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.broke == ("good",)
 
 
 # --- against a live installation ------------------------------------------

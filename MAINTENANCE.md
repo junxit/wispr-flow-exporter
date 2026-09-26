@@ -87,9 +87,21 @@ Read the `drift` line:
 | verdict | meaning | what to do |
 | --- | --- | --- |
 | `ok` | every endpoint answered as recorded | nothing |
-| `additive` | new fields, or an endpoint that started answering | note it; adopt the new data if it is worth archiving |
+| `additive` | new or retyped fields, or an endpoint that started answering | note it; adopt the new data if it is worth archiving |
 | `breaking` | a field vanished, or an endpoint stopped answering | go to step 3 — but note the archive still completed |
 | `stale_source` | the installed app is *older* than the pin | you downgraded, or you are on a machine behind the pinned build |
+
+Fields are compared by path — `items[].title` — and a field counts as vanished
+only on evidence: the record that held it came back without it, and it was
+never optional. A list that came back empty, or a value that is null today, is
+not a removal. An endpoint that could not be asked this run — no network, a
+`401`, `403`, `408`, `429` or `5xx` — is listed as *not answered this run* and
+fails the run, but is not drift: nothing about the interface was learned. A
+`204` is listed as *no content*. A failure never replaces what was recorded,
+so the next answer is compared against the last one that arrived.
+
+`schema --json` exits with the same code as the text form. Through 0.4.1 it
+always exited 0.
 
 **`breaking` does not mean the run failed.** Everything reachable is still
 archived verbatim before anything is interpreted. Failing loud must never mean
@@ -465,16 +477,25 @@ occasionally; if it ever starts working, the listener can go.
 ### 3. Re-check the tools
 
 `wispr-export schema --source mcp` prints every advertised tool, marks the ones
-this backend calls, and classifies drift the same four ways the other backends
-do. The pin covers each tool's **input schema**, so a renamed argument is
-reported before a single call is made.
+this backend calls (`use`) and the rest of the allowlist (`ok`), and classifies
+drift the same four ways the other backends do. What it compares is each tool's
+input schema reduced to its **constraints** — types, required lists, ranges,
+enumerations — so a reworded description is not drift and a retyped argument
+is.
 
-Severity is about what this tool needs, not the server's inventory: a server
-that adds tools is `additive`, one that drops or changes a tool in `READ_TOOLS`
-is `breaking`.
+Severity is about what this tool needs, not the server's inventory. Each tool
+the sync pass calls declares the arguments it sends, in `McpTool.sends` in
+`mcp_api.py`; a tool with `sends` is *used*. `breaking` means a used tool is
+gone, or its *contract* moved: an argument it sends was renamed, retyped or
+narrowed, or a new argument became required beside them. Everything else — a
+new tool, a new optional argument, any change to an allowlisted tool nothing
+calls — is `additive`. **When the pass starts sending a new argument, add it to
+`sends`**; a test fails if the pass sends anything a tool does not declare.
 
 To re-baseline, paste the values from `--json` into `MCP_PIN` in
-`mcp_schema.py`.
+`mcp_schema.py`, including `algorithm`: version 2 digests constraints, and a
+pin records the algorithm it was taken with so it is always compared the same
+way.
 
 ### 4. The allowlist
 

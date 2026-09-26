@@ -427,13 +427,15 @@ client issues `GET` only; there is no code path that writes to Wispr Flow's
 servers, and a cloud pass that cannot reach one is reported without discarding a
 successful local run.
 
-Because nothing upstream will announce a change, the cloud backend fingerprints
-every response's *structure* — field names and types, never values or counts —
-and stores the digest in `.sync-state.json`. A changed shape is then reported
-rather than silently absorbed, and classified the same four ways the local
-backend classifies schema drift: `ok`, `additive`, `breaking`, `stale_source`.
-Breaking drift still archives everything reachable and exits non-zero naming
-what broke. `wispr-export schema --source cloud` runs that check on its own,
+Because nothing upstream will announce a change, the cloud backend records
+every response's *structure* — field paths and types, never values or counts —
+in `.sync-state.json`. A change is then reported rather than silently absorbed,
+and classified the same four ways the local backend classifies schema drift:
+`ok`, `additive`, `breaking`, `stale_source`. Only evidence counts as breaking:
+an endpoint that stopped answering, or a field gone from a record that was
+there to hold it. A run that could not ask — no network, a lapsed token, a rate
+limit, a server error — is a failed run, not drift. Breaking drift still
+archives everything reachable and exits non-zero naming what broke. `wispr-export schema --source cloud` runs that check on its own,
 writing nothing. The procedure for acting on it is in
 [MAINTENANCE.md](MAINTENANCE.md).
 

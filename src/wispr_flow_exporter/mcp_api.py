@@ -79,10 +79,15 @@ class McpTool:
     Attributes:
         note: Why it is here, or what it is used for.
         paginated: Whether results arrive a page at a time.
+        sends: The arguments the sync pass sends it, as dotted paths into its
+            input schema; ``None`` for a tool the pass never calls. This is
+            what drift protects: a change to one of these, or a new required
+            argument beside them, is breaking, and anything else is news.
     """
 
     note: str = ""
     paginated: bool = False
+    sends: tuple[str, ...] | None = None
 
 
 #: The allowlist. Membership here is the only thing that makes a tool callable,
@@ -90,19 +95,39 @@ class McpTool:
 #: Every name is a read verb; the server exposes no write tools today, and if it
 #: ever does, absence from this table is what keeps them unreachable.
 READ_TOOLS: Mapping[str, McpTool] = {
-    "get_account_info": McpTool("Identity, to tell the owner from other attendees."),
+    "get_account_info": McpTool(
+        "Identity, to tell the owner from other attendees.", sends=()
+    ),
     "search_meetings": McpTool(
         "Lists meetings most recently modified first; `since` and `until` "
         "bound when a meeting started, not when it changed.",
         paginated=True,
+        sends=("limit", "cursor", "since", "until"),
     ),
-    "get_meeting": McpTool("Notes, summary, todos, attendees and the transcript."),
+    "get_meeting": McpTool(
+        "Notes, summary, todos, attendees and the transcript, a range at a time.",
+        sends=(
+            "meeting_id",
+            "view_content.start_char",
+            "view_content.char_limit",
+            "view_transcript.start_char",
+            "view_transcript.char_limit",
+        ),
+    ),
     "list_meeting_series": McpTool("Occurrences of a recurring meeting.", paginated=True),
-    "search_scratchpad_notes": McpTool("Lists notes, same filters.", paginated=True),
+    "search_scratchpad_notes": McpTool(
+        "Lists notes, same filters.", paginated=True, sends=("limit", "cursor")
+    ),
     "get_scratchpad_note": McpTool("One note's normalized text."),
     "search_calendar_events": McpTool("Calendar events.", paginated=True),
     "get_calendar_event": McpTool("One calendar event."),
 }
+
+#: The tools the sync pass calls. The rest of the allowlist may be called by no
+#: one yet, and a change to it is reported, never breaking.
+USED_TOOLS: frozenset[str] = frozenset(
+    name for name, tool in READ_TOOLS.items() if tool.sends is not None
+)
 
 #: The only JSON-RPC methods this client sends.
 ALLOWED_METHODS = (

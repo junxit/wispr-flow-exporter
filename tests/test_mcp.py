@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -47,9 +47,9 @@ from wispr_flow_exporter import sync_mcp as mcp_pass
 from wispr_flow_exporter.mcp_api import ALLOWED_METHODS, READ_TOOLS, McpError, unwrap
 from wispr_flow_exporter.mcp_auth import McpCredential
 from wispr_flow_exporter.mcp_schema import (
-    McpPin,
     detect_mcp_drift,
     pin_from_tools,
+    tool_ledger,
     tool_shapes,
 )
 from wispr_flow_exporter.schema import DriftClass
@@ -63,8 +63,49 @@ from wispr_flow_exporter.sync_mcp import (
 )
 from wispr_flow_exporter.transport import read_capped
 
+_RANGE = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "start_char": {"type": "integer", "minimum": 0, "default": 0},
+        "char_limit": {"type": "integer", "minimum": 1, "maximum": 40000},
+    },
+}
+
+#: The input schemas the tools this backend calls publish, as literals -- the
+#: parts drift compares, with a description where prose would be.
+_SCHEMAS: dict[str, dict[str, Any]] = {
+    "get_account_info": {"type": "object", "properties": {}},
+    "search_meetings": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Keyword matching titles."},
+            "limit": {"type": "integer", "description": "Page size, max 200."},
+            "cursor": {"type": "string"},
+            "since": {"type": "string"},
+            "until": {"type": "string"},
+        },
+    },
+    "get_meeting": {
+        "type": "object",
+        "required": ["meeting_id"],
+        "properties": {
+            "meeting_id": {"type": "string"},
+            "view_content": _RANGE,
+            "view_transcript": _RANGE,
+        },
+    },
+    "search_scratchpad_notes": {
+        "type": "object",
+        "properties": {"limit": {"type": "integer"}, "cursor": {"type": "string"}},
+    },
+}
+
 _TOOLS = [
-    {"name": name, "inputSchema": {"type": "object", "properties": {}}}
+    {
+        "name": name,
+        "inputSchema": _SCHEMAS.get(name, {"type": "object", "properties": {}}),
+    }
     for name in READ_TOOLS
 ]
 _SERVER = {"name": "wispr", "version": "1.0.0", "protocol_version": "2025-06-18"}
@@ -1663,15 +1704,28 @@ def test_a_meeting_that_cannot_be_written_is_counted_and_the_pass_goes_on(
 # --- drift ----------------------------------------------------------------
 
 
-_PIN = McpPin(
-    server="wispr", version="1.0.0", protocol_version="2025-06-18", tool_count=8,
-    sha256=pin_from_tools(_TOOLS, _SERVER).sha256,
-)
+_PIN = pin_from_tools(_TOOLS, _SERVER)
+
+
+def _edited(name: str, schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the tool list with one tool's input schema replaced.
+
+    Args:
+        name: The tool.
+        schema: Its new input schema.
+
+    Returns:
+        The edited list.
+    """
+    return [
+        {"name": tool["name"], "inputSchema": schema} if tool["name"] == name else tool
+        for tool in _TOOLS
+    ]
 
 
 def test_a_matching_server_is_clean() -> None:
     """The ordinary case says so rather than staying silent."""
-    drift = detect_mcp_drift(_TOOLS, _SERVER, tool_shapes(_TOOLS), _PIN)
+    drift = detect_mcp_drift(_TOOLS, _SERVER, tool_ledger(_TOOLS), _PIN)
 
     assert drift.kind is DriftClass.OK
     assert "OK" in drift.summary()
@@ -1681,7 +1735,7 @@ def test_a_new_tool_is_additive() -> None:
     """The server growing a tool has done nothing to this backend."""
     grown = [*_TOOLS, {"name": "get_weather", "inputSchema": {}}]
 
-    drift = detect_mcp_drift(grown, _SERVER, tool_shapes(_TOOLS), _PIN)
+    drift = detect_mcp_drift(grown, _SERVER, tool_ledger(_TOOLS), _PIN)
 
     assert drift.kind is DriftClass.ADDITIVE
     assert drift.new_tools == ("get_weather",)
@@ -1692,32 +1746,112 @@ def test_losing_a_tool_this_backend_calls_is_breaking() -> None:
     """Severity is about what this tool needs, not the server's inventory."""
     reduced = [tool for tool in _TOOLS if tool["name"] != "get_meeting"]
 
-    drift = detect_mcp_drift(reduced, _SERVER, tool_shapes(_TOOLS), _PIN)
+    drift = detect_mcp_drift(reduced, _SERVER, tool_ledger(_TOOLS), _PIN)
 
     assert drift.kind is DriftClass.BREAKING
     assert "get_meeting" in drift.unavailable
     assert drift.blocks_rendering
 
 
-def test_a_renamed_argument_is_breaking() -> None:
-    """An input schema that moved breaks the calls built against it."""
-    moved = [
-        {"name": t["name"], "inputSchema": {"type": "object", "properties": {"q": {}}}}
-        if t["name"] == "search_meetings"
-        else t
-        for t in _TOOLS
-    ]
+def test_losing_an_unused_allowlisted_tool_is_additive() -> None:
+    """Allowlisted is not the same as needed."""
+    reduced = [tool for tool in _TOOLS if tool["name"] != "list_meeting_series"]
 
-    drift = detect_mcp_drift(moved, _SERVER, tool_shapes(_TOOLS), _PIN)
+    drift = detect_mcp_drift(reduced, _SERVER, tool_ledger(_TOOLS), _PIN)
+
+    assert drift.kind is DriftClass.ADDITIVE
+    assert drift.missing_tools == ("list_meeting_series",)
+
+
+def test_a_renamed_argument_this_backend_sends_is_breaking() -> None:
+    """``since`` renamed to ``from`` breaks every windowed listing."""
+    schema = json.loads(json.dumps(_SCHEMAS["search_meetings"]))
+    schema["properties"]["from"] = schema["properties"].pop("since")
+
+    drift = detect_mcp_drift(
+        _edited("search_meetings", schema), _SERVER, tool_ledger(_TOOLS), _PIN
+    )
 
     assert drift.kind is DriftClass.BREAKING
+    assert drift.broken_contracts == ("search_meetings",)
+
+
+@pytest.mark.parametrize(
+    ("tool", "edit"),
+    [
+        ("search_meetings", lambda s: s["properties"]["limit"].update(type="string")),
+        ("get_meeting", lambda s: s["properties"]["view_transcript"].update(
+            properties={
+                **_RANGE["properties"],
+                "char_limit": {"type": "integer", "minimum": 1, "maximum": 20000},
+            }
+        )),
+        ("search_meetings", lambda s: s.update(required=["query"])),
+        ("get_meeting", lambda s: s["properties"]["view_content"].update(
+            required=["char_limit"]
+        )),
+    ],
+    ids=["retyped", "lower-maximum", "new-required", "new-required-nested"],
+)
+def test_a_change_to_what_this_backend_sends_is_breaking(
+    tool: str, edit: Callable[[dict[str, Any]], None]
+) -> None:
+    """Measured on 0.4.1: a retyped or newly required argument moved nothing.
+
+    Its digest was a skeleton of each schema, which keeps a key's presence and
+    discards its value -- and a type, a maximum and a required list are all
+    values.
+    """
+    schema = json.loads(json.dumps(_SCHEMAS[tool]))
+    edit(schema)
+
+    drift = detect_mcp_drift(_edited(tool, schema), _SERVER, tool_ledger(_TOOLS), _PIN)
+
+    assert drift.kind is DriftClass.BREAKING
+    assert drift.broken_contracts == (tool,)
+
+
+def test_a_new_optional_argument_is_additive() -> None:
+    """The pass does not send it, and nothing requires it."""
+    schema = json.loads(json.dumps(_SCHEMAS["search_meetings"]))
+    schema["properties"]["attendee_emails"] = {"type": "array", "items": {"type": "string"}}
+
+    drift = detect_mcp_drift(
+        _edited("search_meetings", schema), _SERVER, tool_ledger(_TOOLS), _PIN
+    )
+
+    assert drift.kind is DriftClass.ADDITIVE
     assert drift.changed_schemas == ("search_meetings",)
+    assert drift.broken_contracts == ()
+
+
+def test_a_change_to_an_unused_allowlisted_tool_is_additive() -> None:
+    """Measured on 0.4.1: an optional argument there was breaking drift."""
+    schema = {"type": "object", "required": ["series_id"], "properties": {"series_id": {}}}
+
+    drift = detect_mcp_drift(
+        _edited("list_meeting_series", schema), _SERVER, tool_ledger(_TOOLS), _PIN
+    )
+
+    assert drift.kind is DriftClass.ADDITIVE
+
+
+def test_a_reworded_description_is_not_drift() -> None:
+    """Prose is not a constraint."""
+    schema = json.loads(json.dumps(_SCHEMAS["search_meetings"]))
+    schema["properties"]["limit"]["description"] = "How many per page; at most 200."
+
+    edited = _edited("search_meetings", schema)
+    drift = detect_mcp_drift(edited, _SERVER, tool_ledger(_TOOLS), _PIN)
+
+    assert drift.kind is DriftClass.OK
+    assert pin_from_tools(edited, _SERVER) == _PIN
 
 
 def test_an_older_server_is_stale_not_broken() -> None:
     """A downgrade is a different source, not a failure."""
     drift = detect_mcp_drift(
-        _TOOLS, {**_SERVER, "version": "0.9.0"}, tool_shapes(_TOOLS), _PIN
+        _TOOLS, {**_SERVER, "version": "0.9.0"}, tool_ledger(_TOOLS), _PIN
     )
 
     assert drift.kind is DriftClass.STALE_SOURCE
@@ -1730,24 +1864,104 @@ def test_a_first_run_establishes_a_baseline() -> None:
     assert drift.kind is DriftClass.OK
 
 
+def test_the_first_run_after_the_ledger_upgrade_is_not_breaking() -> None:
+    """0.4.x recorded skeletons and no contracts; they are compared once, fairly.
+
+    An unchanged server is OK. A used tool whose schema moved is reported --
+    but without a recorded contract there is no evidence the change breaks
+    anything, so it is additive, not a false alarm on upgrade day.
+    """
+    legacy = tool_shapes(_TOOLS)
+    assert detect_mcp_drift(_TOOLS, _SERVER, None, _PIN, legacy=legacy).kind is (
+        DriftClass.OK
+    )
+
+    schema = json.loads(json.dumps(_SCHEMAS["search_meetings"]))
+    schema["properties"]["attendee_emails"] = {"type": "array"}
+    drift = detect_mcp_drift(
+        _edited("search_meetings", schema), _SERVER, None, _PIN, legacy=legacy
+    )
+    assert drift.kind is DriftClass.ADDITIVE
+    assert drift.changed_schemas == ("search_meetings",)
+
+
 def test_the_pin_moves_when_an_input_schema_moves() -> None:
     """A renamed argument must move the pin even with the tool list intact."""
-    moved = [
-        {"name": t["name"], "inputSchema": {"type": "object", "properties": {"z": {}}}}
-        if t["name"] == "get_meeting"
-        else t
-        for t in _TOOLS
-    ]
+    moved = _edited("get_meeting", {"type": "object", "properties": {"z": {}}})
 
-    assert pin_from_tools(moved, _SERVER).sha256 != pin_from_tools(_TOOLS, _SERVER).sha256
+    assert pin_from_tools(moved, _SERVER).sha256 != _PIN.sha256
+
+
+def test_a_pin_taken_the_old_way_is_compared_the_old_way() -> None:
+    """MCP_PIN stays valid until it is re-taken: the algorithm travels with it."""
+    old = pin_from_tools(_TOOLS, _SERVER, algorithm=1)
+
+    drift = detect_mcp_drift(_TOOLS, _SERVER, tool_ledger(_TOOLS), old)
+
+    assert old.sha256 != _PIN.sha256
+    assert drift.kind is DriftClass.OK
 
 
 def test_the_state_ledger_carries_no_timestamp() -> None:
     """A ledger that dated itself would churn the state file every run."""
-    shapes = tool_shapes(_TOOLS)
+    ledger = tool_ledger(_TOOLS)
 
-    assert shapes == tool_shapes(_TOOLS)
-    assert all(isinstance(value, str) for value in shapes.values())
+    assert ledger == tool_ledger(_TOOLS)
+    assert set(ledger["get_meeting"]) == {"shape", "contract"}
+    assert set(ledger["list_meeting_series"]) == {"shape"}
+
+
+def _argument_paths(arguments: Mapping[str, Any]) -> set[str]:
+    """Name every argument sent, nested ones as dotted paths.
+
+    Args:
+        arguments: One call's arguments.
+
+    Returns:
+        The paths.
+    """
+    paths: set[str] = set()
+    for key, value in arguments.items():
+        if isinstance(value, dict):
+            paths.update(f"{key}.{inner}" for inner in value)
+        else:
+            paths.add(key)
+    return paths
+
+
+def test_the_declared_arguments_are_the_ones_the_pass_sends(tmp_path: Path) -> None:
+    """``sends`` is what drift protects, so it has to be what is sent.
+
+    A whole pass against a server that makes it do everything -- page, window
+    a capped listing, fetch notes and a transcript -- and every argument that
+    reaches the server must be one its tool declares.
+    """
+    now = datetime.now(tz=UTC)
+    meetings = [
+        _meeting(
+            key,
+            start=(now - timedelta(days=400 * n + 5)).isoformat().replace("+00:00", "Z"),
+            modified=(now - timedelta(days=n)).isoformat().replace("+00:00", "Z"),
+        )
+        for n, key in enumerate([MEETING_A, MEETING_B, NOTE_A])
+    ]
+    server = _Wispr(
+        meetings,
+        cap=2,
+        transcripts={MEETING_A: _spoken(50_000)},
+        contents={MEETING_B: _spoken(50_000)},
+    )
+
+    sync_mcp(Archive(root=tmp_path / "archive"), server, SyncOptions())
+
+    sent: dict[str, set[str]] = {}
+    for name, arguments in server.asked:
+        sent.setdefault(name, set()).update(_argument_paths(arguments))
+    for name, paths in sent.items():
+        declared = READ_TOOLS[name].sends
+        assert declared is not None, name
+        assert paths <= set(declared), (name, paths - set(declared))
+    assert {"since", "until"} <= sent["search_meetings"]
 
 
 # --- the authorization flow -----------------------------------------------

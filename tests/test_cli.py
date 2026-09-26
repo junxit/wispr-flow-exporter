@@ -867,3 +867,50 @@ def test_only_a_stored_token_gets_a_renewal() -> None:
 
     assert cli._renewer(DEFAULT_MCP_ENDPOINT, stored) is not None
     assert cli._renewer(DEFAULT_MCP_ENDPOINT, environment) is None
+
+
+# --- drift and exit codes -------------------------------------------------
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_schema_exits_the_same_whatever_its_output(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+    json_output: bool,
+) -> None:
+    """Measured on 0.4.1: --json exited 0 on breaking drift; the text form, 4.
+
+    A script reading the JSON could not learn from the exit code what the
+    text form would have said -- and the JSON is what a script reads.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db, drop_columns={"Meetings": ("title",)})
+    argv = ["schema", "--source", "local", "--data-dir", str(data_dir)]
+
+    code = main([*argv, "--json"] if json_output else argv)
+
+    assert code == EXIT_BREAKING_DRIFT
+    if json_output:
+        assert json.loads(capsys.readouterr().out)["drift"] == "breaking"
+
+
+@pytest.mark.parametrize(
+    ("kind", "strict", "code"),
+    [
+        ("ok", False, EXIT_OK),
+        ("ok", True, EXIT_OK),
+        ("additive", False, EXIT_OK),
+        ("additive", True, EXIT_ADDITIVE_DRIFT),
+        ("breaking", False, EXIT_BREAKING_DRIFT),
+        ("breaking", True, EXIT_BREAKING_DRIFT),
+        ("stale_source", True, EXIT_OK),
+    ],
+)
+def test_every_drift_site_maps_a_kind_to_the_same_exit_code(
+    kind: str, strict: bool, code: int
+) -> None:
+    """One mapping, used by sync, doctor and every schema form."""
+    from wispr_flow_exporter.cli import _drift_exit
+    from wispr_flow_exporter.schema import DriftClass
+
+    assert _drift_exit(DriftClass(kind), strict) == code

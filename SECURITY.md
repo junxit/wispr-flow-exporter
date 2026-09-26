@@ -75,16 +75,17 @@ spoke.
   account's `user_id`, `email` and Supabase project ref *are* archived, to
   `account/profile.json`, so an archive can say whose it is.
 
-  This extends to the cloud backend's drift machinery. The per-endpoint
-  response fingerprints in `.sync-state.json` are digests of *structure* —
-  field names and types, with every value discarded and dictionary keys that do
-  not look like field names collapsed to `<dynamic>`, so a response keyed by
-  UUID or by an email address cannot put one in the state file. The pattern
-  admits any key shaped like an identifier (`[A-Za-z_][A-Za-z0-9_]*`), so a
-  purely alphanumeric id — Wispr Flow's 181-character base32
-  `CalendarEvents.externalId` is exactly that shape — would survive as a *key
-  name*, never as a value. That is a privacy property first and a stability
-  property second.
+  This extends to the cloud backend's drift machinery. The per-endpoint field
+  ledger in `.sync-state.json` records *structure* — field paths such as
+  `items[].title` and the types seen there, with every value discarded and any
+  key that does not look like a field name collapsed to `<dynamic>`, so a
+  response keyed by UUID or by an email address cannot put one in the state
+  file. A key is kept only if it matches `[A-Za-z_][A-Za-z0-9_]*` and is at
+  most 64 characters: through 0.4.1 the length went unchecked, so a purely
+  alphanumeric id — Wispr Flow's 181-character base32
+  `CalendarEvents.externalId` is exactly that shape — could have survived as a
+  *key name*, though never as a value. That is a privacy property first and a
+  stability property second.
 
 - **The tool never refreshes the *borrowed* session.** Supabase GoTrue rotates
   refresh tokens and detects reuse, so a second client calling the refresh

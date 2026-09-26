@@ -308,6 +308,29 @@ def _human_bytes(count: int) -> str:
     return f"{size:.1f} GB"
 
 
+def _drift_exit(kind: DriftClass, strict: bool) -> int:
+    """Map a drift classification to its exit code, the same way everywhere.
+
+    Every drift site -- sync, doctor, and each backend's ``schema``, text or
+    ``--json`` -- answers through this. The ``--json`` forms used to exit 0
+    whatever they found, so a script reading them could not learn from the
+    exit code what the text form would have said.
+
+    Args:
+        kind: The classification.
+        strict: Whether additive drift is an error for this run.
+
+    Returns:
+        4 for breaking drift, 3 for additive drift under ``--strict-schema``,
+        0 otherwise.
+    """
+    if kind is DriftClass.BREAKING:
+        return EXIT_BREAKING_DRIFT
+    if kind is DriftClass.ADDITIVE and strict:
+        return EXIT_ADDITIVE_DRIFT
+    return EXIT_OK
+
+
 def _say(label: str, value: str) -> None:
     """Print one aligned diagnostic line, redacted.
 
@@ -405,10 +428,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             drift = source.detect_drift()
             _say("migrations", f"{len(migrations)}  latest {drift.live.latest or '-'}")
             _say("schema", drift.summary())
-            if drift.kind is DriftClass.BREAKING:
-                exit_code = EXIT_BREAKING_DRIFT
-            elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-                exit_code = EXIT_ADDITIVE_DRIFT
+            exit_code = _drift_exit(drift.kind, config.strict_schema)
             if drift.live != MIGRATION_PIN and drift.kind is not DriftClass.BREAKING:
                 _say("", "raw archiving is unaffected; renderers may lag")
 
@@ -658,11 +678,11 @@ def _run_local(
         drift = source.detect_drift()
         if drift.kind is not DriftClass.OK:
             _say("schema", drift.summary())
+        # Raw archiving still completes under breaking drift; only renderers
+        # are affected. For an archival tool, failing loud must never mean
+        # failing closed, so this is reported and the pass continues.
+        exit_code = _drift_exit(drift.kind, config.strict_schema)
         if drift.kind is DriftClass.BREAKING:
-            # Raw archiving still completes; only renderers are affected.
-            # For an archival tool, failing loud must never mean failing
-            # closed, so this is reported and the pass continues.
-            exit_code = EXIT_BREAKING_DRIFT
             # Renderers read declared columns by name and degrade quietly when
             # one is gone, so an existing document is kept rather than
             # overwritten with less. Said out loud because the held-back
@@ -673,8 +693,6 @@ def _run_local(
                 "existing documents kept as they are; once the declaration is "
                 "updated, the next sync or `wispr-export render` rebuilds them",
             )
-        elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-            exit_code = EXIT_ADDITIVE_DRIFT
 
         state = archive.source_state(LOCAL_BACKEND)
         # Recorded on every run, so an archive that is empty because of a
@@ -799,13 +817,11 @@ def _run_cloud(
         _say("cloud schema", drift.summary())
 
     result.counts["cloud"] = counts
-    if drift.kind is DriftClass.BREAKING:
-        # Everything reachable was still archived. Failing loud must not mean
-        # failing closed for this backend either.
-        return EXIT_BREAKING_DRIFT
-    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-        return EXIT_ADDITIVE_DRIFT
-    return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    # Everything reachable was still archived. Failing loud must not mean
+    # failing closed for this backend either.
+    return _drift_exit(drift.kind, config.strict_schema) or (
+        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    )
 
 
 def _run_mcp(
@@ -832,7 +848,7 @@ def _run_mcp(
     """
     from .mcp_api import McpClient, McpError
     from .mcp_auth import McpAuthError, open_client, resolve_credential
-    from .mcp_schema import MCP_PIN, detect_mcp_drift, tool_shapes
+    from .mcp_schema import MCP_PIN, detect_mcp_drift, tool_ledger
     from .sync_mcp import SOURCE_MCP as MCP_BACKEND
     from .sync_mcp import sync_mcp
 
@@ -860,18 +876,22 @@ def _run_mcp(
         return EXIT_FAILURE if explicit else EXIT_OK
 
     state = archive.source_state(MCP_BACKEND)
-    drift = detect_mcp_drift(tools, server, state.get("tool_shapes"))
+    drift = detect_mcp_drift(
+        tools, server, state.get("tool_ledger"), legacy=state.get("tool_shapes")
+    )
     if not options.dry_run:
         state["mcp_pin"] = {
             "server": MCP_PIN.server,
             "version": MCP_PIN.version,
             "sha256": MCP_PIN.sha256,
         }
-        if tools or not state.get("tool_shapes"):
+        if tools or not (state.get("tool_ledger") or state.get("tool_shapes")):
             # An empty tool list is far likelier a server's bad moment than a
             # server with no tools, and recording it would make every tool
-            # look new -- additive drift -- on the next run.
-            state["tool_shapes"] = tool_shapes(tools)
+            # look new -- additive drift -- on the next run. The 0.4.x ledger
+            # has been compared once, above, and is replaced here.
+            state["tool_ledger"] = tool_ledger(tools)
+            state.pop("tool_shapes", None)
 
     for name, reason in failures:
         _say("", f"mcp {name}: {redact(reason)}")
@@ -881,11 +901,9 @@ def _run_mcp(
         _say("mcp schema", drift.summary())
 
     result.counts["mcp"] = counts
-    if drift.kind is DriftClass.BREAKING:
-        return EXIT_BREAKING_DRIFT
-    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-        return EXIT_ADDITIVE_DRIFT
-    return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    return _drift_exit(drift.kind, config.strict_schema) or (
+        EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
+    )
 
 
 def _renewer(
@@ -1077,16 +1095,18 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
                     "broke": list(drift.broke),
                     "recovered": list(drift.recovered),
                     "unreachable": list(drift.unreachable),
-                    "changed_shapes": list(drift.changed_shapes),
+                    "unasked": list(drift.unasked),
+                    "empty": list(drift.empty),
                     "new_fields": {k: list(v) for k, v in drift.new_fields.items()},
                     "missing_fields": {
                         k: list(v) for k, v in drift.missing_fields.items()
                     },
+                    "retyped": {k: list(v) for k, v in drift.retyped.items()},
                 },
                 indent=2,
             )
         )
-        return EXIT_OK
+        return _drift_exit(drift.kind, config.strict_schema)
 
     print("wispr-flow-exporter schema (cloud)")
     _say("app", f"{app_version or 'unknown'} (pinned {CLIENT_PIN.app_version})")
@@ -1097,12 +1117,7 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
         shape = seen["shape"] or "no body"
         _say("", f"{mark}{name:22} {status or 'net':>4}  {shape}")
     _say("drift", drift.summary())
-
-    if drift.kind is DriftClass.BREAKING:
-        return EXIT_BREAKING_DRIFT
-    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-        return EXIT_ADDITIVE_DRIFT
-    return EXIT_OK
+    return _drift_exit(drift.kind, config.strict_schema)
 
 
 def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
@@ -1120,7 +1135,7 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
     Returns:
         Process exit code.
     """
-    from .mcp_api import READ_TOOLS, McpClient, McpError
+    from .mcp_api import READ_TOOLS, USED_TOOLS, McpClient, McpError
     from .mcp_auth import McpAuthError, open_client, resolve_credential
     from .mcp_schema import MCP_PIN, detect_mcp_drift, pin_from_tools
     from .sync_mcp import SOURCE_MCP as MCP_BACKEND
@@ -1145,7 +1160,9 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
         return EXIT_SOURCE_UNREACHABLE
 
     recorded = Archive(root=config.archive_dir, read_only=True).source_state(MCP_BACKEND)
-    drift = detect_mcp_drift(tools, server, recorded.get("tool_shapes"))
+    drift = detect_mcp_drift(
+        tools, server, recorded.get("tool_ledger"), legacy=recorded.get("tool_shapes")
+    )
     live = pin_from_tools(tools, server)
     advertised = sorted(str(tool.get("name", "")) for tool in tools)
 
@@ -1165,11 +1182,14 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
                         "server": MCP_PIN.server,
                         "version": MCP_PIN.version,
                         "sha256": MCP_PIN.sha256,
+                        "algorithm": MCP_PIN.algorithm,
                     },
                     "drift": drift.kind,
                     "tools": advertised,
-                    "used": sorted(READ_TOOLS),
+                    "used": sorted(USED_TOOLS),
+                    "allowlisted": sorted(READ_TOOLS),
                     "unavailable": list(drift.unavailable),
+                    "broken_contracts": list(drift.broken_contracts),
                     "new_tools": list(drift.new_tools),
                     "missing_tools": list(drift.missing_tools),
                     "changed_schemas": list(drift.changed_schemas),
@@ -1177,23 +1197,22 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
                 indent=2,
             )
         )
-        return EXIT_OK
+        return _drift_exit(drift.kind, config.strict_schema)
 
     print("wispr-flow-exporter schema (mcp)")
     _say("server", f"{live.server or '?'} {live.version or ''}".strip())
     _say("protocol", live.protocol_version or "?")
     _say("pin", f"{live.sha256[:12]} (declared {MCP_PIN.sha256[:12]})")
-    _say("tools", f"{len(advertised)} advertised, {len(READ_TOOLS)} used")
+    _say(
+        "tools",
+        f"{len(advertised)} advertised, {len(USED_TOOLS)} used, "
+        f"{len(READ_TOOLS)} allowlisted",
+    )
     for name in advertised:
-        mark = "use" if name in READ_TOOLS else "-- "
+        mark = "use" if name in USED_TOOLS else "ok " if name in READ_TOOLS else "-- "
         _say("", f"{mark} {name}")
     _say("drift", drift.summary())
-
-    if drift.kind is DriftClass.BREAKING:
-        return EXIT_BREAKING_DRIFT
-    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-        return EXIT_ADDITIVE_DRIFT
-    return EXIT_OK
+    return _drift_exit(drift.kind, config.strict_schema)
 
 
 def cmd_schema(args: argparse.Namespace) -> int:
@@ -1245,19 +1264,14 @@ def cmd_schema(args: argparse.Namespace) -> int:
                     indent=2,
                 )
             )
-            return EXIT_OK
+            return _drift_exit(drift.kind, config.strict_schema)
 
         print("wispr-flow-exporter schema")
         _say("tables", f"{len(tables)} live, {len(EXPECTED)} declared")
         _say("migrations", f"{drift.live.count} (declared {MIGRATION_PIN.count})")
         _say("pin", f"{drift.live.sha256[:12]} (declared {MIGRATION_PIN.sha256[:12]})")
         _say("drift", drift.summary())
-
-    if drift.kind is DriftClass.BREAKING:
-        return EXIT_BREAKING_DRIFT
-    if drift.kind is DriftClass.ADDITIVE and config.strict_schema:
-        return EXIT_ADDITIVE_DRIFT
-    return EXIT_OK
+    return _drift_exit(drift.kind, config.strict_schema)
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
