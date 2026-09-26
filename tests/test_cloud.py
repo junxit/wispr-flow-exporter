@@ -379,6 +379,20 @@ def test_a_hostile_retry_after_cannot_park_the_run() -> None:
 # --- the pass -------------------------------------------------------------
 
 
+def test_a_response_that_shrinks_keeps_the_fuller_one(tmp_path: Path) -> None:
+    """Notifications cleared, a list cut short: the snapshot mirrors, the past is kept."""
+    archive = Archive(root=tmp_path / "archive")
+    full = {"items": [{"id": "n-1"}, {"id": "n-2"}]}
+    sync_cloud(archive, _Recorder({"notifications": full}), SyncOptions(), endpoints=("notifications",))
+
+    later = Archive(root=archive.root)
+    shorter = _Recorder({"notifications": {"items": [{"id": "n-2"}]}})
+    sync_cloud(later, shorter, SyncOptions(), endpoints=("notifications",))
+
+    kept = list((archive.root / "superseded" / "cloud" / "notifications").iterdir())
+    assert [json.loads(p.read_text(encoding="utf-8"))["payload"] for p in kept] == [full]
+
+
 def test_responses_are_archived_verbatim(tmp_path: Path) -> None:
     """The API is not a contract, so nothing is reshaped on the way in.
 

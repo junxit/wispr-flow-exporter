@@ -1307,6 +1307,114 @@ def test_an_archive_from_before_ledgers_is_not_rewritten_by_the_upgrade(
     assert moved <= {"index.json"}
 
 
+# --- what upstream empties ------------------------------------------------
+
+
+def _update(db: Path, sql: str, params: tuple[object, ...]) -> None:
+    """Change rows upstream the way Wispr Flow itself does.
+
+    Args:
+        db: The source database.
+        sql: One UPDATE statement.
+        params: Its parameters.
+    """
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(sql, params)
+
+
+def _superseded(root: Path, entity: str, key: str) -> list[dict[str, object]]:
+    """Read every kept superseded payload for one record.
+
+    Args:
+        root: Archive root.
+        entity: Record kind.
+        key: Record key.
+
+    Returns:
+        The kept wrappers, ``{"superseded_at", "payload"}`` each.
+    """
+    directory = root / "superseded" / entity / key
+    if not directory.is_dir():
+        return []
+    return [json.loads(path.read_text(encoding="utf-8")) for path in directory.iterdir()]
+
+
+def test_a_meeting_that_loses_its_summary_keeps_the_version_that_had_it(
+    scene: Callable[..., tuple],
+) -> None:
+    """raw/meeting.json mirrors upstream; the fuller version is filed, not dropped."""
+    archive, resolved, db = scene()
+    _run(archive, resolved)
+
+    _update(
+        db,
+        'UPDATE "Meetings" SET "summary" = NULL, "modifiedAt" = ? WHERE "id" = ?',
+        ("2026-08-22 08:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved)
+
+    raw = archive.root / archive.entry("meetings", MEETING_A)["path"] / "raw" / "meeting.json"
+    assert json.loads(raw.read_text(encoding="utf-8"))["summary"] is None
+    kept = _superseded(archive.root, "meetings", MEETING_A)
+    assert [entry["payload"]["summary"] for entry in kept] == [  # type: ignore[index]
+        "Reviewed the budget with <@speaker:2>."
+    ]
+
+
+def test_an_edit_keeps_no_superseded_copy(scene: Callable[..., tuple]) -> None:
+    """Replacing a value with another is the archive mirroring, not losing."""
+    archive, resolved, db = scene()
+    _run(archive, resolved)
+
+    _update(
+        db,
+        'UPDATE "Meetings" SET "summary" = ?, "modifiedAt" = ? WHERE "id" = ?',
+        ("A different summary.", "2026-08-22 08:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved)
+
+    assert not (archive.root / "superseded").exists()
+
+
+def test_a_dictionary_entry_that_loses_its_replacement_is_kept_in_the_ledger(
+    scene: Callable[..., tuple],
+) -> None:
+    """Superseded, not removed: the entry is still upstream, just emptier."""
+    archive, resolved, db = scene(rows=[], tables={"Dictionary": DICTIONARY_ROWS})
+    _run(archive, resolved)
+
+    _update(db, 'UPDATE "Dictionary" SET "replacement" = NULL WHERE "id" = ?', ("d-1",))
+    _run(Archive(root=archive.root), resolved)
+
+    ledger = _ndjson(archive.root / "dictionary" / "dictionary.removed.ndjson")
+    assert [(sorted(e), e["row"]["replacement"]) for e in ledger] == [  # type: ignore[index]
+        (["row", "superseded_at"], "Kubernetes")
+    ]
+    rendered = (archive.root / "dictionary" / "dictionary.md").read_text(encoding="utf-8")
+    assert "## Removed upstream" not in rendered
+
+
+def test_a_second_run_after_a_loss_writes_nothing(scene: Callable[..., tuple]) -> None:
+    """Keeping the fuller version happens once, however many runs see the loss."""
+    archive, resolved, db = scene(tables={"Dictionary": DICTIONARY_ROWS})
+    _run(archive, resolved)
+    _update(
+        db,
+        'UPDATE "Meetings" SET "summary" = NULL, "modifiedAt" = ? WHERE "id" = ?',
+        ("2026-08-22 08:00:00.000 +00:00", MEETING_A),
+    )
+    _update(db, 'UPDATE "Dictionary" SET "replacement" = NULL WHERE "id" = ?', ("d-1",))
+    _run(Archive(root=archive.root), resolved)
+    before = _snapshot(archive.root)
+
+    _run(Archive(root=archive.root), resolved)
+    _run(Archive(root=archive.root), resolved, full=True)
+
+    assert _snapshot(archive.root) == before
+
+
 # --- misc tables and account ----------------------------------------------
 
 
@@ -1481,6 +1589,29 @@ def test_the_account_pass_captures_what_no_table_holds(
     assert json.loads((root / "sync_coordinator.json").read_text(encoding="utf-8"))[
         "timestamps"
     ]["meetings"]
+
+
+def test_the_account_context_is_archived_raw_as_well_as_rendered(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """Writing samples lived only as Markdown; raw first, as everywhere else."""
+    archive = Archive(root=tmp_path / "archive")
+    config = LocalConfig(
+        policy=Policy("store_normally", "never_delete", datetime.now(tz=UTC)),
+        writing_samples=["Keep the murmurs brief.", "Hush means now."],
+        polish_prompts=["Make it quieter."],
+    )
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    wispr_db().replace(data_dir / "flow.sqlite")
+    resolved = paths.resolve(data_dir=data_dir)
+
+    with open_source(resolved.db) as source:
+        sync_local(archive, source, resolved, SyncOptions(), config=config)
+
+    context = json.loads((archive.root / "account" / "context.json").read_text(encoding="utf-8"))
+    assert context["writingSamples"] == ["Keep the murmurs brief.", "Hush means now."]
+    assert (archive.root / "account" / "writing_samples.md").is_file()
 
 
 def test_the_archived_profile_carries_no_credential(

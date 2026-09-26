@@ -272,6 +272,7 @@ archive/
     media/upload.ogg
   notes/  dictation/  dictionary/  calendar/  account/  tables/
   …/<file>.removed.ndjson       # rows upstream deleted, beside the file they left
+  superseded/<kind>/<key>/      # payloads a later version held less than
   cloud/                        # one verbatim response per endpoint
   mcp/                          # verbatim MCP responses, content-addressed
     meetings/                   # meetings upstream has and the local store does not
@@ -299,6 +300,13 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
   gone. Ledgers are only ever appended to. `dictionary.md` lists removed
   entries in a section of their own, and a day's dictation log keeps a removed
   entry in its place, marked as such.
+- **What upstream empties is kept too.** Edits are mirrored, but a replacement
+  that *loses* content — a column a migration drops, a summary someone clears,
+  a list that gets shorter — first files the fuller version: under
+  `superseded/<kind>/<key>/` for a record's own payload (a meeting's
+  `raw/meeting.json`, a note, a calendar event, the account's JSON, each cloud
+  endpoint), and as a `superseded_at` line in the ledger for a row of a
+  whole-file table.
 - **A transcript Wispr Flow deletes stays in your archive**, flagged
   `transcript_deleted_upstream: true`. This is the whole point of the tool.
 - **A retitle moves the directory** rather than duplicating it — and a move

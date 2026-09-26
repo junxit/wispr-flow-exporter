@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .cloud_api import ENDPOINTS, CloudProtocol
-from .secure_io import write_json_if_changed
+from .retention import replace_payload
 from .store import Archive
 from .sync import SyncCounts, SyncOptions, _now
 
@@ -197,7 +197,18 @@ def sync_cloud(
             counts.unchanged += 1
             continue
 
-        wrote = write_json_if_changed(destination, payload)
+        # A response that now holds less than the archived one -- a list
+        # that shrank, a field that emptied -- keeps the old one under
+        # superseded/. Aggregates that merely move are edits, and replaced.
+        wrote = replace_payload(
+            archive,
+            destination,
+            payload,
+            entity="cloud",
+            key=name,
+            when=now,
+            project=_projection,
+        )
         fields: dict[str, Any] = {
             "path": archive.relative(destination),
             "endpoint": ENDPOINTS[name].path,

@@ -96,6 +96,24 @@ wrapped at 72 columns, US English.
   date and identity rather than scan order, which may rewrite a few
   shards once; a dictation day log no longer stops the run when numWords
   holds something that is not a number.
+- What upstream empties is kept, not only what it deletes. A record that
+  survives upstream can still lose what it held -- a column a migration
+  drops, a summary someone clears, a list that shrinks -- and every
+  archived payload was simply replaced. Measured on 0.4.1: a meeting
+  whose summary went away upstream lost it from raw/meeting.json on the
+  next sync that re-read the meeting. A replacement that loses content
+  now files the version it replaces first: under
+  superseded/<kind>/<key>/, content-addressed so it is kept once, for a
+  meeting's raw/meeting.json, a note's raw payload, a calendar event,
+  the account's JSON and each cloud endpoint; and as a superseded_at
+  line in the ledger for a row of a table archived as a whole file. An
+  edit that replaces one value with another loses nothing and is
+  mirrored as before, and churn columns do not count.
+- The account's writing samples and rewrite prompts are archived raw, as
+  account/context.json. They existed only as the two Markdown files
+  rendered from them, which broke the rule every other entity keeps: raw
+  first, so a rendering can always be rebuilt and nothing depends on
+  one.
 
 0.4.1
 -----

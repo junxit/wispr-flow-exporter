@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +49,11 @@ from .paths import WisprPaths
 from .retention import (
     key_digest,
     ledger_path,
+    lost_content,
+    project_record,
     read_ledger,
     record_removals,
+    replace_payload,
     still_removed,
 )
 from .schema import EXPECTED, Layout, TableSpec
@@ -463,7 +467,15 @@ def _write_meeting_files(
     data = record.data
     raw_dir = destination / "raw"
     secure_mkdir(raw_dir)
-    wrote = write_json_if_changed(raw_dir / "meeting.json", data)
+    wrote = replace_payload(
+        archive,
+        raw_dir / "meeting.json",
+        data,
+        entity="meetings",
+        key=record.key,
+        when=_now(),
+        project=partial(project_record, EXPECTED["Meetings"]),
+    )
 
     speakers = SpeakerMap.parse(data.get("speakerMap"))
     if speakers.raw is not None:
@@ -797,7 +809,15 @@ def sync_notes(
             if archive.relocate_document("notes", key, stem, NOTE_SUFFIXES):
                 counts.relocated += 1
 
-            wrote = write_json_if_changed(_document_paths(stem, ".raw.json"), data)
+            wrote = replace_payload(
+                archive,
+                _document_paths(stem, ".raw.json"),
+                data,
+                entity="notes",
+                key=key,
+                when=now,
+                project=partial(project_record, spec),
+            )
             wrote |= _write_markdown(
                 _document_paths(stem, ".md"),
                 render.render_note(
@@ -908,7 +928,15 @@ def sync_calendar(
             if archive.relocate_file("calendar", key, destination):
                 counts.relocated += 1
 
-            wrote = write_json_if_changed(destination, data)
+            wrote = replace_payload(
+                archive,
+                destination,
+                data,
+                entity="calendar",
+                key=key,
+                when=now,
+                project=partial(project_record, spec),
+            )
             fields: dict[str, Any] = {
                 "path": archive.relative(destination),
                 "external_id": external_id,
@@ -997,9 +1025,10 @@ def sync_snapshot(
         counts.written = len(rows)
         return counts
 
-    present = {row_identity(spec, row) for row in rows}
+    current = {row_identity(spec, row): row for row in rows}
+    present = set(current)
     ledger = ledger_path(destination)
-    counts.absent = _keep_removed(destination, ledger, spec, present, now)
+    counts.absent = _keep_removed(destination, ledger, spec, current, now)
     wrote = counts.absent > 0
     wrote |= write_ndjson_if_changed(destination, rows)
     removed = still_removed(read_ledger(ledger), spec, present)
@@ -1027,28 +1056,44 @@ def sync_snapshot(
 
 
 def _keep_removed(
-    main: Path, ledger: Path, spec: TableSpec, present: set[str], when: str
+    main: Path,
+    ledger: Path,
+    spec: TableSpec,
+    current: Mapping[str, Mapping[str, Any]],
+    when: str,
 ) -> int:
-    """Move rows upstream dropped from a file about to be rewritten into its ledger.
+    """Move what a file about to be rewritten would lose into its ledger.
 
-    Called immediately before the main file is replaced, so the ledger is
-    always written first: there is no instant at which a removed row is in
-    neither file.
+    Rows upstream dropped are recorded as removed; rows upstream still has but
+    whose new version holds less (see :func:`.retention.lost_content`) have
+    their old version recorded as superseded. Called immediately before the
+    main file is replaced, so the ledger is always written first: there is no
+    instant at which either kind of row is in neither file.
 
     Args:
         main: The snapshot or shard about to be rewritten.
         ledger: Its ledger.
         spec: The table's declaration.
-        present: Every identity upstream holds now -- across the whole table,
-            so a row that moved to another shard is not mistaken for removed.
-        when: ISO timestamp for ``missing_since``.
+        current: Every row upstream holds now, by identity -- across the whole
+            table, so a row that moved to another shard is not mistaken for
+            removed.
+        when: ISO timestamp for the ledger.
 
     Returns:
         How many rows were newly recorded as removed.
     """
     old_rows, unparsed = read_ndjson(main)
-    gone = [row for row in old_rows if row_identity(spec, row) not in present]
-    return record_removals(ledger, spec, gone, unparsed, when=when)
+    gone: list[dict[str, Any]] = []
+    superseded: list[dict[str, Any]] = []
+    for row in old_rows:
+        new = current.get(row_identity(spec, row))
+        if new is None:
+            gone.append(row)
+        elif lost_content(project_record(spec, row), project_record(spec, new)):
+            superseded.append(row)
+    removed = record_removals(ledger, spec, gone, unparsed, when=when)
+    record_removals(ledger, spec, (), when=when, superseded=superseded)
+    return removed
 
 
 def _day_start(day: str) -> datetime | None:
@@ -1254,6 +1299,15 @@ def sync_dictation(
         if everywhere is not None:
             gone = [row for key, row in carried[day].items() if key not in everywhere]
             appended = record_removals(ledger, spec, gone, unparsed[day], when=now)
+            # A re-read dictation whose new version holds less -- text the
+            # cascade had, cleared -- keeps its old version in the ledger.
+            superseded = [
+                old
+                for key, old in carried[day].items()
+                if key in read
+                and lost_content(project_record(spec, old), project_record(spec, read[key]))
+            ]
+            record_removals(ledger, spec, (), when=now, superseded=superseded)
             removed = still_removed(read_ledger(ledger), spec, everywhere)
         counts.absent += appended
 
@@ -1426,7 +1480,8 @@ def sync_sharded(
         for key in archive.entries("tables")
         if key.startswith(prefix) and key != f"{entity}:empty"
     }
-    everywhere = {row_identity(spec, row) for rows in days.values() for row in rows}
+    current = {row_identity(spec, row): row for rows in days.values() for row in rows}
+    everywhere = set(current)
 
     def order(row: Mapping[str, Any]) -> tuple[str, str]:
         stamp = instant(row)
@@ -1448,7 +1503,7 @@ def sync_sharded(
             continue
 
         ledger = ledger_path(shard)
-        appended = _keep_removed(shard, ledger, spec, everywhere, now)
+        appended = _keep_removed(shard, ledger, spec, current, now)
         counts.absent += appended
         wrote = appended > 0
         wrote |= write_ndjson_if_changed(shard, rows)
@@ -1536,17 +1591,27 @@ def sync_account(
         return counts
 
     root = archive.resolve("account")
-    wrote = False
-    # Identity and expiry only. The token itself is never handed to anything
-    # that writes, so no file this tool creates can carry one.
-    wrote |= write_json_if_changed(root / "profile.json", account_profile(session))
-    wrote |= write_json_if_changed(root / "preferences.json", config.preferences)
-    wrote |= write_json_if_changed(
-        root / "sync_coordinator.json", config.sync_coordinator
-    )
+    now = _now()
+    payloads: dict[str, Any] = {
+        # Identity and expiry only. The token itself is never handed to
+        # anything that writes, so no file this tool creates can carry one.
+        "profile": account_profile(session),
+        "preferences": config.preferences,
+        "sync_coordinator": config.sync_coordinator,
+        # The raw lists the two Markdown files below are rendered from. They
+        # used to exist only as those renderings, which broke the rule every
+        # other entity keeps: raw first, so a rendering can always be redone.
+        "context": {
+            "writingSamples": config.writing_samples,
+            "polishPrompts": config.polish_prompts,
+        },
+    }
     if config.voice_profile is not None:
-        wrote |= write_json_if_changed(
-            root / "voice_profile.json", config.voice_profile
+        payloads["voice_profile"] = config.voice_profile
+    wrote = False
+    for name, payload in payloads.items():
+        wrote |= replace_payload(
+            archive, root / f"{name}.json", payload, entity="account", key=name, when=now
         )
     for name, value in (
         ("writing_samples.md", config.writing_samples),
