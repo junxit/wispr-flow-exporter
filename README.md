@@ -275,6 +275,9 @@ archive/
     raw/…                       # verbatim JSON and NDJSON
     media/upload.ogg
   notes/  dictation/  dictionary/  calendar/  account/  tables/
+  notes/images/<note uuid>/     # pasted images, with --include-images
+  dictation/media/  tables/FlowLensHistory/media/  # dictation audio and
+                                # screenshots, each with its own opt-in
   …/<file>.removed.ndjson       # rows upstream deleted, beside the file they left
   superseded/<kind>/<key>/      # payloads a later version held less than
   cloud/                        # one verbatim response per endpoint

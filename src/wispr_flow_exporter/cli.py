@@ -43,7 +43,7 @@ from .store import Archive, ArchiveBusy
 # Aliased: this module's SOURCE_LOCAL is the CLI choice "local", while
 # sync's is the backend key "wispr-local" that namespaces sync state.
 from .sync import SOURCE_LOCAL as LOCAL_BACKEND
-from .sync import SyncOptions, SyncResult, rerender, sync_local
+from .sync import SyncOptions, SyncResult, blob_columns, rerender, sync_local
 from .verify import verify_archive
 
 if TYPE_CHECKING:  # pragma: no cover - the MCP modules load only when used
@@ -670,7 +670,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
         audio=config.audio,
         max_audio_mb=config.max_audio_mb,
         include_screen_context=config.include_screen_context,
-        include_blobs=config.include_audio_blobs or config.include_images,
+        blobs=blob_columns(
+            audio=config.include_audio_blobs,
+            screen_context=config.include_screen_context,
+            images=config.include_images,
+        ),
         verbose=getattr(args, "verbose", False),
         dry_run=getattr(args, "dry_run", False),
         recheck_days=config.recheck_days,

@@ -34,7 +34,14 @@ from wispr_flow_exporter.normalize import calendar_key
 from wispr_flow_exporter.schema import EXPECTED
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
-from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, rerender, sync_local
+from wispr_flow_exporter.sync import (
+    AUDIO_BLOBS,
+    SOURCE_LOCAL,
+    SyncOptions,
+    blob_columns,
+    rerender,
+    sync_local,
+)
 
 REFINED = [
     {
@@ -1042,7 +1049,7 @@ def test_dictation_blobs_are_written_as_sidecars(
         rows=[],
         tables={"History": [_history_row(audio=b"OggS" + bytes(64))]},
     )
-    _run(archive, resolved, include_blobs=True, policy=_policy("store_normally"))
+    _run(archive, resolved, blobs=AUDIO_BLOBS, policy=_policy("store_normally"))
 
     sidecar = (
         archive.root / "dictation" / "media" / "2026" / "08" / HISTORY_A / "audio.opus"
@@ -1922,3 +1929,116 @@ def test_skip_mode_records_nothing_at_all(scene: Callable[..., tuple]) -> None:
     directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
     assert not (directory / "media").exists()
     assert not (directory / "raw" / "audio.json").exists()
+
+
+# --- binary columns, one opt-in each --------------------------------------
+
+_PNG = b"\x89PNG\r\n\x1a\n" + bytes(8)
+_STAMP = "2026-08-30 10:00:00.000 +00:00"
+
+
+def _binary_tables() -> dict[str, list[dict[str, object]]]:
+    """Build one row with a binary column in each table that has one.
+
+    Returns:
+        Table name to rows.
+    """
+    return {
+        "History": [_history_row(audio=b"OggS" + bytes(8), screenshot=_PNG)],
+        "FlowLensHistory": [
+            {
+                "id": HISTORY_B,
+                "role": "user",
+                "screenshot": _PNG,
+                "createdAt": _STAMP,
+                "updatedAt": _STAMP,
+            }
+        ],
+        "NoteImages": [
+            {
+                "id": HISTORY_C,
+                "noteId": NOTE_A,
+                "data": _PNG,
+                "contentType": "image/png",
+                "createdAt": _STAMP,
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("switch", "expected"),
+    [
+        ("audio", {f"dictation/media/2026/08/{HISTORY_A}/audio.opus"}),
+        (
+            "screen_context",
+            {
+                f"dictation/media/2026/08/{HISTORY_A}/screenshot.png",
+                f"tables/FlowLensHistory/media/2026/08/{HISTORY_B}/screenshot.png",
+            },
+        ),
+        ("images", {f"notes/images/{NOTE_A}/{HISTORY_C}.png"}),
+    ],
+)
+def test_each_opt_in_archives_exactly_the_columns_it_names(
+    scene: Callable[..., tuple], switch: str, expected: set[str]
+) -> None:
+    """Measured on 0.4.1, where one switch read every binary column at once.
+
+    Screen context alone wrote no screenshot; images alone wrote dictation
+    audio and no image; and a FlowLensHistory screenshot or a note image was
+    never written, whatever was switched on.
+    """
+    archive, resolved, _ = scene(rows=[], tables=_binary_tables())
+    switches = {"audio": False, "screen_context": False, "images": False, switch: True}
+
+    _run(
+        archive,
+        resolved,
+        include_screen_context=switches["screen_context"],
+        blobs=blob_columns(**switches),
+        policy=_policy("store_normally"),
+    )
+
+    written = {
+        str(path.relative_to(archive.root))
+        for path in archive.root.rglob("*")
+        if path.is_file() and path.suffix in (".opus", ".png")
+    }
+    assert written == expected
+
+
+def test_a_binary_column_whose_id_cannot_name_a_file_is_marked_unwritten(
+    scene: Callable[..., tuple],
+) -> None:
+    """A row's id is untrusted input, and is refused as a path component.
+
+    The row is still archived; its reference says the bytes are not.
+    """
+    tables = {
+        "History": [
+            _history_row(transcriptEntityId="../../outside", audio=b"OggS" + bytes(8))
+        ]
+    }
+    archive, resolved, _ = scene(rows=[], tables=tables)
+
+    _run(archive, resolved, blobs=AUDIO_BLOBS, policy=_policy("store_normally"))
+
+    assert not list(archive.root.rglob("*.opus"))
+    shard = archive.root / "dictation" / "2026" / "08" / "2026-08-30.ndjson"
+    row = json.loads(shard.read_text(encoding="utf-8").splitlines()[0])
+    assert row["audio"]["__blob__"]["archived"] is False
+
+
+def test_a_binary_column_not_opted_into_is_recorded_as_unread(
+    scene: Callable[..., tuple],
+) -> None:
+    """Present, hashed and sized -- and honest that the bytes are not here."""
+    archive, resolved, _ = scene(rows=[], tables=_binary_tables())
+
+    _run(archive, resolved, blobs=AUDIO_BLOBS, policy=_policy("store_normally"))
+
+    snapshot = (archive.root / "tables" / "NoteImages.ndjson").read_text(encoding="utf-8")
+    reference = json.loads(snapshot.splitlines()[0])["data"]["__blob__"]
+    assert reference["archived"] is False
+    assert reference["bytes"] == len(_PNG)

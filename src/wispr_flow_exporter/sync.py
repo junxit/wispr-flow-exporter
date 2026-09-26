@@ -102,6 +102,143 @@ ENTITIES = (
 )
 
 
+#: Which binary columns each opt-in archives. One switch used to read every
+#: binary column at once, so the opt-ins did not do what they said. Measured
+#: on 0.4.1: screen context alone wrote no screenshot at all; images alone
+#: wrote dictation audio and no image; and a FlowLensHistory screenshot or a
+#: note image was never written, whatever was switched on.
+AUDIO_BLOBS = frozenset({"History.audio", "History.builtInAudio"})
+SCREENSHOTS = frozenset({"History.screenshot", "FlowLensHistory.screenshot"})
+NOTE_IMAGES = frozenset({"NoteImages.data"})
+
+#: File suffixes for binary columns whose content is known.
+_SUFFIXES = {"audio": ".opus", "builtInAudio": ".opus", "screenshot": ".png"}
+_IMAGE_TYPES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".heic",
+}
+
+
+def blob_columns(*, audio: bool, screen_context: bool, images: bool) -> frozenset[str]:
+    """Name the binary columns a run's opt-ins archive.
+
+    Args:
+        audio: Dictation audio blobs.
+        screen_context: Screen captures, which the caller has acknowledged.
+        images: Images pasted into notes.
+
+    Returns:
+        ``Table.column`` names.
+    """
+    chosen: frozenset[str] = frozenset()
+    if audio:
+        chosen |= AUDIO_BLOBS
+    if screen_context:
+        chosen |= SCREENSHOTS
+    if images:
+        chosen |= NOTE_IMAGES
+    return chosen
+
+
+def _blobs_of(table: str, options: SyncOptions) -> frozenset[str]:
+    """Return the binary columns of one table this run archives.
+
+    Args:
+        table: Source table name.
+        options: What this run was asked to do.
+
+    Returns:
+        Column names.
+    """
+    prefix = f"{table}."
+    return frozenset(
+        name.removeprefix(prefix) for name in options.blobs if name.startswith(prefix)
+    )
+
+
+def _sidecar(archive: Archive, record: Record, column: str, day: str) -> Path | None:
+    """Say where one binary column of one row is archived.
+
+    Args:
+        archive: The destination archive.
+        record: The row.
+        column: The binary column.
+        day: The row's day, for dated tables.
+
+    Returns:
+        The file, or ``None`` when an id that would name it is not a
+        canonical UUID: a row's id is untrusted input like any other, and is
+        refused as a path component rather than trusted to be one.
+    """
+    if not MEETING_DIR_RE.match(record.key):
+        return None
+    if record.table == "NoteImages":
+        note = record.data.get("noteId")
+        if not isinstance(note, str) or not MEETING_DIR_RE.match(note):
+            return None
+        kind = str(record.data.get("contentType") or "").strip().lower()
+        suffix = _IMAGE_TYPES.get(kind, ".bin")
+        return archive.resolve("notes", "images", note, f"{record.key}{suffix}")
+    base = "dictation" if record.table == "History" else entity_name(record.table)
+    return archive.resolve(
+        base,
+        "media",
+        *day.split("-")[:2],
+        record.key,
+        f"{column}{_SUFFIXES.get(column, '.bin')}",
+    )
+
+
+def _unwritten(record: Record, column: str) -> None:
+    """Mark a binary column that was read but will not be written.
+
+    Args:
+        record: The row, whose reference is updated in place before the row
+            itself is archived.
+        column: The binary column.
+    """
+    reference = record.data.get(column)
+    if isinstance(reference, dict) and isinstance(reference.get("__blob__"), dict):
+        reference["__blob__"]["archived"] = False
+
+
+def _collect_blobs(
+    archive: Archive,
+    record: Record,
+    day: str,
+    into: list[tuple[Path, bytes]],
+) -> None:
+    """Queue a row's binary columns for writing, or mark them unwritten.
+
+    Args:
+        archive: The destination archive.
+        record: The row.
+        day: The row's day.
+        into: Receives ``(file, bytes)`` for each column to write.
+    """
+    for column, payload in record.blobs.items():
+        target = _sidecar(archive, record, column, day)
+        if target is None:
+            _unwritten(record, column)
+        else:
+            into.append((target, payload))
+
+
+def _write_blobs(blobs: list[tuple[Path, bytes]], counts: SyncCounts) -> None:
+    """Write queued binary columns, compare-then-write.
+
+    Args:
+        blobs: ``(file, bytes)`` pairs.
+        counts: Mutated with the bytes written.
+    """
+    for target, payload in blobs:
+        if write_bytes_if_changed(target, payload):
+            counts.bytes_copied += len(payload)
+
+
 @dataclass(slots=True)
 class SyncOptions:
     """What one sync run was asked to do.
@@ -111,7 +248,9 @@ class SyncOptions:
         audio: ``copy``, ``link`` or ``skip``.
         max_audio_mb: Refuse to copy a single file larger than this.
         include_screen_context: Widen the projection to screen captures.
-        include_blobs: Read binary columns.
+        blobs: The binary columns to read and archive, as ``Table.column``;
+            see :func:`blob_columns`. Any other binary column is recorded as
+            present and unread.
         verbose: Report per record.
         dry_run: Report what would be written and touch nothing.
         recheck_days: Trailing days re-read for tables with no modification
@@ -126,7 +265,7 @@ class SyncOptions:
     audio: str = AUDIO_COPY
     max_audio_mb: int = 512
     include_screen_context: bool = False
-    include_blobs: bool = False
+    blobs: frozenset[str] = frozenset()
     verbose: bool = False
     dry_run: bool = False
     recheck_days: int = 14
@@ -1137,10 +1276,14 @@ def sync_snapshot(
     counts = SyncCounts()
     now = _now()
 
-    rows = sorted(
-        (record.data for record in source.records(table)),
-        key=lambda row: row_order(spec, row),
-    )
+    blobs: list[tuple[Path, bytes]] = []
+    records = list(source.records(table, include_blobs=_blobs_of(table, options)))
+    for record in records:
+        # Before the rows are hashed: a column marked unwritten is part of
+        # what the snapshot records. Opting in changes each row's reference,
+        # so an otherwise unchanged snapshot is rewritten once, images and all.
+        _collect_blobs(archive, record, UNDATED, blobs)
+    rows = sorted((record.data for record in records), key=lambda row: row_order(spec, row))
     counts.scanned = len(rows)
 
     destination = archive.record_path(table, spec, "")
@@ -1166,6 +1309,7 @@ def sync_snapshot(
     counts.absent = _keep_removed(destination, ledger, spec, current, now)
     wrote = counts.absent > 0
     wrote |= write_ndjson_if_changed(destination, rows)
+    _write_blobs(blobs, counts)
     removed = still_removed(read_ledger(ledger), spec, present)
     if render_markdown and table == "Dictionary":
         wrote |= _write_markdown(
@@ -1343,7 +1487,7 @@ def sync_dictation(
     )
 
     read: dict[str, dict[str, Any]] = {}
-    blobs: list[tuple[str, str, str, bytes]] = []
+    blobs: list[tuple[Path, bytes]] = []
     highest: Any = None
 
     try:
@@ -1352,16 +1496,14 @@ def sync_dictation(
             since=since,
             since_column="timestamp",
             include_screen_context=options.include_screen_context,
-            include_blobs=options.include_blobs,
+            include_blobs=_blobs_of("History", options),
         ):
             counts.scanned += 1
             read[row_identity(spec, record.data)] = record.data
             raw = record.data.get("timestamp")
             if isinstance(raw, str) and (highest is None or raw > highest):
                 highest = raw
-            day = _day_of(raw) or UNDATED
-            for column, payload in record.blobs.items():
-                blobs.append((day, record.key, column, payload))
+            _collect_blobs(archive, record, _day_of(raw) or UNDATED, blobs)
     except KeyboardInterrupt:
         if not options.dry_run:
             archive.save()
@@ -1417,12 +1559,11 @@ def sync_dictation(
             "History",
             keys=missing,
             include_screen_context=options.include_screen_context,
-            include_blobs=options.include_blobs,
+            include_blobs=_blobs_of("History", options),
         ):
             read[row_identity(spec, record.data)] = record.data
             day = _day_of(record.data.get("timestamp")) or UNDATED
-            for column, payload in record.blobs.items():
-                blobs.append((day, record.key, column, payload))
+            _collect_blobs(archive, record, day, blobs)
 
     everywhere = set(live) if live is not None else None
     for day in sorted(touched):
@@ -1480,14 +1621,7 @@ def sync_dictation(
             counts.unchanged += len(rows)
         archive.put("dictation", day, **fields)
 
-    for day, key, column, payload in blobs:
-        suffix = {"audio": ".opus", "builtInAudio": ".opus", "screenshot": ".png"}
-        target = archive.resolve(
-            "dictation", "media", *day.split("-")[:2], key,
-            f"{column}{suffix.get(column, '.bin')}",
-        )
-        if write_bytes_if_changed(target, payload):
-            counts.bytes_copied += len(payload)
+    _write_blobs(blobs, counts)
 
     archive.source_state(SOURCE_LOCAL)["policy"] = policy.as_dict(
         archive.source_state(SOURCE_LOCAL).get("policy")
@@ -1593,16 +1727,17 @@ def sync_sharded(
         return to_instant(kind, row.get(date_column)) if date_column else None
 
     days: dict[str, list[dict[str, Any]]] = {}
+    blobs: list[tuple[Path, bytes]] = []
     for record in source.records(
         table,
         include_screen_context=options.include_screen_context,
-        include_blobs=options.include_blobs,
+        include_blobs=_blobs_of(table, options),
     ):
         counts.scanned += 1
         when = instant(record.data)
-        days.setdefault(f"{when:%Y-%m-%d}" if when else UNDATED, []).append(
-            record.data
-        )
+        day = f"{when:%Y-%m-%d}" if when else UNDATED
+        _collect_blobs(archive, record, day, blobs)
+        days.setdefault(day, []).append(record.data)
 
     if options.dry_run:
         counts.written = counts.scanned
@@ -1668,6 +1803,7 @@ def sync_sharded(
         else:
             counts.unchanged += len(rows)
         archive.put("tables", key, **fields)
+    _write_blobs(blobs, counts)
     return counts
 
 

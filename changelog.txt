@@ -432,6 +432,16 @@ wrapped at 72 columns, US English.
   all eight entities. `all` still means every one, and an unknown name
   -- in the variable or in --only -- is a usage error, exit 2 rather
   than 1.
+- Each opt-in archives exactly the binary columns it names. One switch
+  used to read every binary column at once. Measured on 0.4.1, with one
+  row of each in the store: screen context alone wrote no screenshot at
+  all; --include-images alone wrote dictation audio and no image; and
+  with everything on, the FlowLensHistory screenshot and the note image
+  were still never written. --include-audio-blobs now archives
+  History's audio, screen context the screenshots in History and
+  FlowLensHistory, and --include-images the note images, under
+  notes/images/<note>/. A row whose id cannot safely name a file keeps
+  its row and records the bytes as `archived: false`.
 
 0.4.1
 -----

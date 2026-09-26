@@ -252,9 +252,15 @@ spoke.
 
   Meeting audio (`meetings/<uuid>/upload.ogg`) *is* archived by default, because
   Wispr Flow garbage-collects it — on the machine this was developed against,
-  only one of three meetings still had its audio on disk. Dictation audio blobs
-  and note images are opt-in. Screen context requires both
-  `--include-screen-context` and `--i-understand`; enabling it through
+  only one of three meetings still had its audio on disk. Everything else
+  binary is opt-in, and each opt-in archives exactly the columns it names:
+  `--include-audio-blobs` the dictation audio in `History`, `--include-images`
+  the images pasted into notes, and screen context the screenshots in both
+  `History` and `FlowLensHistory` beside their text captures. Until 0.5.0 one
+  switch read every binary column at once, so `--include-images` archived
+  dictation audio and no image. A binary column that is not archived is still
+  recorded, with its size and SHA-256 and `archived: false`. Screen context
+  requires both `--include-screen-context` and `--i-understand`; enabling it through
   `WISPR_INCLUDE_SCREEN_CONTEXT` instead still requires `--i-understand` on the
   command line. Before 0.4.1 the variable alone was enough, which let a `.env`
   in the working directory widen the export with no acknowledgement at all.

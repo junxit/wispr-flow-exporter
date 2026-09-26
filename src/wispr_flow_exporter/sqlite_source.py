@@ -427,7 +427,7 @@ class SqliteSource:
         table: str,
         *,
         include_screen_context: bool = False,
-        include_blobs: bool = False,
+        include_blobs: bool | Collection[str] = False,
         since: Any = None,
         since_column: str | None = None,
         keys: Collection[str] | None = None,
@@ -441,8 +441,9 @@ class SqliteSource:
         Args:
             table: Table name, which must come from :meth:`tables`.
             include_screen_context: Select the screen-capture columns too.
-            include_blobs: Read binary columns. When false they are reported
-                as present but unread, so the archive records that they exist.
+            include_blobs: Which binary columns to read: all of them for
+                ``True``, or those named. The rest are reported as present
+                but unread, so the archive records that they exist.
             since: Watermark value; only rows with a greater ``since_column``
                 are returned. Compared in SQL against the raw stored value,
                 which is why the watermark is stored raw rather than parsed.
@@ -458,6 +459,7 @@ class SqliteSource:
                 single-column key.
         """
         spec = self.spec_for(table)
+        readable = spec.blobs if include_blobs is True else frozenset(include_blobs or ())
         available = self.columns(table)
         projected = spec.projection(
             available, include_screen_context=include_screen_context
@@ -477,7 +479,7 @@ class SqliteSource:
                 marks = ", ".join("?" for _ in batch)
                 clause = f' WHERE "{spec.key_columns[0]}" IN ({marks})'
                 for row in self.connection.execute(query + clause, batch):
-                    yield self._coerce(spec, table, row, include_blobs=include_blobs)
+                    yield self._coerce(spec, table, row, include_blobs=readable)
             return
         params: tuple[Any, ...] = ()
         if since is not None and since_column and since_column in available:
@@ -485,7 +487,7 @@ class SqliteSource:
             params = (since,)
 
         for row in self.connection.execute(query, params):
-            yield self._coerce(spec, table, row, include_blobs=include_blobs)
+            yield self._coerce(spec, table, row, include_blobs=readable)
 
     def _coerce(
         self,
@@ -493,7 +495,7 @@ class SqliteSource:
         table: str,
         row: sqlite3.Row,
         *,
-        include_blobs: bool,
+        include_blobs: Collection[str],
     ) -> Record:
         """Turn one raw row into a JSON-serializable record.
 
@@ -501,7 +503,7 @@ class SqliteSource:
             spec: The table's declaration.
             table: Table name, for the record.
             row: The raw row.
-            include_blobs: Whether binary columns were selected.
+            include_blobs: The binary columns to read.
 
         Returns:
             The coerced record.
@@ -526,7 +528,7 @@ class SqliteSource:
                 }
                 if len(value) > MAX_BLOB_BYTES:
                     reference["truncated"] = True
-                elif include_blobs:
+                elif column in include_blobs:
                     blobs[column] = value
                 else:
                     reference["archived"] = False
