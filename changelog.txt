@@ -493,6 +493,12 @@ wrapped at 72 columns, US English.
   banner of transcript.live.md and the artifact list in meeting.md now
   say "labeled". The next `wispr-export render` rewrites those
   documents once, as does a sync when their meeting next changes.
+- CI runs on every push, on every branch, and on every version tag. It
+  ran only on main and on pull requests, so 0.4.0 was tagged and pushed
+  from a branch CI had never seen. Tests also run on macOS, the one
+  platform this tool reads Wispr Flow on, beside Ubuntu, and every
+  workflow action is pinned to a commit with its version in a comment:
+  a tag can be moved to other code, a commit cannot.
 
 0.4.1
 -----

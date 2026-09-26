@@ -26,10 +26,10 @@ that compare this tool against a live installation —
 `test_pin_matches_the_live_database`, `test_expected_covers_the_live_database`,
 `test_the_pin_matches_the_installed_app` and
 `test_the_recorded_app_version_matches_the_bundle` — all call `pytest.skip`
-when Wispr Flow is not installed, and CI runs on `ubuntu-latest`, where it
-never is. **A green CI badge says nothing about schema drift.** The weekly cron
-is a CVE canary; it is not a schema canary, and it cannot be made into one
-without a runner that has the app on it.
+when Wispr Flow is not installed, and CI runs on `ubuntu-latest` and
+`macos-latest`, where it never is. **A green CI badge says nothing about schema
+drift.** The weekly cron is a CVE canary; it is not a schema canary, and it
+cannot be made into one without a runner that has the app on it.
 
 So the cadence is manual, and it is short because the drift is not:
 

@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  # Every push, on every branch, and every version tag. It used to be main and
+  # pull requests only, so a pushed branch or a tag got no run at all: 0.4.0
+  # was tagged and pushed from a branch CI had never seen.
   push:
-    branches: [main]
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
   schedule:
     # Weekly, so a newly-published CVE in a pinned dependency surfaces even
@@ -14,23 +18,30 @@ on:
 permissions:
   contents: read
 
+# Every action below is pinned to a commit, with the version it is in a
+# comment. A tag can be moved to other code; a commit cannot. Dependabot keeps
+# the commits and the comments current.
+
 jobs:
   test:
-    name: Tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Tests (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # macOS as well: it is the only platform this tool reads Wispr Flow on,
+        # and file modes, flock and loopback sockets are all exercised here.
+        os: [ubuntu-latest, macos-latest]
         # Pinned rather than left to float. Without this uv resolves whatever
         # the newest interpreter satisfying `requires-python` happens to be on
         # the day the job runs, so the declared floor was never exercised and
         # the tested version could change between two runs of the same commit.
         python-version: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -45,10 +56,10 @@ jobs:
     name: Lint and types
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           enable-cache: true
           python-version: "3.13"
@@ -69,12 +80,12 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # osv-scanner reads uv.lock natively and queries the OSV database.
       # Fails the job if any pinned dependency has a known advisory.
       - name: Scan uv.lock for known vulnerabilities
-        uses: google/osv-scanner-action/osv-scanner-action@v2.6.0
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
         with:
           scan-args: |-
             --lockfile=uv.lock
