@@ -20,6 +20,17 @@ wrapped at 72 columns, US English.
   or not. A dry run now opens the archive read-only and writes nothing:
   not the index, not the state, not the MCP pass's verbatim pages
   (written before its dry-run check), and not a repository's .gitignore.
+- A .env in the working directory could still hand the account token to
+  someone else. 0.4.0 stopped the search walking up and checked both
+  base URLs, but the file was still exported whole. Measured:
+  HTTPS_PROXY and SSL_CERT_FILE in it routed every request through a
+  proxy it named while trusting a CA it named, which reads the bearer
+  token in cleartext whatever WISPR_API_BASE says; XDG_CONFIG_HOME moved
+  the MCP refresh token into the working directory; and the same file
+  could carry both the redirect and WISPR_ALLOW_ENDPOINT_OVERRIDE,
+  making the two-setting consent one accident. A .env now sets only
+  WISPR_* options, never the override, and names what it ignored on
+  stderr.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check

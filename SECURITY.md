@@ -271,16 +271,29 @@ Out of scope: the security of the Wispr Flow service itself, and anything
 requiring an attacker who already has code execution as your user — who can
 simply read `~/Library/Application Support/Wispr Flow/` directly.
 
-A file is not code execution, and that distinction cost this tool a real hole.
-`load_dotenv()` with no argument searches the working directory **and every
-ancestor**, so a `.env` anywhere above wherever you happened to run could set
-`WISPR_API_BASE`. Measured: a `.env` two directories up resolved the API base
-to `http://evil.example`, and the borrowed bearer token would have gone there
-in cleartext. Both remote base URLs are now checked before a credential is
-attached — `https` required, and the host must be the one this tool ships
-unless `WISPR_ALLOW_ENDPOINT_OVERRIDE` is also set — and the `.env` search no
-longer walks up. Placing a file in a directory you run commands from remains
-**in** scope.
+A file is not code execution, and that distinction has cost this tool two real
+holes. Placing a file in a directory you run commands from is **in** scope.
+
+The first: `load_dotenv()` with no argument searches the working directory
+**and every ancestor**, so a `.env` anywhere above wherever you happened to run
+could set `WISPR_API_BASE`. Measured: a `.env` two directories up resolved the
+API base to `http://evil.example`, and the borrowed bearer token would have
+gone there in cleartext. Both remote base URLs are now checked before a
+credential is attached — `https` required, and the host must be the one this
+tool ships unless `WISPR_ALLOW_ENDPOINT_OVERRIDE` is also set — and the `.env`
+search no longer walks up (0.4.0).
+
+The second got past that fix: the `.env` in the working directory was still
+exported **whole**. Measured: one setting `HTTPS_PROXY` and `SSL_CERT_FILE`
+sent every request through a proxy of the file's choosing while trusting a CA
+of its choosing — a man in the middle for the bearer token no matter which
+host `WISPR_API_BASE` named — and `XDG_CONFIG_HOME` moved the MCP refresh
+token into the working directory. The same file could also carry both
+`WISPR_API_BASE` and `WISPR_ALLOW_ENDPOINT_OVERRIDE`, making the two-setting
+consent a single accident. Since 0.4.1 a `.env` may set only `WISPR_*`
+options, never `WISPR_ALLOW_ENDPOINT_OVERRIDE`; everything else it contains is
+ignored and named on stderr (names, never values). Proxies, CA bundles and the
+override belong in the real environment, where someone put them on purpose.
 
 ## Dependencies
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +29,7 @@ from wispr_flow_exporter.cli import (
     EXIT_SOURCE_UNREACHABLE,
     main,
 )
+from wispr_flow_exporter.endpoints import EndpointError
 from wispr_flow_exporter.store import Archive
 
 # Environment, working directory, credential store and network are isolated for
@@ -542,6 +545,72 @@ def test_a_deliberate_override_is_still_possible(
     monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
 
     import argparse
+
+    assert _config(argparse.Namespace()).api_base == "https://staging.example"
+
+
+def test_a_dotenv_can_set_only_this_tools_own_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A planted .env must not choose the proxy, the CA, or where tokens live.
+
+    Measured before the fix: this file routed every request through
+    127.0.0.1:9 while trusting ./attacker-ca.pem -- a man in the middle for the
+    account's bearer token whatever WISPR_API_BASE said -- and moved the MCP
+    token store into the working directory.
+    """
+    from wispr_flow_exporter.cli import _config
+
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (tmp_path / ".env").write_text(
+        "HTTPS_PROXY=http://127.0.0.1:9\n"
+        "SSL_CERT_FILE=./attacker-ca.pem\n"
+        "XDG_CONFIG_HOME=./.config\n"
+        "WISPR_AUDIO=skip\n",
+        encoding="utf-8",
+    )
+
+    config = _config(argparse.Namespace())
+
+    assert config.audio == "skip"
+    for name in ("HTTPS_PROXY", "SSL_CERT_FILE", "XDG_CONFIG_HOME"):
+        assert name not in os.environ
+    err = capsys.readouterr().err
+    assert "HTTPS_PROXY" in err and "SSL_CERT_FILE" in err
+    assert "127.0.0.1" not in err and "attacker-ca" not in err
+
+
+def test_a_dotenv_cannot_consent_to_its_own_redirect(tmp_path: Path) -> None:
+    """The override has to come from the real environment.
+
+    Two settings are required so that a redirect and the consent to it cannot
+    both be accidents; one planted file carrying both made them one accident.
+    """
+    from wispr_flow_exporter.cli import _config
+
+    (tmp_path / ".env").write_text(
+        "WISPR_API_BASE=https://staging.example\n"
+        "WISPR_ALLOW_ENDPOINT_OVERRIDE=1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EndpointError, match=r"staging\.example"):
+        _config(argparse.Namespace())
+    assert "WISPR_ALLOW_ENDPOINT_OVERRIDE" not in os.environ
+
+
+def test_the_real_environment_can_still_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The .env names the host; the operator's own environment says yes."""
+    from wispr_flow_exporter.cli import _config
+
+    (tmp_path / ".env").write_text(
+        "WISPR_API_BASE=https://staging.example\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
 
     assert _config(argparse.Namespace()).api_base == "https://staging.example"
 

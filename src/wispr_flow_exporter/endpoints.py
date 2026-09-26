@@ -6,12 +6,14 @@ place where a configuration value decides who receives a secret, so it is
 checked here rather than at either call site.
 
 The check exists because the environment is wider than it looks. ``cli`` loads
-a ``.env`` before reading these variables, and python-dotenv's search walks
-*up* from the working directory -- so a file placed in any ancestor of wherever
-the operator happens to run can set ``WISPR_API_BASE``. Measured, not assumed:
-a ``.env`` two directories up resolved the API base to ``http://evil.example``
-and nothing objected. An override that redirects the account token to another
-host over cleartext should not be something a stray file can do quietly.
+a ``.env`` before reading these variables, and python-dotenv's default search
+used to walk *up* from the working directory -- so a file placed in any
+ancestor of wherever the operator happened to run could set
+``WISPR_API_BASE``. Measured, not assumed: a ``.env`` two directories up
+resolved the API base to ``http://evil.example`` and nothing objected. The
+search now stops at the working directory, and a ``.env`` may no longer supply
+:data:`OVERRIDE_ENV` at all, so the redirect and the consent to it cannot both
+arrive in one planted file.
 
 This module is deliberately free of both backends' vocabulary so either may
 import it. The MCP modules may not reference the borrowed credential's path at

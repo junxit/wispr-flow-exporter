@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from . import files_source, paths
 from .endpoints import OVERRIDE_ENV, EndpointError, validated_endpoint
@@ -128,6 +128,59 @@ class Config:
     session_file: str | None
 
 
+# The one setting of this tool's own that a .env may not supply. It is the
+# consent half of redirecting a credential to a host this tool does not ship,
+# and the reason two settings are required is that a redirect and the consent
+# to it cannot both be accidents -- which they can if one planted file carries
+# both.
+_ENVIRONMENT_ONLY = frozenset({OVERRIDE_ENV})
+
+# .env files already reported, so a run that resolves its configuration twice
+# (the interactive setup does) says so once.
+_ANNOUNCED_DOTENV: set[Path] = set()
+
+
+def _load_dotenv(path: Path) -> None:
+    """Apply this tool's settings from a ``.env``, and nothing else.
+
+    ``load_dotenv`` exports every key in the file, and the process then honours
+    them -- including ``HTTPS_PROXY`` and ``SSL_CERT_FILE``, which httpx reads by
+    default. Measured: a ``.env`` in the working directory setting those two
+    routed every request through a proxy of the file's choosing while trusting
+    a CA of its choosing, which reads the account's bearer token in cleartext
+    no matter which host ``WISPR_API_BASE`` names. ``XDG_CONFIG_HOME`` moved
+    the MCP refresh token into the working directory.
+
+    So only ``WISPR_*`` keys are applied, and never :data:`_ENVIRONMENT_ONLY`.
+    Anything else that genuinely needs setting -- a proxy, a CA bundle -- comes
+    from the real environment, where the operator put it on purpose. Ignored
+    keys are named on stderr, never their values, so a ``--json`` report on
+    stdout stays parseable.
+
+    Real environment variables still win: nothing here overwrites one.
+
+    Args:
+        path: The ``.env`` to read. Absent is fine.
+    """
+    if not path.is_file():
+        return
+    ignored: list[str] = []
+    for name, value in dotenv_values(path).items():
+        if value is None:
+            continue
+        if name.startswith("WISPR_") and name not in _ENVIRONMENT_ONLY:
+            os.environ.setdefault(name, value)
+        else:
+            ignored.append(name)
+    if ignored and path not in _ANNOUNCED_DOTENV:
+        _ANNOUNCED_DOTENV.add(path)
+        print(
+            f"  note         : ignored {', '.join(sorted(ignored))} in {path}; a "
+            f".env may only set WISPR_* options, and never {OVERRIDE_ENV}",
+            file=sys.stderr,
+        )
+
+
 def _flag(name: str, default: bool = False) -> bool:
     """Read a boolean environment variable.
 
@@ -163,14 +216,14 @@ def _int(name: str, default: int) -> int:
 def _config(args: argparse.Namespace) -> Config:
     """Build the configuration for this run.
 
-    Precedence is CLI flag > real environment > ``.env`` > default;
-    ``load_dotenv`` does not override an already-set variable, which is what
-    makes the middle two orderings hold.
+    Precedence is CLI flag > real environment > ``.env`` > default; the
+    ``.env`` never overrides an already-set variable, which is what makes the
+    middle two orderings hold.
 
-    The ``.env`` is read from the working directory and nowhere else. The
-    default search walks up to the filesystem root, which meant a file in any
-    ancestor directory could set ``WISPR_API_BASE`` -- see ``endpoints`` for
-    the measurement and for the check that now guards both remote base URLs.
+    The ``.env`` is read from the working directory and nowhere else -- the
+    default search walks up to the filesystem root, which let a file in any
+    ancestor set ``WISPR_API_BASE`` -- and only this tool's own settings are
+    taken from it. See :func:`_load_dotenv`.
 
     Args:
         args: Parsed arguments.
@@ -182,7 +235,7 @@ def _config(args: argparse.Namespace) -> Config:
         EndpointError: A configured base URL is not one a credential may be
             sent to.
     """
-    load_dotenv(dotenv_path=Path.cwd() / ".env")
+    _load_dotenv(Path.cwd() / ".env")
     allow_override = _flag(OVERRIDE_ENV)
     return Config(
         data_dir=getattr(args, "data_dir", None)

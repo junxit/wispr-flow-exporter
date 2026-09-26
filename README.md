@@ -302,11 +302,18 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
 See `.env.example` for the full set. Precedence is **CLI flag > environment >
 `.env` > default**.
 
+A `.env` is read from the working directory only, and only `WISPR_*` options
+are taken from it — never `WISPR_ALLOW_ENDPOINT_OVERRIDE`. Anything else in it
+(`HTTPS_PROXY`, `SSL_CERT_FILE`, `XDG_CONFIG_HOME`, …) is ignored and named on
+stderr, because those decide where the account's token travels and whom the
+connection trusts. Set them in the real environment if you need them; see
+[SECURITY.md](SECURITY.md).
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WISPR_DATA_DIR` | auto-detected | Wispr Flow application-support directory |
 | `WISPR_DB_PATH` | `<data dir>/flow.sqlite` | Database to read; point at a backup or Time Machine copy |
-| `WISPR_SYNC_SOURCE` | `auto` | `local`, `cloud`, `both`, `auto`. `auto` is local-only; the cloud backend is never reached without asking |
+| `WISPR_SYNC_SOURCE` | `all` | `all`, `local`, `cloud`, `mcp`, `both`, `auto`. `all` is local plus every remote backend that has a credential; `local` and `auto` never touch the network |
 | `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written |
 | `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
 | `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures |
