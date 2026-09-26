@@ -279,9 +279,13 @@ archive/
   superseded/<kind>/<key>/      # payloads a later version held less than
   cloud/                        # one verbatim response per endpoint
   mcp/                          # verbatim MCP responses, content-addressed
-    meetings/                   # meetings upstream has and the local store does not
+    meetings/2026/08/…--<uuid>/ # a meeting upstream has and the local store does not:
+      transcript.mcp.md         #   its transcript, when it has one
+      raw/meeting.json          #   the meeting, with the first range of its notes
+      raw/content/ raw/transcript/  # every range of each, verbatim
+      raw/manifest.json         #   how the ranges assemble
   meetings/…/transcript.mcp.md  # a transcript recovered when local had none
-  meetings/…/raw/mcp/           # its verbatim chunks and manifest
+  meetings/…/raw/mcp/           # its verbatim ranges and manifest
 ```
 
 Both backends record the Wispr Flow build that produced the archive

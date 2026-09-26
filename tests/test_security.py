@@ -703,3 +703,40 @@ def test_printable_marks_where_it_cut() -> None:
     """A cap on what a remote host can make the operator read."""
     assert printable("x" * 500, limit=10) == "x" * 9 + "…"
     assert printable("short", limit=10) == "short"
+
+
+def test_a_meeting_id_with_a_trailing_newline_is_not_a_meeting_id() -> None:
+    r"""``$`` matches before a trailing newline; ``\Z`` does not.
+
+    Measured on 0.4.1: an id ending in a newline passed the meeting-id check,
+    and a remote id is exactly where one could come from. The drift ledger's
+    safe-key check had the same hole.
+    """
+    from wispr_flow_exporter import drift
+    from wispr_flow_exporter.files_source import MEETING_DIR_RE
+
+    assert MEETING_DIR_RE.match(MEETING_A)
+    assert MEETING_DIR_RE.match(MEETING_A + "\n") is None
+    assert drift._SAFE_KEY.match("title")
+    assert drift._SAFE_KEY.match("title\n") is None
+
+
+def test_a_recovered_transcript_cannot_be_restructured_by_its_title(
+    tmp_path: Path,
+) -> None:
+    """Measured on 0.4.1: a title's newlines forged frontmatter in the body.
+
+    The frontmatter quoted it; the ``# heading`` line did not flatten it.
+    """
+    from wispr_flow_exporter.sync_mcp import _render_transcript
+
+    rendered = _render_transcript(
+        "hush", MEETING_A, TITLE_FRONTMATTER, mismatch=False
+    )
+
+    body = rendered.split("\n---\n", 1)[1].splitlines()
+    assert "---" not in body
+    assert not [line for line in body if line.startswith("title:")]
+    assert [line for line in body if line.startswith("#")] == [
+        "# --- title: injected ---"
+    ]

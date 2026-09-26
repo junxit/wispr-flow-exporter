@@ -43,9 +43,11 @@ ARTIFACT_NAMES = ("refined", "live", "observations", "audio")
 # Meeting directories are named with a canonical lowercase UUID. Anything else
 # in meetings/ is not a meeting -- notably the app's own .observations-tmp
 # staging directory -- and validating the name here is also what keeps an
-# unexpected entry from becoming a path component later.
+# unexpected entry from becoming a path component later. Anchored with \Z,
+# not $: $ also matches before a trailing newline, so an id with one used to
+# pass, and a remote id is not a name anyone chose with care.
 MEETING_DIR_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
 )
 
 

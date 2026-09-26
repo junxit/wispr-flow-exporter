@@ -262,3 +262,30 @@ def test_a_copy_does_not_write_through_a_symlink_at_its_temp_name(
         copy_file_secure(source, tmp_path / "media" / "upload.ogg")
 
     assert outside.read_bytes() == b"untouched"
+
+
+def test_a_lone_surrogate_is_written_escaped_not_raised(tmp_path: Path) -> None:
+    """Half a character is still archived, exactly, rather than crashing.
+
+    A server counting in UTF-16 can end a range between the two halves of an
+    emoji, and the half that arrives decodes to a lone surrogate, which UTF-8
+    cannot hold. JSON's escape can, so that one file is written escaped.
+    """
+    target = tmp_path / "range.json"
+    half = json.loads('"quiet \\ud83e"')
+
+    assert secure_io.write_json_if_changed(target, {"transcript": half})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"transcript": half}
+    assert not secure_io.write_json_if_changed(target, {"transcript": half})
+
+
+def test_an_ordinary_payload_is_written_exactly_as_before(tmp_path: Path) -> None:
+    """The escape is a fallback: readable UTF-8 stays readable, byte for byte."""
+    target = tmp_path / "plain.json"
+    payload = {"title": "Murmur & Hush — weekly", "chars": 3}
+
+    secure_io.write_json_if_changed(target, payload)
+
+    assert target.read_text(encoding="utf-8") == json.dumps(
+        payload, indent=2, ensure_ascii=False
+    )

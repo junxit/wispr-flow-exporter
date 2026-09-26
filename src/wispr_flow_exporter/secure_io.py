@@ -290,6 +290,12 @@ def write_text_if_changed(path: Path, text: str) -> bool:
 def write_json_if_changed(path: Path, payload: Any) -> bool:
     """Write JSON only when it differs from what is already there.
 
+    A value holding a lone surrogate -- half of a character that a server
+    counting in UTF-16 cut in two at the end of a range -- cannot be written as
+    UTF-8, and used to raise ``UnicodeEncodeError`` from the middle of a pass.
+    Such a value is written with JSON's own escapes instead, which keep it
+    exactly; everything else is written as before, byte for byte.
+
     Args:
         path: Destination file.
         payload: JSON-serializable value.
@@ -297,9 +303,12 @@ def write_json_if_changed(path: Path, payload: Any) -> bool:
     Returns:
         ``True`` when the file was written.
     """
-    return write_text_if_changed(
-        path, json.dumps(payload, indent=2, ensure_ascii=False, default=str)
-    )
+    text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = json.dumps(payload, indent=2, default=str)
+    return write_text_if_changed(path, text)
 
 
 def write_ndjson_if_changed(path: Path, records: Iterable[Any]) -> bool:

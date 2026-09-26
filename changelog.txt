@@ -312,6 +312,55 @@ wrapped at 72 columns, US English.
 - A test runs a whole MCP pass against a fake server and checks every
   request that reaches it: only the four allowlisted JSON-RPC methods,
   and only read tools.
+- Transcripts recovered over MCP are assembled from the server's own
+  continuation offsets. A range that is not the last ends with a marker
+  naming the offset to ask for next, and 0.4.1 advanced by the length of
+  what came back instead -- envelope and marker included. Measured: a
+  100,000-character transcript came back in three requests, at 40,211
+  and 80,422 where the server said 40,000 and 80,000, so 211 characters
+  were lost at each seam, and three envelope headers and two markers
+  were spliced into a transcript recorded as recovered. Assembly now
+  follows the marker and strips the envelope; a full range with no
+  marker, a missing envelope, or an offset that does not advance leaves
+  the transcript unrecovered with the reason printed; and an offset
+  that disagrees with the text is rendered with a warning but not
+  called recovered. A character split across two ranges -- as a server
+  counting UTF-16 units splits an emoji -- is assembled whole, and a
+  range holding half of one is archived with JSON escapes rather than
+  failing to write. Transcripts recovered by 0.4.x are fetched again
+  once; `sync --full` fetches them all again.
+- Meetings only the server has are archived whole. Measured on 0.4.1:
+  their notes stopped at 12,087 of 30,000 characters, the server's
+  default range; the transcript was never asked for; the directory was
+  "undated" because the listing's start time went unread; a retitle left
+  a second directory beside the first; and every run fetched every such
+  meeting again, with an unchanged run deleting the archived_at the
+  last one set. Every range of the notes and of the transcript is now
+  archived, with transcript.mcp.md beside them; a retitle moves the
+  directory; and a meeting whose listing has not changed costs no
+  request at all. Each is fetched in full once after upgrading.
+- An incremental MCP run finds what changed, not what started recently.
+  0.4.1 sent a `since` a week before its watermark, and `since` filters
+  on when a meeting started: measured, a June meeting whose notes were
+  edited in September was never listed again. The server lists most
+  recently modified first, so a run now reads from the top and stops
+  past the watermark -- checking the order as it goes, and reading to
+  the end if it is ever wrong. A listing the server caps at a thousand
+  results is narrowed by start time, window by window, as the server
+  itself advises, for at most 32 queries.
+- Smaller things in the MCP pass, each measured on 0.4.1: account info
+  was written once and never again, so a plan that changed from free to
+  pro stayed free -- it is now content-addressed; the derived meeting
+  index was rewritten from each run's own listing, so an incremental run
+  left it holding one of two meetings -- rows are now merged; a
+  recovery's facts were erased when the local transcript caught up,
+  leaving transcript.mcp.md on disk unmentioned by the index -- they are
+  kept; one meeting whose directory could not be written ended the pass
+  for every meeting after it -- it is now counted and the pass goes on;
+  and a title's newlines put forged frontmatter lines into the body of
+  transcript.mcp.md -- the heading is flattened. The meeting-id check
+  and the drift ledger's key check anchored with `$`, which accepted a
+  trailing newline; both use `\Z`.
 
 0.4.1
 -----

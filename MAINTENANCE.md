@@ -491,14 +491,48 @@ tool, absence from the table is what keeps it unreachable.
 
 ### 5. A listing that ends early
 
+`search_meetings` lists most recently modified first, and `since` and `until`
+bound when a meeting *started* — both measured, both published. So a first
+run, or `--full`, lists everything, and an incremental run lists from the top
+and stops at the first page older than the watermark less `recheck_days`. It
+checks the order as it reads, and if the server ever stops listing most
+recently modified first it reads to the end and says so.
+
 `mcp: meetings listing incomplete: …` after a run means the pass did not see
 every meeting, and it says why: a page could not be fetched (the call's own
 failure is printed too, with the server's reason), a page flagged more records
-without a cursor, the server repeated a cursor, or the server capped the
-listing with `truncated: true`, which no cursor recovers. The watermark does
-not move until a listing completes, so the next run asks again. A tool's own
-error — `isError` in the result — is always a failure with its reason, never
-archived as data.
+without a cursor, or the server repeated a cursor. A query the server capped
+with `truncated: true` — a thousand results — is narrowed rather than given up
+on: split by start time, a year at a time and then in halves, for at most 32
+queries. The watermark does not move until a listing completes, so the next
+run asks again. A tool's own error — `isError` in the result — is always a
+failure with its reason, never archived as data.
+
+### 6. Transcripts and notes, a range at a time
+
+`get_meeting` returns at most 40,000 characters of a transcript or of a
+meeting's notes per request. Measured, a transcript range arrives inside an
+envelope — a `<<<…>>>` line before it and `<<<END TRANSCRIPT>>>` after — and a
+range that is not the last ends with a marker:
+
+```
+(...truncated, 24383 chars remaining; continue with view_transcript.start_char=1...)
+```
+
+The next request always uses the offset that marker names, and neither the
+envelope nor the marker reaches the text. Every range is archived verbatim
+under the offset it was asked for, and the manifest records each range's
+length in code points and in UTF-16 units beside the offset the server named
+next. Assembly stops, and says why, when a full range arrives with no marker
+(the marker's format has changed: update `_MARKER` in `sync_mcp.py`), when the
+envelope is missing, or when an offset does not move forward. An offset that
+disagrees with the length of the range before it, in both units, is rendered
+with a warning but not recorded as recovered.
+
+Recoveries carry `assembly: 2`. One without it was assembled by 0.4.x's
+splicer, which lost characters at every seam, and is fetched again once.
+`sync --full` fetches every recovered transcript again, and is the repair
+path whenever one is in doubt.
 
 ## What cannot be reached
 

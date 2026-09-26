@@ -37,8 +37,9 @@ MAX_DEPTH = 6
 
 # A key that is part of the schema rather than part of the data. Anything else
 # -- a UUID, an email, a date used as a map key -- is collapsed, so an id can
-# never reach the state file through a key name.
-_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# never reach the state file through a key name. \Z rather than $, which would
+# also accept a key ending in a newline.
+_SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 _DYNAMIC = "<dynamic>"
 

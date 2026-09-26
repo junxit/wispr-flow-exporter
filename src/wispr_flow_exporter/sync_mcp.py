@@ -17,6 +17,15 @@ NDJSON has both. So local always wins where local has anything at all, the
 decision is made on what is actually on disk rather than on what the index
 claims, and the MCP rendering is a sibling file that never replaces a local one.
 
+**Ranges.** Transcripts and notes arrive a bounded range at a time, and a range
+that is not the last ends with the server's own marker naming the offset to
+ask for next. That offset is always the server's, never computed here, and
+the marker never reaches the text. Measured on 0.4.1, which advanced by the
+length of what came back, envelope and marker included: a 100,000-character
+transcript came back in three requests, 211 characters short at each seam,
+with three envelope headers and two markers spliced into it -- and was
+recorded as recovered.
+
 **Two ownership rules make a third writer safe**, and everything here follows
 from them:
 
@@ -38,13 +47,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from .files_source import MEETING_DIR_RE, read_transcript
 from .mcp_api import PAGE_SIZE, TRANSCRIPT_CHARS, McpProtocol
+from .render import inline
 from .secure_io import (
+    read_ndjson,
     write_json_if_changed,
     write_ndjson_if_changed,
     write_text_if_changed,
@@ -67,34 +81,88 @@ _CURSOR_FLAGS = ("next_cursor", "nextCursor")
 #: are not deterministic cannot make an unchanged listing look new every run.
 _PAGING_FIELDS = (*_CURSOR_FLAGS, "more")
 
+#: Where the search tools put their records.
+MEETING_KEYS = ("meetings", "results", "items")
+NOTE_KEYS = ("notes", "results", "items")
+
 #: Pages of one listing to follow before deciding the server is looping.
 MAX_PAGES = 64
+
+#: Queries one listing may spend narrowing past the server's result cap. A
+#: real account needs a few: a year of meetings rarely passes a thousand. A
+#: server that capped every window however narrow would otherwise be answered
+#: with a binary tree of queries -- measured against a fake that does, 8,191.
+MAX_WINDOWS = 32
 
 #: Refuse to assemble a transcript larger than this. Untrusted remote input
 #: gets a cap for the same reason the NDJSON reader has one.
 MAX_TRANSCRIPT_CHARS = 8_000_000
 
+#: Ranges of one transcript or note body to request before giving up.
+MAX_RANGES = 256
 
-def _iso_floor(watermark: Any, days: int) -> str | None:
-    """Compute how far back to re-read, in the encoding MCP expects.
+#: How this pass assembles a transcript. Recorded with every recovery, so one
+#: assembled by an older, wrong method is fetched again rather than trusted:
+#: version 1 was 0.4.x's splicer, which the module note describes.
+ASSEMBLY_VERSION = 2
 
-    ``sync._recheck_floor`` does the same job for the local backend but formats
-    for Sequelize's column text; MCP filters on ISO-8601, so reusing it would
-    send a timestamp the server cannot parse. The trailing window itself is
-    worth keeping: a meeting refined after it was first archived moves its
+#: The transcript envelope, as measured: a first line and a last line in
+#: triple angle brackets around the text. Matched by shape rather than wording,
+#: so a reworded warning still parses and a missing envelope does not.
+_ENVELOPE = re.compile(r"\A<<<[^\n]*>>>\n(?P<body>.*)\n<<<[^\n]*>>>\Z", re.DOTALL)
+
+#: The marker ending a range that is not the last, as measured for transcripts
+#: and as published for both views. Anchored at the end, so text that merely
+#: quotes a marker mid-range is text.
+_MARKER = re.compile(
+    r"\n\n\(\.\.\.truncated, (?P<remaining>\d+) chars remaining; continue with "
+    r"(?P<view>view_transcript|view_content)\.start_char=(?P<next>\d+)\.\.\.\)\Z"
+)
+
+#: The sub-key fields ``_decorate`` writes, in the order it writes them.
+_MCP_KEYS = (
+    "has_transcript",
+    "filled",
+    "reason",
+    "chars",
+    "sha256",
+    "chunks",
+    "assembly",
+    "modified_at",
+    "files",
+)
+
+#: What a recovery leaves behind. Kept when a later state is not a recovery --
+#: local catching up, say -- because the files it describes are still on disk.
+_RECOVERY_KEYS = ("chars", "sha256", "chunks", "assembly", "files")
+
+View = Literal["view_transcript", "view_content"]
+
+
+def _floor(watermark: Any, days: int) -> datetime | None:
+    """Compute how far back an incremental listing reads.
+
+    The search tools list most recently modified first, so an incremental run
+    reads until it passes this point and stops. The trailing window is worth
+    keeping: a meeting refined after it was first archived moves its
     modification time backwards relative to when this tool saw it.
+
+    ``since`` is deliberately not how the window is applied. Measured, and
+    published: it filters on when a meeting *started*, so 0.4.1's ``since``
+    of a week before the watermark never listed a June meeting whose notes
+    were edited in September.
 
     Args:
         watermark: The highest modification time archived so far.
         days: How many days to reach back.
 
     Returns:
-        An ISO-8601 lower bound, or ``None`` for everything.
+        The floor, or ``None`` for everything.
     """
     when = _parsed(watermark)
     if when is None:
         return None
-    return (when - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    return when - timedelta(days=days)
 
 
 def content_digest(payload: Any) -> str:
@@ -150,11 +218,14 @@ class Paging:
         records: Every record seen, in order.
         complete: Whether the listing ended the way a complete one does.
         reason: Why it is incomplete, for the operator; ``None`` when complete.
+        capped: Whether it ended at the server's result cap, which a
+            narrower query can get past.
     """
 
     records: list[dict[str, Any]]
     complete: bool
     reason: str | None = None
+    capped: bool = False
 
 
 def _page_digest(payload: Any) -> str:
@@ -286,6 +357,7 @@ def _fetch_pages(
     record_keys: tuple[str, ...],
     counts: SyncCounts,
     dry_run: bool = False,
+    enough: Callable[[Any], bool] | None = None,
 ) -> Paging:
     """Page one search tool to its end, archiving each page verbatim.
 
@@ -304,6 +376,8 @@ def _fetch_pages(
         record_keys: Candidate field names holding the record list.
         counts: Mutated with what was written.
         dry_run: Page as usual but write no page to disk.
+        enough: Says, after each page, whether the caller has read as far as
+            it needs to -- which is then as complete as it has to be.
 
     Returns:
         Every record seen, and whether the listing was complete.
@@ -328,8 +402,10 @@ def _fetch_pages(
         else:
             counts.unchanged += 1
         seen.extend(_records(payload, *record_keys))
+        if enough is not None and enough(payload):
+            return Paging(seen, True)
         if capped(payload):
-            return Paging(seen, False, "the server capped the listing")
+            return Paging(seen, False, "the server capped the listing", capped=True)
         cursor = _cursor(payload)
         if cursor is None:
             if more_pages(payload):
@@ -343,140 +419,421 @@ def _fetch_pages(
     return Paging(seen, False, f"the listing ran past {MAX_PAGES} pages")
 
 
-def _fetch_transcript(
-    client: McpProtocol, archive: Archive, directory: Any, meeting_id: str
-) -> dict[str, Any] | None:
-    """Fetch one meeting's transcript in bounded chunks, archiving each.
+def _iso(when: datetime) -> str:
+    """Format a time the way the search tools take it.
 
-    Every chunk is archived verbatim before anything is assembled, so a splice
-    that later turns out to be wrong is reconstructible from what is on disk.
-    The manifest is the commit point and is written last: an interrupted fetch
-    leaves correct chunks and no document claiming to be complete.
+    Args:
+        when: An aware time.
+
+    Returns:
+        ISO 8601 in UTC, ending ``Z``.
+    """
+    return when.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _unique(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeated meetings, keeping the first of each.
+
+    Args:
+        records: Search results, perhaps from overlapping queries.
+
+    Returns:
+        One record per id, in first-seen order.
+    """
+    seen: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for record in records:
+        key = str(record.get("id") or record.get("meeting_id") or "")
+        if key not in seen:
+            seen.add(key)
+            kept.append(record)
+    return kept
+
+
+@dataclass(slots=True)
+class _Budget:
+    """What is left of one listing's :data:`MAX_WINDOWS`."""
+
+    left: int = MAX_WINDOWS
+
+
+def _windowed(
+    client: McpProtocol,
+    archive: Archive,
+    *,
+    counts: SyncCounts,
+    dry_run: bool,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    budget: _Budget | None = None,
+) -> Paging:
+    """List every meeting starting in a window, narrowing it past the cap.
+
+    The server stops any one query at a thousand results and says so. The way
+    past that is its own advice -- narrow the query -- so a capped window is
+    split by start time and each half listed in turn: a bounded window halves,
+    and an open-ended one gives up its oldest part a year at a time.
 
     Args:
         client: An open MCP client.
         archive: The destination archive.
-        directory: Where to write, under ``raw/mcp/``.
-        meeting_id: The meeting to fetch.
+        counts: Mutated with what was written.
+        dry_run: Write no page to disk.
+        since: Earliest start time, inclusive; ``None`` for no bound.
+        until: Latest start time, exclusive; ``None`` for no bound.
+        budget: Queries left for this listing; a new listing gets its own.
 
     Returns:
-        The manifest, or ``None`` when the fetch did not complete.
+        Every meeting in the window, and whether that is all of them.
     """
-    chunks: list[dict[str, Any]] = []
-    text_parts: list[str] = []
-    start = 0
-    reported: int | None = None
+    budget = _Budget() if budget is None else budget
+    if budget.left <= 0:
+        return Paging(
+            [],
+            False,
+            f"the server capped the listing in every window of {MAX_WINDOWS} tried",
+        )
+    budget.left -= 1
+    arguments: dict[str, Any] = {"limit": PAGE_SIZE}
+    if since is not None:
+        arguments["since"] = _iso(since)
+    if until is not None:
+        arguments["until"] = _iso(until)
+    listing = _fetch_pages(
+        client,
+        archive,
+        "search_meetings",
+        arguments,
+        record_keys=MEETING_KEYS,
+        counts=counts,
+        dry_run=dry_run,
+    )
+    if not listing.capped:
+        return listing
+    now = datetime.now(tz=UTC)
+    if since is not None and until is not None:
+        pivot = since + (until - since) / 2
+    elif since is not None:
+        pivot = now if now > since else since + timedelta(days=365)
+    else:
+        pivot = (until or now) - timedelta(days=365)
+    halves = [
+        _windowed(
+            client,
+            archive,
+            counts=counts,
+            dry_run=dry_run,
+            since=low,
+            until=high,
+            budget=budget,
+        )
+        for low, high in ((pivot, until), (since, pivot))
+    ]
+    incomplete = [half for half in halves if not half.complete]
+    return Paging(
+        _unique([*listing.records, *(r for half in halves for r in half.records)]),
+        not incomplete,
+        incomplete[0].reason if incomplete else None,
+    )
 
-    for _ in range(256):
+
+class _Horizon:
+    """Stops a most-recently-modified-first listing once it is past a floor.
+
+    Checks the order as it goes. Measured, and published: the search tools
+    list most recently modified first. Should that ever stop being true, a
+    listing that stopped early would miss what it was meant to find, so the
+    first record out of order turns early stopping off for the rest of the
+    listing, which then reads to the end.
+    """
+
+    def __init__(self, floor: datetime) -> None:
+        """Remember where to stop.
+
+        Args:
+            floor: The oldest modification time this run needs.
+        """
+        self.floor = floor
+        self.last: datetime | None = None
+        self.ordered = True
+
+    def __call__(self, payload: Any) -> bool:
+        """Report whether a page has reached the floor.
+
+        Args:
+            payload: One listing page.
+
+        Returns:
+            ``True`` once the listing, still in order, is older than the floor.
+        """
+        for record in _records(payload, *MEETING_KEYS):
+            when = _parsed(record.get("modified_at") or record.get("modifiedAt"))
+            if when is None:
+                continue
+            if self.last is not None and when > self.last:
+                self.ordered = False
+            self.last = when
+        return self.ordered and self.last is not None and self.last < self.floor
+
+
+def _list_meetings(
+    client: McpProtocol,
+    archive: Archive,
+    *,
+    floor: datetime | None,
+    counts: SyncCounts,
+    dry_run: bool,
+    problems: list[str],
+) -> Paging:
+    """List the meetings this run needs to look at.
+
+    Args:
+        client: An open MCP client.
+        archive: The destination archive.
+        floor: For an incremental run, the oldest modification time needed;
+            ``None`` lists everything.
+        counts: Mutated with what was written.
+        dry_run: Write no page to disk.
+        problems: Receives anything worth telling the operator.
+
+    Returns:
+        The listed meetings, and whether the listing covered what was needed.
+    """
+    if floor is not None:
+        horizon = _Horizon(floor)
+        recent = _fetch_pages(
+            client,
+            archive,
+            "search_meetings",
+            {"limit": PAGE_SIZE},
+            record_keys=MEETING_KEYS,
+            counts=counts,
+            dry_run=dry_run,
+            enough=horizon,
+        )
+        if not horizon.ordered:
+            problems.append(
+                "the meetings listing was not most recently modified first, so "
+                "all of it was read"
+            )
+        if not recent.capped:
+            return recent
+        # More changed since the floor than one query will return. Rare, and
+        # the answer is the one a first run gets: everything, window by window.
+    return _windowed(client, archive, counts=counts, dry_run=dry_run)
+
+
+# --- ranges -----------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Assembled:
+    """A transcript or note body put back together from its ranges.
+
+    Attributes:
+        text: The assembled text.
+        chunks: What each range was: where it started, how long it was in
+            both units the server might count in, and where the server said
+            to continue.
+        first: The first range's whole reply.
+        complete: Whether the last range ended the way a last range does.
+        mismatch: Whether a continuation offset disagreed with the length of
+            the range before it, in either unit.
+        reason: Why assembly is incomplete; ``None`` when complete.
+    """
+
+    text: str
+    chunks: tuple[dict[str, Any], ...]
+    first: Any
+    complete: bool
+    mismatch: bool = False
+    reason: str | None = None
+
+    def summary(self) -> dict[str, Any]:
+        """Describe the assembly for a manifest, without the text itself.
+
+        Returns:
+            The facts a later run, or a reader, checks it against.
+        """
+        return {
+            "chars": len(self.text),
+            "sha256": hashlib.sha256(self.text.encode("utf-8")).hexdigest(),
+            "complete": self.complete,
+            "mismatch": self.mismatch,
+            "chunks": list(self.chunks),
+        }
+
+
+def _utf16_len(text: str) -> int:
+    """Count a text's length in UTF-16 code units, as JavaScript does.
+
+    Args:
+        text: The text.
+
+    Returns:
+        Its length in UTF-16 code units.
+    """
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _joined(parts: list[str]) -> str:
+    """Join ranges, rejoining any character a range boundary split in two.
+
+    A server that counts in UTF-16 units can end a range between the two
+    halves of a surrogate pair -- an emoji, say -- and each half then decodes
+    on its own. Concatenated, the halves are two code points, not one
+    character, and cannot even be encoded as UTF-8.
+
+    Args:
+        parts: The ranges' texts, in order.
+
+    Returns:
+        The text, with every split pair whole again.
+    """
+    return (
+        "".join(parts)
+        .encode("utf-16-le", "surrogatepass")
+        .decode("utf-16-le", errors="replace")
+    )
+
+
+def _range_text(payload: Any, view: View) -> str | None:
+    """Extract one range's raw text from a ``get_meeting`` reply.
+
+    Args:
+        payload: The decoded reply.
+        view: Which body was asked for.
+
+    Returns:
+        The text as sent, envelope and marker included, or ``None``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("transcript" if view == "view_transcript" else "content")
+    return value if isinstance(value, str) else None
+
+
+def _split_range(raw: str, view: View) -> tuple[str, int | None, int | None] | None:
+    """Split one range into its text and where the server says to continue.
+
+    Args:
+        raw: The range as sent.
+        view: Which body it belongs to.
+
+    Returns:
+        ``(text, next_start, remaining)``, with ``next_start`` ``None`` for a
+        last range; or ``None`` when a transcript's envelope, or a marker
+        for this view, is not where it should be.
+    """
+    body = raw
+    if view == "view_transcript":
+        envelope = _ENVELOPE.match(raw)
+        if envelope is None:
+            return None
+        body = envelope.group("body")
+    marker = _MARKER.search(body)
+    if marker is None:
+        return body, None, None
+    if marker.group("view") != view:
+        return None
+    following, remaining = int(marker.group("next")), int(marker.group("remaining"))
+    return body[: marker.start()], following, remaining
+
+
+def _fetch_ranges(
+    client: McpProtocol, meeting_id: str, view: View, sink: Path
+) -> Assembled | None:
+    """Fetch a transcript or note body a range at a time, archiving each.
+
+    Every range is archived verbatim, under the offset it was asked for,
+    before anything is assembled, so an assembly that later turns out to be
+    wrong is reconstructible from what is on disk.
+
+    The next offset is always the one the server's marker names. A range with
+    no marker is the last -- unless it is a full range, which means the
+    marker's format has changed and this cannot tell where the text goes on,
+    so the assembly is incomplete rather than silently short.
+
+    Args:
+        client: An open MCP client.
+        meeting_id: The meeting.
+        view: ``"view_transcript"`` or ``"view_content"``.
+        sink: The directory the ranges are archived in.
+
+    Returns:
+        The assembly, complete or not, or ``None`` when a request failed --
+        which the client has already recorded, with its reason.
+    """
+    parts: list[str] = []
+    chunks: list[dict[str, Any]] = []
+    first: Any = None
+    mismatch = False
+    start = 0
+    total = 0
+
+    def stopped(reason: str) -> Assembled:
+        return Assembled(_joined(parts), tuple(chunks), first, False, mismatch, reason)
+
+    for _ in range(MAX_RANGES):
         payload = client.call(
             "get_meeting",
             {
                 "meeting_id": meeting_id,
-                "view_transcript": {
-                    "start_char": start,
-                    "char_limit": TRANSCRIPT_CHARS,
-                },
+                view: {"start_char": start, "char_limit": TRANSCRIPT_CHARS},
             },
         )
         if payload is None:
             return None
-        name = f"{start:08d}"
-        write_json_if_changed(
-            directory / "raw" / "mcp" / "transcript" / f"{name}.json", payload,
-        )
-        text = _transcript_text(payload)
-        if reported is None:
-            reported = _transcript_total(payload)
-        if not text:
-            break
+        first = payload if first is None else first
+        write_json_if_changed(sink / f"{start:08d}.json", payload)
+        raw = _range_text(payload, view)
+        if raw is None:
+            return stopped("a reply carried no text for the requested range")
+        split = _split_range(raw, view)
+        if split is None:
+            return stopped("a reply's envelope or marker was not recognized")
+        text, following, remaining = split
+        chars, units = len(text), _utf16_len(text)
         chunks.append(
-            {"start_char": start, "chars": len(text), "file": f"transcript/{name}.json"}
+            {
+                "start_char": start,
+                "chars": chars,
+                "utf16": units,
+                "next_start_char": following,
+                "remaining": remaining,
+                "file": f"{sink.name}/{start:08d}.json",
+            }
         )
-        text_parts.append(text)
-        # Advance by what came back, never by what was asked for: the two
-        # differ on the last page, and assuming otherwise drops characters.
-        start += len(text)
-        if len(text) < TRANSCRIPT_CHARS:
-            break
-        if sum(len(part) for part in text_parts) > MAX_TRANSCRIPT_CHARS:
-            return None
-
-    assembled = "".join(text_parts)
-    if not assembled:
-        return None
-    # A reported total that disagrees with what was assembled means the
-    # transcript moved underneath the paging, or the offsets do not mean what
-    # this client assumes. Either way, refuse to claim it is complete.
-    mismatch = reported is not None and reported != len(assembled)
-    return {
-        "tool": "get_meeting.view_transcript",
-        "meeting_id": meeting_id,
-        "chars": len(assembled),
-        "sha256": hashlib.sha256(assembled.encode("utf-8")).hexdigest(),
-        "chunks": chunks,
-        "reported_total": reported,
-        "assembly_mismatch": mismatch,
-        "text": assembled,
-    }
+        parts.append(text)
+        total += chars
+        if total > MAX_TRANSCRIPT_CHARS:
+            return stopped(f"longer than {MAX_TRANSCRIPT_CHARS} characters")
+        if following is None:
+            if max(chars, units) >= TRANSCRIPT_CHARS:
+                return stopped("a full range arrived without a continuation marker")
+            return Assembled(_joined(parts), tuple(chunks), first, True, mismatch)
+        if following <= start:
+            return stopped("the continuation offset did not move forward")
+        # Either unit may be the server's; anything else means the offsets
+        # do not mean what they appear to, and the text is suspect.
+        mismatch |= following - start not in (chars, units)
+        start = following
+    return stopped(f"more than {MAX_RANGES} ranges")
 
 
-def _transcript_text(payload: Any) -> str:
-    """Extract the transcript text from a get_meeting response.
-
-    Args:
-        payload: A decoded response.
-
-    Returns:
-        The text, or an empty string when the response carried none.
-    """
-    if not isinstance(payload, dict):
-        return ""
-    for key in ("transcript", "transcript_text"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
-        if isinstance(value, dict):
-            for inner in ("text", "content"):
-                nested = value.get(inner)
-                if isinstance(nested, str):
-                    return nested
-    return ""
-
-
-def _transcript_total(payload: Any) -> int | None:
-    """Extract a reported total character count, when the server sends one.
-
-    Args:
-        payload: A decoded response.
-
-    Returns:
-        The total, or ``None``.
-    """
-    if not isinstance(payload, dict):
-        return None
-    value = payload.get("transcript")
-    if isinstance(value, dict):
-        for key in ("total_chars", "total", "length"):
-            nested = value.get(key)
-            if isinstance(nested, int):
-                return nested
-    for key in ("transcript_total_chars", "transcript_chars"):
-        total = payload.get(key)
-        if isinstance(total, int):
-            return total
-    return None
-
-
-def _render_transcript(manifest: dict[str, Any], meeting_id: str, title: str) -> str:
-    """Render the recovered transcript as a sibling document.
+def _render_transcript(
+    text: str, meeting_id: str, title: str, *, mismatch: bool
+) -> str:
+    """Render a recovered transcript as a sibling document.
 
     Frontmatter says plainly where it came from and what it is missing, so
     nobody mistakes it for the local rendering.
 
     Args:
-        manifest: The assembled manifest.
+        text: The assembled transcript.
         meeting_id: The meeting id.
         title: The meeting title.
+        mismatch: Whether assembly found offsets it could not account for.
 
     Returns:
         Markdown.
@@ -489,11 +846,11 @@ def _render_transcript(manifest: dict[str, Any], meeting_id: str, title: str) ->
         "carries\n> no speaker attribution and no timestamps, which the local "
         "NDJSON does.\n"
     )
-    if manifest.get("assembly_mismatch"):
+    if mismatch:
         warning += (
-            ">\n> **The server's reported length disagreed with what was "
-            "assembled.**\n> Treat this text as possibly incomplete; the "
-            "verbatim chunks are under `raw/mcp/`.\n"
+            ">\n> **The server's continuation offsets disagreed with the lengths "
+            "of the\n> ranges it sent.** Treat this text as possibly incomplete; "
+            "the verbatim\n> ranges are archived beside it.\n"
         )
     head = yaml_block(
         {
@@ -502,11 +859,14 @@ def _render_transcript(manifest: dict[str, Any], meeting_id: str, title: str) ->
             "source": SOURCE_MCP,
             "kind": "transcript",
             "fidelity": "normalized-plaintext",
-            "chars": manifest["chars"],
+            "chars": len(text),
             "tags": ["wispr/transcript", "wispr/recovered"],
         }
     )
-    return f"{head}\n# {title or meeting_id}\n\n{warning}\n{manifest['text'].strip()}\n"
+    # Flattened: the title is remote input, and a newline in it would
+    # otherwise put a forged frontmatter block into the body.
+    heading = inline(title, fallback=meeting_id)
+    return f"{head}\n# {heading}\n\n{warning}\n{text.strip()}\n"
 
 
 def sync_mcp(
@@ -535,31 +895,31 @@ def sync_mcp(
     account = client.call("get_account_info", {})
     if account is not None:
         counts.scanned += 1
+        # Content-addressed: a fixed name, existence-gated, kept the first
+        # answer forever. Measured on 0.4.1: a plan that changed from free
+        # to pro was still archived as free.
         if _archive_verbatim(
-            archive, "get_account_info", "account", account, dry_run=options.dry_run
+            archive,
+            "get_account_info",
+            content_digest(account)[:16],
+            account,
+            dry_run=options.dry_run,
         ):
             counts.written += 1
         else:
             counts.unchanged += 1
 
     watermark = archive.watermark(SOURCE_MCP, "meetings")
-    since = None if options.full else _iso_floor(watermark, options.recheck_days)
-    arguments: dict[str, Any] = {"limit": PAGE_SIZE}
-    if since:
-        # `since` only. A moving `until=now` echoed back into a response would
-        # give every page a fresh digest and rewrite the archive every run.
-        arguments["since"] = since
-
-    listing = _fetch_pages(
+    floor = None if options.full else _floor(watermark, options.recheck_days)
+    listing = _list_meetings(
         client,
         archive,
-        "search_meetings",
-        arguments,
-        record_keys=("meetings", "results", "items"),
+        floor=floor,
         counts=counts,
         dry_run=options.dry_run,
+        problems=problems,
     )
-    meetings = listing.records
+    meetings = _unique(listing.records)
     if not listing.complete:
         counts.failed += 1
         problems.append(f"meetings listing incomplete: {listing.reason}")
@@ -578,84 +938,26 @@ def sync_mcp(
         modified = record.get("modified_at") or record.get("modifiedAt")
         if isinstance(modified, str) and (highest is None or modified > str(highest)):
             highest = modified
-
-        entry = archive.entry("meetings", meeting_id)
-        if entry is None:
-            _archive_upstream_only(archive, client, record, meeting_id, counts, now)
-            continue
-
-        directory = archive.existing_path("meetings", meeting_id)
-        has_upstream = bool(record.get("has_transcript"))
-        state_of_local = local_transcript_state(directory)
-
-        if state_of_local == "present" or not has_upstream or directory is None:
-            # Record the fact and spend no request on it. "Gone from both
-            # sides" is worth being able to prove, in the same spirit as
-            # recording localDataPolicy.
-            _decorate(
-                archive,
-                meeting_id,
-                {
-                    "has_transcript": has_upstream,
-                    "filled": False,
-                    "reason": "local_transcript_present"
-                    if state_of_local == "present"
-                    else "no_transcript_upstream",
-                    "modified_at": modified,
-                },
-            )
-            counts.unchanged += 1
-            continue
-
-        existing = (entry.get("mcp") or {}) if isinstance(entry.get("mcp"), dict) else {}
-        if existing.get("filled") and existing.get("modified_at") == modified:
-            # Already recovered and nothing moved upstream. Transcripts are the
-            # expensive calls; this is the guard that keeps a re-run cheap as
-            # well as byte-identical.
-            counts.unchanged += 1
-            continue
-
-        counts.scanned += 1
-        manifest = _fetch_transcript(client, archive, directory, meeting_id)
-        if manifest is None:
+        try:
+            if archive.entry("meetings", meeting_id) is None:
+                _archive_upstream_only(
+                    archive, client, record, meeting_id, counts, now, options, problems
+                )
+            else:
+                _fill_gap(archive, client, record, meeting_id, counts, options, problems)
+        except OSError as error:
+            # One meeting that cannot be written is that meeting's failure.
+            # Measured on 0.4.1: it ended the pass, and every meeting after it
+            # went unarchived.
             counts.failed += 1
-            continue
-
-        title = str(record.get("title") or entry.get("title") or "")
-        text = manifest.pop("text")
-        wrote = write_json_if_changed(
-            directory / "raw" / "mcp" / "manifest.json", manifest
-        )
-        wrote |= write_text_if_changed(
-            directory / "transcript.mcp.md",
-            _render_transcript({**manifest, "text": text}, meeting_id, title),
-        )
-        _decorate(
-            archive,
-            meeting_id,
-            {
-                "has_transcript": True,
-                "filled": True,
-                "reason": "transcript_deleted_upstream"
-                if entry.get("transcript_deleted_upstream")
-                else "no_local_transcript",
-                "chars": manifest["chars"],
-                "sha256": manifest["sha256"],
-                "chunks": len(manifest["chunks"]),
-                "assembly_mismatch": manifest["assembly_mismatch"] or None,
-                "modified_at": modified,
-                "files": ["raw/mcp/manifest.json", "transcript.mcp.md"],
-            },
-        )
-        counts.written += 1 if wrote else 0
-        counts.unchanged += 0 if wrote else 1
+            problems.append(f"meeting {meeting_id}: {error.strerror or error}")
 
     notes = _fetch_pages(
         client,
         archive,
         "search_scratchpad_notes",
         {"limit": PAGE_SIZE},
-        record_keys=("notes", "results", "items"),
+        record_keys=NOTE_KEYS,
         counts=counts,
     )
     if not notes.complete:
@@ -663,7 +965,7 @@ def sync_mcp(
         problems.append(f"notes listing incomplete: {notes.reason}")
 
     index = archive.resolve(ENTITY_MCP, "meetings.index.ndjson")
-    if write_ndjson_if_changed(index, _summaries(meetings)):
+    if write_ndjson_if_changed(index, _merged_summaries(index, meetings)):
         counts.written += 1
 
     if not counts.failed and highest and highest != watermark:
@@ -673,41 +975,197 @@ def sync_mcp(
     return counts
 
 
-def _summaries(meetings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build the sorted derived index of what MCP reported.
+def _fill_gap(
+    archive: Archive,
+    client: McpProtocol,
+    record: dict[str, Any],
+    meeting_id: str,
+    counts: SyncCounts,
+    options: SyncOptions,
+    problems: list[str],
+) -> None:
+    """Recover the transcript of a local meeting whose archive has none.
 
     Args:
-        meetings: Every meeting record seen this pass.
+        archive: The destination archive.
+        client: An open MCP client.
+        record: The meeting's search result.
+        meeting_id: The validated meeting id.
+        counts: Mutated with what was done.
+        options: What this run was asked to do.
+        problems: Receives why a recovery is incomplete.
+    """
+    entry = archive.entry("meetings", meeting_id) or {}
+    modified = record.get("modified_at") or record.get("modifiedAt")
+    directory = archive.existing_path("meetings", meeting_id)
+    has_upstream = bool(record.get("has_transcript"))
+    state_of_local = local_transcript_state(directory)
+
+    if state_of_local == "present" or not has_upstream or directory is None:
+        # Record the fact and spend no request on it. "Gone from both sides"
+        # is worth being able to prove, in the same spirit as recording
+        # localDataPolicy.
+        _decorate(
+            archive,
+            meeting_id,
+            {
+                "has_transcript": has_upstream,
+                "filled": False,
+                "reason": "local_transcript_present"
+                if state_of_local == "present"
+                else "no_transcript_upstream",
+                "modified_at": modified,
+            },
+        )
+        counts.unchanged += 1
+        return
+
+    recorded = entry.get("mcp")
+    existing: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
+    if (
+        not options.full
+        and existing.get("filled")
+        and existing.get("modified_at") == modified
+        and existing.get("assembly") == ASSEMBLY_VERSION
+    ):
+        # Already recovered, by this assembly, and nothing moved upstream.
+        # Transcripts are the expensive calls; this is the guard that keeps a
+        # re-run cheap as well as byte-identical. One assembled by the old
+        # splicer is fetched again, once; --full fetches any of them again.
+        counts.unchanged += 1
+        return
+
+    counts.scanned += 1
+    sink = directory / "raw" / "mcp" / "transcript"
+    assembled = _fetch_ranges(client, meeting_id, "view_transcript", sink)
+    if assembled is None:
+        counts.failed += 1
+        return
+    if not assembled.complete:
+        # The ranges stay on disk; nothing claims to be the transcript, and
+        # whatever an earlier run recovered is left exactly as it was.
+        counts.failed += 1
+        problems.append(f"transcript of {meeting_id} incomplete: {assembled.reason}")
+        return
+
+    title = str(record.get("title") or entry.get("title") or "")
+    summary = assembled.summary()
+    manifest = {
+        "tool": "get_meeting.view_transcript",
+        "meeting_id": meeting_id,
+        "assembly": ASSEMBLY_VERSION,
+        **summary,
+    }
+    wrote = write_json_if_changed(directory / "raw" / "mcp" / "manifest.json", manifest)
+    wrote |= write_text_if_changed(
+        directory / "transcript.mcp.md",
+        _render_transcript(
+            assembled.text, meeting_id, title, mismatch=assembled.mismatch
+        ),
+    )
+    if assembled.mismatch:
+        reason = "assembly_mismatch"
+    elif entry.get("transcript_deleted_upstream"):
+        reason = "transcript_deleted_upstream"
+    else:
+        reason = "no_local_transcript"
+    _decorate(
+        archive,
+        meeting_id,
+        {
+            "has_transcript": True,
+            # Rendered, with its warning, but never called recovered: offsets
+            # that disagree with the text are not a transcript to rely on.
+            "filled": not assembled.mismatch,
+            "reason": reason,
+            "chars": summary["chars"],
+            "sha256": summary["sha256"],
+            "chunks": len(assembled.chunks),
+            "assembly": ASSEMBLY_VERSION,
+            "modified_at": modified,
+            "files": ["raw/mcp/manifest.json", "transcript.mcp.md"],
+        },
+    )
+    counts.written += 1 if wrote else 0
+    counts.unchanged += 0 if wrote else 1
+
+
+def _summaries(meetings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build one compact row per meeting MCP reported.
+
+    Args:
+        meetings: Meeting records seen this pass.
 
     Returns:
-        One compact row per meeting, sorted by id so the file is stable.
+        One row per valid id.
     """
-    rows = {
-        str(record.get("id") or record.get("meeting_id") or ""): {
-            "id": str(record.get("id") or record.get("meeting_id") or ""),
-            "title": record.get("title"),
-            "has_transcript": bool(record.get("has_transcript")),
-            "modified_at": record.get("modified_at") or record.get("modifiedAt"),
-        }
-        for record in meetings
-    }
-    rows.pop("", None)
+    rows = []
+    for record in meetings:
+        key = str(record.get("id") or record.get("meeting_id") or "")
+        if MEETING_DIR_RE.match(key):
+            rows.append(
+                {
+                    "id": key,
+                    "title": record.get("title"),
+                    "has_transcript": bool(record.get("has_transcript")),
+                    "modified_at": record.get("modified_at") or record.get("modifiedAt"),
+                }
+            )
+    return rows
+
+
+def _merged_summaries(
+    path: Path, meetings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge this pass's rows into the derived index, sorted by id.
+
+    An incremental run lists only what changed recently, and rewriting the
+    index from that alone emptied it of everything else. Measured on 0.4.1:
+    after an incremental run it listed one of the account's two meetings.
+
+    Args:
+        path: The index file.
+        meetings: Meeting records seen this pass.
+
+    Returns:
+        Every meeting either one knows of, the newer row winning.
+    """
+    rows: dict[str, dict[str, Any]] = {}
+    earlier, _ = read_ndjson(path)
+    for row in earlier:
+        key = row.get("id")
+        if isinstance(key, str) and MEETING_DIR_RE.match(key):
+            rows[key] = row
+    for row in _summaries(meetings):
+        rows[row["id"]] = row
     return [rows[key] for key in sorted(rows)]
 
 
 def _decorate(archive: Archive, meeting_id: str, mcp: dict[str, Any]) -> None:
     """Write the one reserved field this pass may add to a meetings entry.
 
-    Built as a single dict so key order is fixed. ``write_json`` does not sort
-    keys, so a conditionally-assembled sub-dict would reorder between runs and
-    churn ``index.json`` with identical content.
+    Written in a fixed key order: ``write_json`` does not sort keys, so a
+    conditionally assembled sub-dict would reorder between runs and churn
+    ``index.json`` with identical content. And a state that is not itself a
+    recovery keeps the last recovery's facts -- measured on 0.4.1, local
+    catching up erased them, leaving a ``transcript.mcp.md`` on disk that the
+    index no longer mentioned.
 
     Args:
         archive: The destination archive.
         meeting_id: The meeting key.
-        mcp: The sub-dict to store.
+        mcp: The new state.
     """
-    archive.put("meetings", meeting_id, mcp={k: v for k, v in mcp.items() if v is not None})
+    entry = archive.entry("meetings", meeting_id) or {}
+    recorded = entry.get("mcp")
+    previous: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
+    if "files" not in mcp:
+        mcp = {**{k: previous[k] for k in _RECOVERY_KEYS if k in previous}, **mcp}
+    archive.put(
+        "meetings",
+        meeting_id,
+        mcp={key: mcp[key] for key in _MCP_KEYS if mcp.get(key) is not None},
+    )
 
 
 def _archive_upstream_only(
@@ -717,6 +1175,8 @@ def _archive_upstream_only(
     meeting_id: str,
     counts: SyncCounts,
     now: str,
+    options: SyncOptions,
+    problems: list[str],
 ) -> None:
     """Archive a meeting the local store does not have, under ``mcp/``.
 
@@ -725,36 +1185,106 @@ def _archive_upstream_only(
     healthy archive report a mismatch on every run -- and would set up a real
     collision the day the meeting finally syncs to the local store.
 
+    The whole meeting is archived: every range of its notes, and every range
+    of its transcript when it has one. Measured on 0.4.1, which asked once
+    with no range: notes stopped at 12,000 characters, the transcript was
+    never asked for, the directory was ``undated`` because the listing's
+    ``start`` went unread, a retitle left a second directory beside the
+    first, and every run fetched every such meeting again.
+
     Args:
         archive: The destination archive.
         client: An open MCP client.
         record: The search result.
         meeting_id: The validated meeting id.
-        counts: Mutated with what was written.
+        counts: Mutated with what was done.
         now: This run's timestamp.
+        options: What this run was asked to do.
+        problems: Receives why an archive is incomplete.
     """
-    detail = client.call("get_meeting", {"meeting_id": meeting_id})
-    if detail is None:
-        counts.failed += 1
+    listing_hash = content_digest(record)[:16]
+    entry = archive.entry(ENTITY_MCP_MEETINGS, meeting_id) or {}
+    current = archive.existing_path(ENTITY_MCP_MEETINGS, meeting_id)
+    if (
+        not options.full
+        and entry.get("listing_hash") == listing_hash
+        and entry.get("assembly") == ASSEMBLY_VERSION
+        and current is not None
+        and current.is_dir()
+    ):
+        # Nothing the listing says about it has moved: no request at all.
+        counts.unchanged += 1
         return
-    counts.scanned += 1
-    when = _parsed(record.get("start_time") or record.get("created_at"))
+
+    when = _parsed(
+        record.get("start") or record.get("start_time") or record.get("created_at")
+    )
     directory = archive.resolve(
         ENTITY_MCP,
         "meetings",
         dated_prefix(when),
         record_dir_name(when, record.get("title"), meeting_id),
     )
-    wrote = write_json_if_changed(directory / "raw" / "meeting.json", detail)
-    archive.put(
-        ENTITY_MCP_MEETINGS,
-        meeting_id,
-        path=archive.relative(directory),
-        title=record.get("title"),
-        source=SOURCE_MCP,
-        upstream_only=True,
-        archived_at=now if wrote else None,
+    # A retitle moves the meeting rather than starting a second one.
+    archive.relocate(ENTITY_MCP_MEETINGS, meeting_id, directory)
+
+    counts.scanned += 1
+    content = _fetch_ranges(
+        client, meeting_id, "view_content", directory / "raw" / "content"
     )
+    if content is None:
+        counts.failed += 1
+        return
+    wrote = write_json_if_changed(directory / "raw" / "meeting.json", content.first)
+    transcript = None
+    unanswered = False
+    if record.get("has_transcript"):
+        transcript = _fetch_ranges(
+            client, meeting_id, "view_transcript", directory / "raw" / "transcript"
+        )
+        # A failed request is already on record, with the server's reason.
+        unanswered = transcript is None
+    incomplete = [part for part in (content, transcript) if part and not part.complete]
+    for part in incomplete:
+        problems.append(f"meeting {meeting_id} incomplete: {part.reason}")
+
+    manifest = {
+        "meeting_id": meeting_id,
+        "assembly": ASSEMBLY_VERSION,
+        "content": content.summary(),
+        "transcript": transcript.summary() if transcript else None,
+    }
+    wrote |= write_json_if_changed(directory / "raw" / "manifest.json", manifest)
+    if transcript is not None and transcript.complete:
+        wrote |= write_text_if_changed(
+            directory / "transcript.mcp.md",
+            _render_transcript(
+                transcript.text,
+                meeting_id,
+                str(record.get("title") or ""),
+                mismatch=transcript.mismatch,
+            ),
+        )
+
+    fields: dict[str, Any] = {
+        "path": archive.relative(directory),
+        "title": record.get("title"),
+        "source": SOURCE_MCP,
+        "upstream_only": True,
+    }
+    if incomplete or unanswered:
+        counts.failed += 1
+    else:
+        # Recorded only once everything is archived, so an incomplete meeting
+        # is asked for again next run rather than skipped as unchanged.
+        fields["listing_hash"] = listing_hash
+        fields["assembly"] = ASSEMBLY_VERSION
+    if wrote:
+        # Only on a write. Passing None here would delete the timestamp the
+        # last write set -- which is how every unchanged run used to churn
+        # index.json.
+        fields["archived_at"] = now
+    archive.put(ENTITY_MCP_MEETINGS, meeting_id, **fields)
     counts.written += 1 if wrote else 0
     counts.unchanged += 0 if wrote else 1
 

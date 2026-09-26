@@ -92,7 +92,8 @@ class McpTool:
 READ_TOOLS: Mapping[str, McpTool] = {
     "get_account_info": McpTool("Identity, to tell the owner from other attendees."),
     "search_meetings": McpTool(
-        "Lists meetings newest first, filtered by `since` on modifiedAt.",
+        "Lists meetings most recently modified first; `since` and `until` "
+        "bound when a meeting started, not when it changed.",
         paginated=True,
     ),
     "get_meeting": McpTool("Notes, summary, todos, attendees and the transcript."),
