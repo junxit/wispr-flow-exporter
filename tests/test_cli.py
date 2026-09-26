@@ -1159,3 +1159,17 @@ def test_the_documented_all_still_means_every_entity(
     monkeypatch.setenv("WISPR_ENTITIES", "all")
 
     assert _entities(argparse.Namespace(only=None, skip=None)) == ENTITIES
+
+
+def test_a_path_from_outside_is_printed_as_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configured path can carry terminal escapes; they arrive as text."""
+    elsewhere = tmp_path / "wispr\x1b[2J"
+
+    code = main(["sync", "--source", "local", "--data-dir", str(elsewhere)])
+
+    out = capsys.readouterr().out
+    assert code == EXIT_SOURCE_UNREACHABLE
+    assert "\x1b" not in out
+    assert "wispr\\x1b[2J" in out

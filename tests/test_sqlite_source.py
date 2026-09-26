@@ -532,3 +532,22 @@ def test_source_is_reusable_after_exit(wispr_db: Callable[..., Path]) -> None:
         assert reader.row_count("Meetings") == 0
     with reader:
         assert reader.row_count("Meetings") == 0
+
+
+def test_a_percent_sign_in_the_path_opens_that_database(tmp_path: Path) -> None:
+    """SQLite decodes a URI's path, so a literal % has to be escaped.
+
+    Measured on 0.4.1: pointed at "backups 100%41/flow.sqlite", it read
+    "backups 100A/flow.sqlite" -- another database, and no error.
+    """
+    for name, label in (("backups 100%41", "asked for"), ("backups 100A", "another")):
+        path = tmp_path / name / "flow.sqlite"
+        path.parent.mkdir()
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE which (label TEXT)")
+            connection.execute("INSERT INTO which VALUES (?)", (label,))
+
+    with open_source(tmp_path / "backups 100%41" / "flow.sqlite", immutable=True) as source:
+        row = source.connection.execute("SELECT label FROM which").fetchone()
+
+    assert row[0] == "asked for"

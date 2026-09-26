@@ -22,6 +22,7 @@ the archive rather than inferred from a zero row count.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -331,19 +332,39 @@ def read_session(path: Path) -> SessionInfo:
     if not session:
         return SessionInfo(present=False, project_ref=project_ref)
 
-    expires_at: datetime | None = None
-    raw_expiry = session.get("expires_at")
-    if isinstance(raw_expiry, (int, float)) and not isinstance(raw_expiry, bool):
-        expires_at = datetime.fromtimestamp(raw_expiry, tz=UTC)
-
     user = _mapping(session.get("user"))
     return SessionInfo(
         present=True,
         project_ref=project_ref,
         user_id=user.get("id"),
         email=user.get("email"),
-        expires_at=expires_at,
+        expires_at=_expiry(session.get("expires_at")),
     )
+
+
+def _expiry(raw: Any) -> datetime | None:
+    """Read a session's expiry, whatever form it arrives in.
+
+    Supabase records seconds. A value too large to be seconds is read as
+    milliseconds, which is how JavaScript writes times; one that is not a
+    finite number is unknown -- and an unknown expiry is expired. Measured on
+    0.4.1: a millisecond value, or an infinite or NaN one, raised from inside
+    ``datetime`` and stopped a local sync that never needed the session to
+    archive anything.
+
+    Args:
+        raw: The ``expires_at`` value as stored.
+
+    Returns:
+        When the token expires, or ``None`` when that cannot be read.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not math.isfinite(raw):
+        return None
+    seconds = raw / 1000 if raw > 10**11 else raw
+    try:
+        return datetime.fromtimestamp(seconds, tz=UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def read_access_token(path: Path) -> str | None:

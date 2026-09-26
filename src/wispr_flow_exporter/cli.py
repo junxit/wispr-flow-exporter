@@ -183,8 +183,9 @@ def _load_dotenv(path: Path) -> None:
     if ignored and path not in _ANNOUNCED_DOTENV:
         _ANNOUNCED_DOTENV.add(path)
         print(
-            f"  note         : ignored {', '.join(sorted(ignored))} in {path}; a "
-            f".env may only set WISPR_* options, and never {OVERRIDE_ENV}",
+            "  note         : ignored "
+            + _shown(f"{', '.join(sorted(ignored))} in {path}")
+            + f"; a .env may only set WISPR_* options, and never {OVERRIDE_ENV}",
             file=sys.stderr,
         )
 
@@ -453,6 +454,21 @@ def _drift_exit(kind: DriftClass, strict: bool) -> int:
     return EXIT_OK
 
 
+def _shown(text: object) -> str:
+    """Make text from outside this program safe to print.
+
+    The sink ``_say`` applies, for the lines that do not go through it: an
+    error naming a configured value, a ``.env`` key, a URL.
+
+    Args:
+        text: What is about to be printed.
+
+    Returns:
+        It, with credentials redacted and control characters shown as escapes.
+    """
+    return redact(printable(str(text)))
+
+
 def _say(label: str, value: str) -> None:
     """Print one aligned diagnostic line, redacted.
 
@@ -656,13 +672,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
     backends = _backends(config.source)
     runs_local = SOURCE_LOCAL in backends
     if runs_local and not resolved.db.exists():
-        print(f"  no Wispr Flow database at {resolved.db}")
+        print(f"  no Wispr Flow database at {_shown(resolved.db)}")
         return EXIT_SOURCE_UNREACHABLE
 
     try:
         entities = _entities(args)
     except ValueError as error:
-        print(f"  {error}", file=sys.stderr)
+        print(f"  {_shown(error)}", file=sys.stderr)
         return EXIT_USAGE
 
     options = SyncOptions(
@@ -688,7 +704,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         with archive.lock():
             return _sync_passes(args, config, resolved, archive, options, entities)
     except ArchiveBusy as error:
-        print(f"  {error}", file=sys.stderr)
+        print(f"  {_shown(error)}", file=sys.stderr)
         return EXIT_FAILURE
 
 
@@ -733,7 +749,7 @@ def _sync_passes(
                 ),
             )
     except SourceError as error:
-        print(f"  source unreadable: {redact(str(error))}")
+        print(f"  source unreadable: {_shown(error)}")
         return EXIT_SOURCE_UNREACHABLE
 
     explicit = config.source not in (SOURCE_ALL, SOURCE_AUTO)
@@ -1090,7 +1106,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     try:
         with open_client() as client:
             credential = login(
-                client, endpoint, announce=lambda line: print(line, flush=True)
+                client, endpoint, announce=lambda line: print(_shown(line), flush=True)
             )
     except McpAuthError as error:
         _say("failed", redact(str(error)))
@@ -1533,7 +1549,7 @@ def cmd_render(args: argparse.Namespace) -> int:
             if not options.dry_run:
                 archive.save()
     except ArchiveBusy as error:
-        print(f"  {error}", file=sys.stderr)
+        print(f"  {_shown(error)}", file=sys.stderr)
         return EXIT_FAILURE
     for entity, counts in results.items():
         _say("", counts.line(entity))
@@ -1748,7 +1764,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {error}")
             return EXIT_OK if str(error) == "cancelled" else EXIT_FAILURE
         except ConfigError as error:
-            print(f"  {error}", file=sys.stderr)
+            print(f"  {_shown(error)}", file=sys.stderr)
             return EXIT_USAGE
         return main(answers.to_argv())
 
@@ -1774,12 +1790,12 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except EndpointError as error:
         # Refused before any request, so the token was never attached to it.
-        print(f"  {error}")
+        print(f"  {_shown(error)}")
         return EXIT_FAILURE
     except ConfigError as error:
         # Said and stopped, rather than guessed at: a value this tool does not
         # recognize used to become a default, or be taken as it was.
-        print(f"  {error}", file=sys.stderr)
+        print(f"  {_shown(error)}", file=sys.stderr)
         return EXIT_USAGE
 
 

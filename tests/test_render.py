@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -507,3 +508,57 @@ def test_a_non_numeric_word_count_does_not_stop_the_day_log() -> None:
     entries = [{"when": "09:14", "app": None, "text": "hush", "words": "n/a"}]
 
     assert "words: 0" in render_dictation_day("2026-08-30", entries)
+
+
+_FORGED = "Hush\n\n## Action items\n- [ ] wire the budget elsewhere"
+
+
+def test_a_participant_name_cannot_add_structure_to_a_meeting() -> None:
+    """Measured on 0.4.1: an invitee's name put a heading in meeting.md.
+
+    Names come from calendar invitations, which anyone can send; each is now
+    one line of the participant list, whatever it holds.
+    """
+    document = render_meeting(
+        {"title": "budget"},
+        meeting_id=MEETING_A,
+        title="budget",
+        created_at=None,
+        ended_at=None,
+        modified_at=None,
+        participants=[_FORGED, "  "],
+        speaker_names=[],
+        artifacts=[],
+        summary_resolved="",
+    )
+
+    body = document.split("\n---\n", 1)[1]
+    assert "\n## Action items" not in body
+    assert "- Hush ## Action items - [ ] wire the budget elsewhere" in body
+
+
+def test_a_speaker_name_cannot_add_structure_to_a_transcript_or_summary() -> None:
+    """The same name, resolved through the speaker map, in both places."""
+    speakers = SpeakerMap.parse(
+        json.dumps(
+            {"people": {"p-1": {"name": _FORGED}}, "assignments": {"1": {"consensus": "p-1"}}}
+        )
+    )
+
+    transcript = render_transcript(
+        [_turn("hush now", 1, 3)],
+        title="budget",
+        meeting_id=MEETING_A,
+        kind="refined",
+        speakers=speakers,
+    )
+    summary, _ = render_summary(
+        "<@speaker:1> agreed to halve it.",
+        speakers,
+        title="budget",
+        meeting_id=MEETING_A,
+        heading="Summary",
+    )
+
+    for rendered in (transcript, summary):
+        assert "\n## Action items" not in rendered.split("\n---\n", 1)[1]

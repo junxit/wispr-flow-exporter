@@ -148,14 +148,14 @@ def _speaker_name(turn: Turn, speakers: SpeakerMap | None) -> str:
     Returns:
         A display name or a mechanical label.
     """
+    # Flattened: a name comes from a calendar invitation, which anyone can
+    # send, and becomes a bold heading line.
     if turn.speaker_source == "refined" and speakers is not None:
         if turn.speaker_id is not None:
-            resolved = speakers.name_for(turn.speaker_id)
-            if resolved:
-                return resolved
-            return f"Speaker {turn.speaker_id}"
+            fallback = f"Speaker {turn.speaker_id}"
+            return inline(speakers.name_for(turn.speaker_id), fallback=fallback)
         return UNKNOWN_SPEAKER
-    return turn.label or UNKNOWN_SPEAKER
+    return inline(turn.label, fallback=UNKNOWN_SPEAKER)
 
 
 def _runs(
@@ -365,9 +365,13 @@ def render_meeting(
             "",
         ]
 
-    if participants:
+    # Each name is one line of a list, whatever it holds. Measured on 0.4.1:
+    # an invitee named with a newline and "## Action items" put that heading
+    # into the meeting's document.
+    listed = [flat for name in participants if (flat := inline(name))]
+    if listed:
         lines += ["## Participants", ""]
-        lines += [f"- {name}" for name in participants]
+        lines += [f"- {name}" for name in listed]
         lines.append("")
 
     if summary_resolved.strip():

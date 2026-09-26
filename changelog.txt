@@ -442,6 +442,34 @@ wrapped at 72 columns, US English.
   FlowLensHistory, and --include-images the note images, under
   notes/images/<note>/. A row whose id cannot safely name a file keeps
   its row and records the bytes as `archived: false`.
+- A session expiry in an unexpected form no longer stops a local sync.
+  Measured on 0.4.1: an expires_at in milliseconds, or infinite, or
+  NaN, raised from inside datetime -- ValueError, OverflowError -- and
+  ended a local sync that did not need the session, and doctor with it.
+  A value too large to be seconds is read as milliseconds, which is how
+  JavaScript writes times, and one that is not a finite number is an
+  unknown expiry, which counts as expired.
+- One note or calendar event that cannot be written is that record's
+  failure, as one meeting's already was. Neither pass had per-record
+  handling: measured before the fix, a PermissionError on one note ended
+  the notes pass for every note after it. And a meeting whose directory
+  had been replaced by a symlink leading out of the archive raised past
+  the per-meeting guard, which caught only OSError. Each is now counted,
+  reported with --verbose, and holds the watermark for the next run.
+- A % in the database path opens that database. SQLite decodes a URI's
+  path, and the % was not escaped: measured on 0.4.1, pointed at
+  "backups 100%41/flow.sqlite", it read "backups 100A/flow.sqlite" -- a
+  different database, with no error.
+- Names cannot add structure to rendered documents. Measured on 0.4.1:
+  an invitee named with a newline and "## Action items" put that
+  heading into meeting.md, and the same name resolved through the
+  speaker map did the same to a summary. Participant and speaker names
+  are flattened to one line wherever they are rendered; ordinary names
+  render exactly as before.
+- Every printed line that carries text from outside -- a configured
+  path or value, an ignored .env key, the authorization URL -- passes
+  through the same redaction and control-character escaping as the
+  diagnostic lines, where some had printed it raw.
 
 0.4.1
 -----

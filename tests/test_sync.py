@@ -2042,3 +2042,95 @@ def test_a_binary_column_not_opted_into_is_recorded_as_unread(
     reference = json.loads(snapshot.splitlines()[0])["data"]["__blob__"]
     assert reference["archived"] is False
     assert reference["bytes"] == len(_PNG)
+
+
+# --- one record's failure is that record's --------------------------------
+
+
+def _unwritable(directory: Path) -> Path:
+    """Create a directory the archive cannot write into.
+
+    Args:
+        directory: Where.
+
+    Returns:
+        The directory, mode 0500 until the caller restores it.
+    """
+    directory.mkdir(parents=True)
+    directory.chmod(0o500)
+    return directory
+
+
+def test_one_note_that_cannot_be_written_does_not_end_the_pass(
+    scene: Callable[..., tuple],
+) -> None:
+    """Measured before this fix: PermissionError raised out of the pass.
+
+    The notes pass had no per-record handling, as the calendar pass had none,
+    so one note that could not be written ended it for every note after.
+    """
+    later = {
+        **NOTE_ROW,
+        "id": HISTORY_D,
+        "createdAt": "2026-06-18 10:00:00.000 +00:00",
+        "modifiedAt": "2026-06-18 10:05:00.000 +00:00",
+    }
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW, later]})
+    stuck = _unwritable(archive.root / "notes" / "2026" / "05")
+    try:
+        result = _run(archive, resolved)
+    finally:
+        stuck.chmod(0o700)
+
+    assert result.counts["notes"].failed == 1
+    assert archive.entry("notes", HISTORY_D) is not None
+    assert archive.watermark(SOURCE_LOCAL, "notes") is None
+
+
+def test_one_event_that_cannot_be_written_does_not_end_the_pass(
+    scene: Callable[..., tuple],
+) -> None:
+    """The calendar pass also gains the failed flag that holds its watermark."""
+    moved = {
+        **CALENDAR_ROW,
+        "externalId": "r" * 181,
+        "startAtUtc": 1784680400000,
+        "updatedAt": "2026-07-21T22:45:13.107782Z",
+    }
+    archive, resolved, _ = scene(rows=[], tables={"CalendarEvents": [CALENDAR_ROW, moved]})
+    stuck = _unwritable(archive.root / "calendar" / "2026" / "08")
+    try:
+        result = _run(archive, resolved)
+    finally:
+        stuck.chmod(0o700)
+
+    assert result.counts["calendar"].failed == 1
+    assert archive.entry("calendar", calendar_key("r" * 181)) is not None
+    assert archive.watermark(SOURCE_LOCAL, "calendar") is None
+
+
+def test_a_meeting_directory_swapped_for_a_symlink_is_that_meetings_failure(
+    scene: Callable[..., tuple], tmp_path: Path
+) -> None:
+    """A path that would leave the archive raised past the per-meeting guard.
+
+    UnsafeArchivePathError is not an OSError, so the handler that kept one
+    unwritable meeting from ending the pass let this one end it.
+    """
+    july = _meeting_row(
+        id=MEETING_B,
+        createdAt="2026-07-21 21:00:58.565 +00:00",
+        modifiedAt="2026-07-21 21:05:00.000 +00:00",
+    )
+    archive, resolved, _ = scene(rows=[_meeting_row(), july])
+    _run(archive, resolved)
+    archive.save()
+    august = archive.root / "meetings" / "2026" / "08"
+    outside = tmp_path / "outside"
+    august.rename(outside)
+    august.symlink_to(outside, target_is_directory=True)
+
+    result = _run(archive, resolved, full=True)
+
+    assert result.counts["meetings"].failed == 1
+    assert result.counts["meetings"].unchanged + result.counts["meetings"].written == 1

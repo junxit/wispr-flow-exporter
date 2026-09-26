@@ -73,6 +73,7 @@ from .store import (
     STATE_ABSENT,
     UNDATED,
     Archive,
+    UnsafeArchivePathError,
     content_hash,
     entity_name,
     row_identity,
@@ -532,7 +533,10 @@ def sync_meetings(
                 changed = _archive_meeting(
                     archive, record, by_id.get(key), spec, options, counts, now
                 )
-            except OSError as error:
+            except (OSError, UnsafeArchivePathError) as error:
+                # A path that would leave the archive -- a directory swapped
+                # for a symlink, say -- is this meeting's failure, not the
+                # pass's.
                 counts.failed += 1
                 failed = True
                 if options.verbose:
@@ -1063,60 +1067,68 @@ def sync_notes(
                 counts.failed += 1
                 failed = True
                 continue
-            data = record.data
-            created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
-            title = _text(data.get("title"))
-            stem = archive.record_path("Notes", spec, key, when=created, title=title)
-            digest = content_hash(spec, data)
-            entry = archive.entry("notes", key)
+            try:
+                data = record.data
+                created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
+                title = _text(data.get("title"))
+                stem = archive.record_path("Notes", spec, key, when=created, title=title)
+                digest = content_hash(spec, data)
+                entry = archive.entry("notes", key)
 
-            archive.mark_seen("notes", key, soft_deleted=record.soft_deleted, when=now)
-            if (
-                entry is not None
-                and entry.get("content_hash") == digest
-                and not options.full
-                and archive.existing_path("notes", key)
-                == _document_paths(stem, ".md")
-                and not entry.get("render_stale")
-            ):
-                counts.unchanged += 1
-                continue
-            if options.dry_run:
-                counts.written += 1
-                continue
+                archive.mark_seen("notes", key, soft_deleted=record.soft_deleted, when=now)
+                if (
+                    entry is not None
+                    and entry.get("content_hash") == digest
+                    and not options.full
+                    and archive.existing_path("notes", key)
+                    == _document_paths(stem, ".md")
+                    and not entry.get("render_stale")
+                ):
+                    counts.unchanged += 1
+                    continue
+                if options.dry_run:
+                    counts.written += 1
+                    continue
 
-            if archive.relocate_document("notes", key, stem, NOTE_SUFFIXES):
-                counts.relocated += 1
+                if archive.relocate_document("notes", key, stem, NOTE_SUFFIXES):
+                    counts.relocated += 1
 
-            wrote = replace_payload(
-                archive,
-                _document_paths(stem, ".raw.json"),
-                data,
-                entity="notes",
-                key=key,
-                when=now,
-                project=partial(project_record, spec),
-            )
-            held = counts.held_back
-            wrote |= _write_markdown(
-                _document_paths(stem, ".md"), _note_document(key, data), options, counts
-            )
-            fields: dict[str, Any] = {
-                # The .md file, not the bare stem: an index path has to point
-                # at something that exists, or verification cannot check it and
-                # relocation cannot find it.
-                "path": archive.relative(_document_paths(stem, ".md")),
-                "title": title or None,
-                "created_at": created.isoformat() if created else None,
-                "content_hash": digest,
-                "render_stale": True if counts.held_back > held else None,
-                "source": SOURCE_LOCAL,
-            }
-            if wrote:
-                fields["archived_at"] = now
-            archive.put("notes", key, **fields)
-            counts.written += 1 if wrote else 0
-            counts.unchanged += 0 if wrote else 1
+                wrote = replace_payload(
+                    archive,
+                    _document_paths(stem, ".raw.json"),
+                    data,
+                    entity="notes",
+                    key=key,
+                    when=now,
+                    project=partial(project_record, spec),
+                )
+                held = counts.held_back
+                wrote |= _write_markdown(
+                    _document_paths(stem, ".md"), _note_document(key, data), options, counts
+                )
+                fields: dict[str, Any] = {
+                    # The .md file, not the bare stem: an index path has to point
+                    # at something that exists, or verification cannot check it and
+                    # relocation cannot find it.
+                    "path": archive.relative(_document_paths(stem, ".md")),
+                    "title": title or None,
+                    "created_at": created.isoformat() if created else None,
+                    "content_hash": digest,
+                    "render_stale": True if counts.held_back > held else None,
+                    "source": SOURCE_LOCAL,
+                }
+                if wrote:
+                    fields["archived_at"] = now
+                archive.put("notes", key, **fields)
+                counts.written += 1 if wrote else 0
+                counts.unchanged += 0 if wrote else 1
+            except (OSError, UnsafeArchivePathError) as error:
+                # This record's failure, not the pass's: the rest are still
+                # archived, and the watermark waits for the next run.
+                counts.failed += 1
+                failed = True
+                if options.verbose:
+                    print(f"    {key}: FAILED {error}")
     except KeyboardInterrupt:
         if not options.dry_run:
             archive.save()
@@ -1155,6 +1167,7 @@ def sync_calendar(
     since = None if options.full else archive.watermark(SOURCE_LOCAL, "calendar")
     live = source.keys("CalendarEvents")
     wanted = _needs_reading(archive, "calendar", live, index_key=calendar_key)
+    failed = False
 
     try:
         for record in _and_by_key(
@@ -1171,58 +1184,66 @@ def sync_calendar(
             # injective. A hash prefix is the only stable short name.
             key = calendar_key(external_id)
 
-            starts = to_instant(TimestampKind.EPOCH_MS, data.get("startAtUtc"))
-            title = _text(data.get("title"))
-            stem = archive.record_path(
-                "CalendarEvents", spec, key, when=starts, title=title
-            )
-            destination = _document_paths(stem, ".json")
-            digest = content_hash(spec, data)
-            entry = archive.entry("calendar", key)
+            try:
+                starts = to_instant(TimestampKind.EPOCH_MS, data.get("startAtUtc"))
+                title = _text(data.get("title"))
+                stem = archive.record_path(
+                    "CalendarEvents", spec, key, when=starts, title=title
+                )
+                destination = _document_paths(stem, ".json")
+                digest = content_hash(spec, data)
+                entry = archive.entry("calendar", key)
 
-            archive.mark_seen(
-                "calendar", key, soft_deleted=record.soft_deleted, when=now
-            )
-            if (
-                entry is not None
-                and entry.get("content_hash") == digest
-                and not options.full
-                and destination.is_file()
-            ):
-                counts.unchanged += 1
-                continue
-            if options.dry_run:
-                counts.written += 1
-                continue
+                archive.mark_seen(
+                    "calendar", key, soft_deleted=record.soft_deleted, when=now
+                )
+                if (
+                    entry is not None
+                    and entry.get("content_hash") == digest
+                    and not options.full
+                    and destination.is_file()
+                ):
+                    counts.unchanged += 1
+                    continue
+                if options.dry_run:
+                    counts.written += 1
+                    continue
 
-            # The YYYY/MM shard derives from startAtUtc, which moves when an
-            # event is rescheduled, so calendar records relocate too.
-            if archive.relocate_file("calendar", key, destination):
-                counts.relocated += 1
+                # The YYYY/MM shard derives from startAtUtc, which moves when an
+                # event is rescheduled, so calendar records relocate too.
+                if archive.relocate_file("calendar", key, destination):
+                    counts.relocated += 1
 
-            wrote = replace_payload(
-                archive,
-                destination,
-                data,
-                entity="calendar",
-                key=key,
-                when=now,
-                project=partial(project_record, spec),
-            )
-            fields: dict[str, Any] = {
-                "path": archive.relative(destination),
-                "external_id": external_id,
-                "title": title or None,
-                "starts_at": starts.isoformat() if starts else None,
-                "status": data.get("status"),
-                "content_hash": digest,
-                "source": SOURCE_LOCAL,
-            }
-            if wrote:
-                fields["archived_at"] = now
-            archive.put("calendar", key, **fields)
-            counts.written += 1 if wrote else 0
-            counts.unchanged += 0 if wrote else 1
+                wrote = replace_payload(
+                    archive,
+                    destination,
+                    data,
+                    entity="calendar",
+                    key=key,
+                    when=now,
+                    project=partial(project_record, spec),
+                )
+                fields: dict[str, Any] = {
+                    "path": archive.relative(destination),
+                    "external_id": external_id,
+                    "title": title or None,
+                    "starts_at": starts.isoformat() if starts else None,
+                    "status": data.get("status"),
+                    "content_hash": digest,
+                    "source": SOURCE_LOCAL,
+                }
+                if wrote:
+                    fields["archived_at"] = now
+                archive.put("calendar", key, **fields)
+                counts.written += 1 if wrote else 0
+                counts.unchanged += 0 if wrote else 1
+            except (OSError, UnsafeArchivePathError) as error:
+                # This record's failure, not the pass's: the rest are still
+                # archived, and the watermark waits for the next run.
+                counts.failed += 1
+                failed = True
+                if options.verbose:
+                    print(f"    {key}: FAILED {error}")
     except KeyboardInterrupt:
         if not options.dry_run:
             archive.save()
@@ -1231,12 +1252,13 @@ def sync_calendar(
     if live is not None:
         present = {calendar_key(external_id) for external_id in live}
         counts.absent = len(archive.mark_absent("calendar", present, when=now))
-    archive.set_watermark(
-        SOURCE_LOCAL,
-        "calendar",
-        "updatedAt",
-        source.max_value("CalendarEvents", "updatedAt"),
-    )
+    if not failed:
+        archive.set_watermark(
+            SOURCE_LOCAL,
+            "calendar",
+            "updatedAt",
+            source.max_value("CalendarEvents", "updatedAt"),
+        )
     return counts
 
 

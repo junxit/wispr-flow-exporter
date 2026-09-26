@@ -160,7 +160,12 @@ class SqliteSource:
         mode = "immutable=1" if self.immutable else "mode=ro"
         # SQLite URIs are percent-decoded, so a literal '?' or '#' in the path
         # would otherwise be read as the start of the query or fragment.
-        quoted = str(self.path).replace("?", "%3f").replace("#", "%23")
+        # % first, or the escapes below would be escaped again. Unescaped, a
+        # path holding "%41" named another file: measured on 0.4.1, pointing
+        # at "backups 100%41/flow.sqlite" read "backups 100A/flow.sqlite".
+        quoted = (
+            str(self.path).replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+        )
         return f"file:{quoted}?{mode}"
 
     def __enter__(self) -> Self:

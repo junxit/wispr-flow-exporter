@@ -307,7 +307,12 @@ spoke.
   with YAML frontmatter. A meeting title containing a newline and `---` would
   otherwise inject arbitrary frontmatter keys into a file other tools then parse.
   Every emitted scalar is quoted and escaped; frontmatter is never built by
-  string interpolation of raw values.
+  string interpolation of raw values. The body is held to the same standard
+  wherever someone else chooses the words: a title in a heading, and a
+  participant's or speaker's name in the participant list, a transcript turn
+  or a summary, is flattened to one line. Names arrive with calendar
+  invitations, which anyone can send; through 0.4.1 an invitee named with a
+  newline and `## Action items` added that heading to the meeting's document.
 
 - **Reading a live WAL database.** `flow.sqlite` is open and being written by the
   Wispr Flow app while this tool runs. It is opened `file:...?mode=ro` with

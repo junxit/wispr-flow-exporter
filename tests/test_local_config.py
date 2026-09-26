@@ -243,3 +243,34 @@ def test_account_profile_never_contains_a_token(tmp_path: Path) -> None:
     assert "refresh_token" not in serialized
     assert profile["email"] == OWNER_EMAIL
     assert OWNER not in serialized
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (4_102_444_800_000, datetime(2100, 1, 1, tzinfo=UTC)),
+        (float("inf"), None),
+        (float("nan"), None),
+        ("soon", None),
+        (True, None),
+    ],
+    ids=["milliseconds", "infinity", "nan", "text", "boolean"],
+)
+def test_an_expiry_in_any_form_is_read_or_left_unknown(
+    tmp_path: Path, raw: object, expected: datetime | None
+) -> None:
+    """Measured on 0.4.1: milliseconds, infinity and NaN each raised.
+
+    From inside ``datetime``, uncaught -- which stopped a local sync that did
+    not need the session to archive anything, and doctor with it.
+    """
+    inner = {"access_token": FAKE_JWT, "expires_at": raw, "user": {"email": OWNER_EMAIL}}
+    (tmp_path / "session.json").write_text(
+        json.dumps({FAKE_SESSION_KEY: json.dumps(inner)}), encoding="utf-8"
+    )
+
+    info = read_session(tmp_path / "session.json")
+
+    assert info.present
+    assert info.expires_at == expected
+    assert info.is_expired is (expected is None)

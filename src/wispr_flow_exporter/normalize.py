@@ -376,10 +376,13 @@ def resolve_speaker_tokens(text: str, speakers: SpeakerMap) -> tuple[str, int]:
     def substitute(match: re.Match[str]) -> str:
         nonlocal unresolved
         name = speakers.name_for(int(match.group(1)))
-        if name is None:
+        # Flattened to one line: the name lands inside prose, and one holding
+        # a newline and "## " would add a heading to the summary.
+        flat = " ".join(name.split()) if name else ""
+        if not flat:
             unresolved += 1
             return match.group(0)
-        return name
+        return flat
 
     return SPEAKER_TOKEN_RE.sub(substitute, text), unresolved
 
