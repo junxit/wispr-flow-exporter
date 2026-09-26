@@ -77,7 +77,19 @@ class Answers:
         Returns:
             An argument vector beginning with ``sync``.
         """
-        argv = ["sync", "--source", self.source, "--audio", self.audio]
+        argv = [
+            "sync",
+            "--source",
+            self.source,
+            "--archive-dir",
+            self.archive_dir,
+            "--audio",
+            self.audio,
+            "--max-audio-mb",
+            str(self.max_audio_mb),
+            "--recheck-days",
+            str(self.recheck_days),
+        ]
         if self.data_dir:
             argv += ["--data-dir", self.data_dir]
         if self.entities:

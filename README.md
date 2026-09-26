@@ -329,7 +329,9 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
 ## Configuration
 
 See `.env.example` for the full set. Precedence is **CLI flag > environment >
-`.env` > default**.
+`.env` > default**. A value this tool cannot read — `WISPR_AUDIO=cpoy`, a
+count that is not a whole number, a yes-or-no that is neither — stops the run
+with exit 2 and names the variable, rather than being guessed at.
 
 A `.env` is read from the working directory only, and only `WISPR_*` options
 are taken from it — never `WISPR_ALLOW_ENDPOINT_OVERRIDE`. Anything else in it
@@ -343,8 +345,13 @@ connection trusts. Set them in the real environment if you need them; see
 | `WISPR_DATA_DIR` | auto-detected | Wispr Flow application-support directory |
 | `WISPR_DB_PATH` | `<data dir>/flow.sqlite` | Database to read; point at a backup or Time Machine copy |
 | `WISPR_SYNC_SOURCE` | `all` | `all`, `local`, `cloud`, `mcp`, `both`, `auto`. `all` is local plus every remote backend that has a credential; `local` and `auto` never touch the network |
-| `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written |
+| `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written; `--archive-dir` on every command that touches one |
+| `WISPR_ENTITIES` | `all` | Comma list of entities to archive; the default for `--only` |
 | `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
+| `WISPR_MAX_AUDIO_MB` | `512` | Record, rather than copy, audio larger than this; `--max-audio-mb` |
+| `WISPR_RECHECK_DAYS` | `14` | Trailing days re-read for edits made in place; `--recheck-days` |
+| `WISPR_INCLUDE_AUDIO_BLOBS` | `0` | Dictation audio blobs |
+| `WISPR_INCLUDE_IMAGES` | `0` | Images pasted into scratchpad notes |
 | `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures; still requires `--i-understand` on the command line |
 | `WISPR_STRICT_SCHEMA` | `0` | Exit non-zero on additive schema drift |
 

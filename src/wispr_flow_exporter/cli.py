@@ -25,7 +25,7 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -189,8 +189,19 @@ def _load_dotenv(path: Path) -> None:
         )
 
 
+class ConfigError(ValueError):
+    """A configured value is not one this tool accepts."""
+
+
+_YES = frozenset({"1", "true", "yes", "on"})
+_NO = frozenset({"0", "false", "no", "off"})
+
+
 def _flag(name: str, default: bool = False) -> bool:
-    """Read a boolean environment variable.
+    """Read a yes-or-no environment variable, refusing anything else.
+
+    A misspelling used to read as no. Measured on 0.4.1:
+    ``WISPR_INCLUDE_IMAGES=ture`` archived no images and said nothing.
 
     Args:
         name: Variable name.
@@ -198,27 +209,98 @@ def _flag(name: str, default: bool = False) -> bool:
 
     Returns:
         The parsed flag.
+
+    Raises:
+        ConfigError: The value is neither yes nor no.
     """
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in _YES:
+        return True
+    if raw in _NO:
+        return False
+    raise ConfigError(f"{name}={raw!r} is not yes or no; use 1 or 0")
 
 
-def _int(name: str, default: int) -> int:
-    """Read an integer environment variable, falling back on anything odd.
+def _count(name: str, default: int, flag: int | None = None) -> int:
+    """Read a non-negative whole number: the flag's, else the environment's.
 
     Args:
-        name: Variable name.
-        default: Value when unset or unparseable.
+        name: Environment variable name.
+        default: Value when neither is set.
+        flag: The command-line value, already checked by argparse.
 
     Returns:
-        The parsed integer.
+        The number.
+
+    Raises:
+        ConfigError: The environment's value is not a whole number, or is
+            negative. It used to fall back on the default, or be taken as it
+            was: measured on 0.4.1, ``WISPR_MAX_AUDIO_MB=big`` became 512 and
+            ``WISPR_RECHECK_DAYS=-3`` became -3.
+    """
+    if flag is not None:
+        return flag
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name}={raw!r} is not a whole number") from None
+    if value < 0:
+        raise ConfigError(f"{name}={raw!r} cannot be negative")
+    return value
+
+
+def _choice(name: str, flag: str | None, choices: Sequence[str], default: str) -> str:
+    """Read one of a fixed set of values: the flag's, else the environment's.
+
+    Args:
+        name: Environment variable name.
+        flag: The command-line value, already checked by argparse.
+        choices: What the value may be.
+        default: Value when neither is set.
+
+    Returns:
+        The value.
+
+    Raises:
+        ConfigError: The environment's value is not one of ``choices``.
+            Measured on 0.4.1: ``WISPR_AUDIO=cpoy`` was taken as it was and
+            fell through to link mode, archiving a pointer to each recording
+            -- which Wispr Flow deletes -- instead of the recording.
+    """
+    if flag:
+        return flag
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw not in choices:
+        raise ConfigError(f"{name}={raw!r} is not one of {', '.join(choices)}")
+    return raw
+
+
+def _non_negative(text: str) -> int:
+    """Parse a non-negative whole number from the command line.
+
+    Args:
+        text: The argument.
+
+    Returns:
+        The number.
+
+    Raises:
+        argparse.ArgumentTypeError: It is not one.
     """
     try:
-        return int(os.environ.get(name, "").strip())
+        value = int(text)
     except ValueError:
-        return default
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} cannot be negative")
+    return value
 
 
 def _config(args: argparse.Namespace) -> Config:
@@ -242,6 +324,7 @@ def _config(args: argparse.Namespace) -> Config:
     Raises:
         EndpointError: A configured base URL is not one a credential may be
             sent to.
+        ConfigError: A configured value is not one this tool accepts.
     """
     _load_dotenv(Path.cwd() / ".env")
     allow_override = _flag(OVERRIDE_ENV)
@@ -253,29 +336,32 @@ def _config(args: argparse.Namespace) -> Config:
         or os.environ.get("WISPR_DB_PATH", "").strip()
         or None,
         archive_dir=Path(
-            os.environ.get("WISPR_ARCHIVE_DIR", DEFAULT_ARCHIVE).strip()
+            getattr(args, "archive_dir", None)
+            or os.environ.get("WISPR_ARCHIVE_DIR", "").strip()
             or DEFAULT_ARCHIVE
         )
         .expanduser()
         .resolve(),
-        source=(
-            getattr(args, "source", None)
-            or os.environ.get("WISPR_SYNC_SOURCE", SOURCE_ALL).strip()
-            or SOURCE_ALL
-        ).lower(),
-        audio=(
-            getattr(args, "audio", None)
-            or os.environ.get("WISPR_AUDIO", "copy").strip()
-            or "copy"
-        ).lower(),
-        max_audio_mb=_int("WISPR_MAX_AUDIO_MB", DEFAULT_MAX_AUDIO_MB),
+        source=_choice(
+            "WISPR_SYNC_SOURCE", getattr(args, "source", None), SOURCE_CHOICES, SOURCE_ALL
+        ),
+        audio=_choice("WISPR_AUDIO", getattr(args, "audio", None), AUDIO_CHOICES, "copy"),
+        max_audio_mb=_count(
+            "WISPR_MAX_AUDIO_MB",
+            DEFAULT_MAX_AUDIO_MB,
+            getattr(args, "max_audio_mb", None),
+        ),
         include_screen_context=getattr(args, "include_screen_context", False)
         or _flag("WISPR_INCLUDE_SCREEN_CONTEXT"),
         include_audio_blobs=getattr(args, "include_audio_blobs", False)
         or _flag("WISPR_INCLUDE_AUDIO_BLOBS"),
         include_images=getattr(args, "include_images", False)
         or _flag("WISPR_INCLUDE_IMAGES"),
-        recheck_days=_int("WISPR_RECHECK_DAYS", DEFAULT_RECHECK_DAYS),
+        recheck_days=_count(
+            "WISPR_RECHECK_DAYS",
+            DEFAULT_RECHECK_DAYS,
+            getattr(args, "recheck_days", None),
+        ),
         strict_schema=getattr(args, "strict_schema", False)
         or _flag("WISPR_STRICT_SCHEMA"),
         api_base=validated_endpoint(
@@ -576,8 +662,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     try:
         entities = _entities(args)
     except ValueError as error:
-        print(f"  {error}")
-        return EXIT_FAILURE
+        print(f"  {error}", file=sys.stderr)
+        return EXIT_USAGE
 
     options = SyncOptions(
         full=getattr(args, "full", False),
@@ -1047,14 +1133,19 @@ def _entities(args: argparse.Namespace) -> tuple[str, ...]:
         ValueError: An entity name was not recognized.
     """
     chosen = set(ENTITIES)
-    only = (getattr(args, "only", None) or "").strip()
+    flagged = (getattr(args, "only", None) or "").strip()
+    # The documented default for --only, which 0.4.1 documented and never
+    # read: measured, WISPR_ENTITIES=meetings still archived all eight.
+    only = flagged or os.environ.get("WISPR_ENTITIES", "").strip()
     skip = (getattr(args, "skip", None) or "").strip()
 
-    if only:
+    # "all", as .env.example documents, is every entity: the default.
+    if only and only.lower() != "all":
         requested = {name.strip() for name in only.split(",") if name.strip()}
         unknown = requested - set(ENTITIES)
         if unknown:
-            raise ValueError(f"unknown entities: {', '.join(sorted(unknown))}")
+            where = "" if flagged else " in WISPR_ENTITIES"
+            raise ValueError(f"unknown entities{where}: {', '.join(sorted(unknown))}")
         chosen = requested
     if skip:
         dropped = {name.strip() for name in skip.split(",") if name.strip()}
@@ -1445,14 +1536,11 @@ def cmd_render(args: argparse.Namespace) -> int:
     return EXIT_FAILURE if any(counts.failed for counts in results.values()) else EXIT_OK
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Entry point for the ``wispr-export`` command.
-
-    Args:
-        argv: Argument vector; defaults to ``sys.argv[1:]``.
+def _parser() -> argparse.ArgumentParser:
+    """Build the command-line parser.
 
     Returns:
-        Process exit code.
+        The parser for every subcommand.
     """
     parser = argparse.ArgumentParser(
         prog="wispr-export",
@@ -1479,6 +1567,14 @@ def main(argv: list[str] | None = None) -> int:
             help="comma list of entities to leave out",
         )
 
+    def add_archive(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--archive-dir",
+            metavar="PATH",
+            default=None,
+            help="the archive to write or read (default: ./archive)",
+        )
+
     def add_source(target: argparse.ArgumentParser) -> None:
         target.add_argument(
             "--source",
@@ -1501,6 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor = sub.add_parser("doctor", help="validate source, schema, policy and archive")
     add_source(doctor)
+    add_archive(doctor)
     doctor.add_argument(
         "--strict-schema",
         action="store_true",
@@ -1510,12 +1607,29 @@ def main(argv: list[str] | None = None) -> int:
 
     sync = sub.add_parser("sync", help="archive new and changed data")
     add_source(sync)
+    add_archive(sync)
     add_selection(sync)
     sync.add_argument(
         "--audio",
         choices=AUDIO_CHOICES,
         default=None,
         help="meeting audio handling (default: copy)",
+    )
+    sync.add_argument(
+        "--max-audio-mb",
+        metavar="N",
+        type=_non_negative,
+        default=None,
+        help=f"record, rather than copy, audio larger than this (default: "
+        f"{DEFAULT_MAX_AUDIO_MB})",
+    )
+    sync.add_argument(
+        "--recheck-days",
+        metavar="N",
+        type=_non_negative,
+        default=None,
+        help=f"re-read this many trailing days for in-place edits (default: "
+        f"{DEFAULT_RECHECK_DAYS})",
     )
     sync.add_argument(
         "--include-screen-context",
@@ -1559,6 +1673,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema", help="show the live schema against the declaration"
     )
     add_source(schema_parser)
+    add_archive(schema_parser)
     schema_parser.add_argument(
         "--strict-schema",
         action="store_true",
@@ -1586,6 +1701,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify", help="check integrity and reconcile against the database"
     )
     add_source(verify)
+    add_archive(verify)
     verify.add_argument(
         "--deep",
         action="store_true",
@@ -1596,12 +1712,26 @@ def main(argv: list[str] | None = None) -> int:
     render_parser = sub.add_parser(
         "render", help="re-render Markdown from archived payloads"
     )
+    add_archive(render_parser)
     render_parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     render_parser.add_argument(
         "--dry-run", action="store_true", help="report without writing"
     )
     render_parser.add_argument("-v", "--verbose", action="store_true")
     render_parser.set_defaults(func=cmd_render)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for the ``wispr-export`` command.
+
+    Args:
+        argv: Argument vector; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code.
+    """
+    parser = _parser()
 
     # Only the real entry point prompts. ``main([])`` is a programmatic call
     # and prints help: deciding by ``len(sys.argv)`` alone made the answer
@@ -1613,6 +1743,9 @@ def main(argv: list[str] | None = None) -> int:
         except PromptAborted as error:
             print(f"  {error}")
             return EXIT_OK if str(error) == "cancelled" else EXIT_FAILURE
+        except ConfigError as error:
+            print(f"  {error}", file=sys.stderr)
+            return EXIT_USAGE
         return main(answers.to_argv())
 
     args = parser.parse_args(argv)
@@ -1639,6 +1772,11 @@ def main(argv: list[str] | None = None) -> int:
         # Refused before any request, so the token was never attached to it.
         print(f"  {error}")
         return EXIT_FAILURE
+    except ConfigError as error:
+        # Said and stopped, rather than guessed at: a value this tool does not
+        # recognize used to become a default, or be taken as it was.
+        print(f"  {error}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 if __name__ == "__main__":

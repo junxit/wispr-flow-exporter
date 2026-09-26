@@ -1031,3 +1031,131 @@ def test_the_version_is_one_flag_away(capsys: pytest.CaptureFixture[str]) -> Non
 
     assert stopped.value.code == 0
     assert capsys.readouterr().out.strip() == f"wispr-export {__version__}"
+
+
+# --- configuration --------------------------------------------------------
+
+
+def test_every_answer_the_prompt_collects_reaches_the_run() -> None:
+    """Every question the interactive setup asks now has a flag to answer it.
+
+    Measured on 0.4.1: the archive directory, audio cap and recheck window
+    were asked for, and then dropped -- the command line had no flags for them.
+    """
+    from wispr_flow_exporter.cli import _config, _parser
+    from wispr_flow_exporter.prompts import Answers
+
+    answers = Answers(
+        data_dir=None,
+        archive_dir="/tmp/elsewhere",
+        source="local",
+        entities=None,
+        audio="copy",
+        max_audio_mb=5,
+        include_audio_blobs=False,
+        include_images=False,
+        include_screen_context=False,
+        recheck_days=3,
+        full=False,
+        strict_schema=False,
+    )
+
+    config = _config(_parser().parse_args(answers.to_argv()))
+
+    assert config.archive_dir == Path("/tmp/elsewhere").resolve()
+    assert (config.max_audio_mb, config.recheck_days) == (5, 3)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("WISPR_AUDIO", "cpoy"),
+        ("WISPR_SYNC_SOURCE", "cloudd"),
+        ("WISPR_MAX_AUDIO_MB", "big"),
+        ("WISPR_RECHECK_DAYS", "-3"),
+        ("WISPR_INCLUDE_IMAGES", "ture"),
+        ("WISPR_STRICT_SCHEMA", "maybe"),
+    ],
+)
+def test_a_setting_this_tool_cannot_read_is_a_usage_error(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    variable: str,
+    value: str,
+) -> None:
+    """Measured on 0.4.1: each was taken as it was, or became a default.
+
+    WISPR_AUDIO=cpoy fell through to link mode and archived pointers to
+    recordings Wispr Flow deletes; WISPR_INCLUDE_IMAGES=ture read as no.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db)
+    monkeypatch.setenv(variable, value)
+
+    code = main(["sync", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_USAGE
+    assert variable in capsys.readouterr().err
+    assert not (tmp_path / "archive").exists()
+
+
+def test_the_environment_can_choose_what_to_archive(
+    tmp_path: Path, wispr_db: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured on 0.4.1: WISPR_ENTITIES was documented and never read."""
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+    monkeypatch.setenv("WISPR_ENTITIES", "notes")
+
+    main(["sync", "--source", "local", "--data-dir", str(data_dir)])
+
+    archive = Archive(root=tmp_path / "archive")
+    assert archive.entry("notes", NOTE_A) is not None
+    assert archive.entry("meetings", MEETING_A) is None
+
+
+def test_an_unknown_entity_in_the_environment_is_named(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A typo must not quietly archive nothing."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+    monkeypatch.setenv("WISPR_ENTITIES", "meeting")
+
+    code = main(["sync", "--source", "local", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_USAGE
+    assert "unknown entities in WISPR_ENTITIES: meeting" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["doctor", "schema", "verify", "render"])
+def test_every_command_that_touches_an_archive_takes_archive_dir(command: str) -> None:
+    """The flag the prompt now emits, on every command that reads an archive."""
+    from wispr_flow_exporter.cli import _config, _parser
+
+    args = _parser().parse_args([command, "--archive-dir", "/tmp/elsewhere"])
+
+    assert _config(args).archive_dir == Path("/tmp/elsewhere").resolve()
+
+
+def test_a_negative_count_on_the_command_line_is_refused() -> None:
+    """The parser refuses it, with the usual usage error."""
+    from wispr_flow_exporter.cli import _parser
+
+    with pytest.raises(SystemExit) as stopped:
+        _parser().parse_args(["sync", "--recheck-days", "-1"])
+
+    assert stopped.value.code == EXIT_USAGE
+
+
+def test_the_documented_all_still_means_every_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """.env.example ships WISPR_ENTITIES=all; copying it must keep working."""
+    from wispr_flow_exporter.cli import ENTITIES, _entities
+
+    monkeypatch.setenv("WISPR_ENTITIES", "all")
+
+    assert _entities(argparse.Namespace(only=None, skip=None)) == ENTITIES

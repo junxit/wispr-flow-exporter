@@ -416,6 +416,22 @@ wrapped at 72 columns, US English.
   It said nothing about MCP before.
 - `wispr-export --version` prints the version. It was an unrecognized
   argument.
+- Every answer the interactive setup collects reaches the run. Measured
+  on 0.4.1: the archive directory, the audio cap and the recheck window
+  were asked for and then dropped, because sync had no flags for them.
+  sync gains --archive-dir, --max-audio-mb and --recheck-days, and
+  --archive-dir is on every command that touches an archive.
+- A setting this tool cannot read stops the run, with exit 2, naming
+  the variable. Measured on 0.4.1: WISPR_AUDIO=cpoy fell through to
+  link mode, archiving a pointer to each meeting's recording -- which
+  Wispr Flow deletes -- instead of the recording;
+  WISPR_MAX_AUDIO_MB=big became 512; WISPR_RECHECK_DAYS=-3 was taken as
+  -3; and WISPR_INCLUDE_IMAGES=ture read as no.
+- WISPR_ENTITIES is read. It was documented as --only's default and
+  never consulted: measured on 0.4.1, WISPR_ENTITIES=meetings archived
+  all eight entities. `all` still means every one, and an unknown name
+  -- in the variable or in --only -- is a usage error, exit 2 rather
+  than 1.
 
 0.4.1
 -----

@@ -97,7 +97,19 @@ def test_pressing_enter_throughout_keeps_every_default(
     assert answers.source == "local"
     assert answers.audio == "copy"
     assert answers.include_screen_context is False
-    assert answers.to_argv() == ["sync", "--source", "local", "--audio", "copy"]
+    assert answers.to_argv() == [
+        "sync",
+        "--source",
+        "local",
+        "--archive-dir",
+        "./archive",
+        "--audio",
+        "copy",
+        "--max-audio-mb",
+        "512",
+        "--recheck-days",
+        "14",
+    ]
 
 
 def test_the_equivalent_command_is_shown(
@@ -108,7 +120,7 @@ def test_the_equivalent_command_is_shown(
 
     out = capsys.readouterr().out
     assert "Equivalent command:" in out
-    assert "wispr-export sync --source local --audio copy" in out
+    assert "wispr-export sync --source local --archive-dir ./archive --audio copy --max-audio-mb 512 --recheck-days 14" in out
 
 
 def test_declining_at_the_confirmation_aborts() -> None:
