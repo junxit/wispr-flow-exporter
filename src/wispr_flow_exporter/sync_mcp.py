@@ -178,7 +178,9 @@ def local_transcript_state(directory: Any) -> str:
     return "absent"
 
 
-def _archive_verbatim(archive: Archive, tool: str, key: str, payload: Any) -> bool:
+def _archive_verbatim(
+    archive: Archive, tool: str, key: str, payload: Any, *, dry_run: bool = False
+) -> bool:
     """Write one response to the content-addressed verbatim store.
 
     Existence-gated rather than compare-then-write. If the server ever puts a
@@ -191,13 +193,16 @@ def _archive_verbatim(archive: Archive, tool: str, key: str, payload: Any) -> bo
         tool: The tool that produced the response.
         key: A stable name within that tool's directory.
         payload: The decoded response.
+        dry_run: Report whether a file would be written, and write nothing.
 
     Returns:
-        ``True`` when a file was written.
+        ``True`` when a file was written, or would have been.
     """
     destination = archive.resolve(ENTITY_MCP, tool, f"{key}.json")
     if destination.is_file():
         return False
+    if dry_run:
+        return True
     return write_json_if_changed(destination, payload)
 
 
@@ -209,6 +214,7 @@ def _fetch_pages(
     *,
     record_keys: tuple[str, ...],
     counts: SyncCounts,
+    dry_run: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Page one search tool to exhaustion, archiving each page verbatim.
 
@@ -219,6 +225,7 @@ def _fetch_pages(
         arguments: Base arguments; ``cursor`` is added per page.
         record_keys: Candidate field names holding the record list.
         counts: Mutated with what was written.
+        dry_run: Page as usual but write no page to disk.
 
     Returns:
         Every record seen, and whether paging completed cleanly.
@@ -235,7 +242,7 @@ def _fetch_pages(
             return seen, False
         counts.scanned += 1
         digest = content_digest(payload)[:16]
-        if _archive_verbatim(archive, tool, digest, payload):
+        if _archive_verbatim(archive, tool, digest, payload, dry_run=dry_run):
             counts.written += 1
         else:
             counts.unchanged += 1
@@ -434,7 +441,9 @@ def sync_mcp(
     account = client.call("get_account_info", {})
     if account is not None:
         counts.scanned += 1
-        if _archive_verbatim(archive, "get_account_info", "account", account):
+        if _archive_verbatim(
+            archive, "get_account_info", "account", account, dry_run=options.dry_run
+        ):
             counts.written += 1
         else:
             counts.unchanged += 1
@@ -454,6 +463,7 @@ def sync_mcp(
         arguments,
         record_keys=("meetings", "results", "items"),
         counts=counts,
+        dry_run=options.dry_run,
     )
     if not complete:
         counts.failed += 1

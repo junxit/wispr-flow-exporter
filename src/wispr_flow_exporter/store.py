@@ -159,11 +159,16 @@ class Archive:
         root: The archive root. Every write is verified to land inside it.
         index: Namespaced record index, loaded from ``index.json``.
         state: Watermarks, cursors, schema pin and observed policy.
+        read_only: Never persist the index or the state. Set for a dry run,
+            whose passes still update both in memory -- that is how they count
+            what they *would* write -- and whose watermarks, once saved, told
+            the next real run that records it had never written were done.
     """
 
     root: Path
     index: dict[str, Any] = None  # type: ignore[assignment]
     state: dict[str, Any] = None  # type: ignore[assignment]
+    read_only: bool = False
 
     def __post_init__(self) -> None:
         """Normalize the root and load any existing index and state."""
@@ -543,8 +548,11 @@ class Archive:
 
         Called before any exception leaves a sync pass, on interrupt, and
         periodically during long runs, so an interrupted archive is always
-        resumable rather than merely usually resumable.
+        resumable rather than merely usually resumable. Does nothing at all
+        for a read-only archive -- not even creating the root.
         """
+        if self.read_only:
+            return
         # The root is narrowed even when it already existed: it holds the index
         # and the sync state directly, and an operator who ran `mkdir archive`
         # before the first run left it 0755.

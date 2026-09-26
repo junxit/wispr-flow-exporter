@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -12,7 +13,10 @@ from conftest import (
     FAKE_JWT,
     FAKE_SESSION_KEY,
     MEETING_A,
+    MEETING_B,
+    NOTE_A,
     TITLE_PLAIN,
+    archive_snapshot,
 )
 
 from wispr_flow_exporter.cli import (
@@ -23,6 +27,7 @@ from wispr_flow_exporter.cli import (
     EXIT_SOURCE_UNREACHABLE,
     main,
 )
+from wispr_flow_exporter.store import Archive
 
 # Environment, working directory, credential store and network are isolated for
 # every test by the autouse fixture in conftest.py, which began life here.
@@ -390,6 +395,104 @@ def test_render_rebuilds_without_touching_the_source(
     code = main(["render"])
 
     assert code == EXIT_OK
+
+
+# --- dry run --------------------------------------------------------------
+# Rows carry modifiedAt on purpose. The defect this section guards against
+# was a dry run saving the watermark it had advanced in memory, and a table
+# with no modification times has no watermark to advance.
+
+_CREATED = "2026-08-21 21:00:58.565 +00:00"
+_MODIFIED = "2026-08-21 21:33:32.711 +00:00"
+
+
+def _dated_rows() -> dict[str, list[dict[str, object]]]:
+    """Build one meeting and one note, both with modification times.
+
+    Returns:
+        Rows for the database factory.
+    """
+    return {
+        "Meetings": [
+            {
+                "id": MEETING_A,
+                "title": TITLE_PLAIN,
+                "createdAt": _CREATED,
+                "modifiedAt": _MODIFIED,
+                "isDeleted": 0,
+            }
+        ],
+        "Notes": [
+            {
+                "id": NOTE_A,
+                "title": "Murmur quota",
+                "content": "- ask about the murmur quota",
+                "createdAt": _CREATED,
+                "modifiedAt": _MODIFIED,
+                "isDeleted": 0,
+            }
+        ],
+    }
+
+
+def test_a_dry_run_leaves_no_trace(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """The default source reaches for remote backends; none may cause a write.
+
+    Measured before the fix: a dry run with no remote credentials at all still
+    created the archive, because the save after the remote passes ran whenever
+    a remote backend was merely selected.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+
+    code = main(["sync", "--dry-run", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_OK
+    assert not (tmp_path / "archive").exists()
+
+
+def test_a_dry_run_costs_the_next_run_nothing(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """A dry run must not tell the next real run that anything was archived.
+
+    Measured before the fix: the dry run saved its advanced watermarks, the
+    next sync scanned 0 meetings and 0 notes, nothing was ever written, and
+    verify still reported the archive as consistent.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+    main(["sync", "--dry-run", "--data-dir", str(data_dir)])
+
+    main(["sync", "--data-dir", str(data_dir)])
+
+    archive = Archive(root=tmp_path / "archive")
+    meeting = archive.entry("meetings", MEETING_A)
+    note = archive.entry("notes", NOTE_A)
+    assert meeting is not None and "path" in meeting
+    assert note is not None and "path" in note
+    assert (tmp_path / "archive" / meeting["path"] / "meeting.md").is_file()
+
+
+def test_a_dry_run_leaves_an_existing_archive_byte_identical(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """New upstream data is reported, not recorded, until a real run writes it."""
+    data_dir = _data_dir(tmp_path, wispr_db, rows=_dated_rows())
+    main(["sync", "--data-dir", str(data_dir)])
+    before = archive_snapshot(tmp_path / "archive")
+    with sqlite3.connect(data_dir / "flow.sqlite") as writer:
+        writer.execute(
+            'INSERT INTO "Meetings" ("id", "title", "createdAt", "modifiedAt", '
+            '"isDeleted") VALUES (?, ?, ?, ?, 0)',
+            (MEETING_B, "Hush weekly", _CREATED, "2026-08-22 09:00:00.000 +00:00"),
+        )
+
+    main(["sync", "--dry-run", "--data-dir", str(data_dir)])
+
+    assert archive_snapshot(tmp_path / "archive") == before
+    main(["sync", "--data-dir", str(data_dir)])
+    assert Archive(root=tmp_path / "archive").entry("meetings", MEETING_B)
 
 
 def test_an_unreachable_source_is_its_own_exit_code(tmp_path: Path) -> None:

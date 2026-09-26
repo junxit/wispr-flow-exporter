@@ -10,6 +10,16 @@ wrapped at 72 columns, US English.
 
 0.4.1
 -----
+- A dry run could stop every later sync from archiving what it had seen.
+  Measured: `sync --dry-run` and then `sync`, against a store holding
+  one meeting and one note, archived neither -- the second run scanned 0
+  meetings and 0 notes -- and `verify` called the result consistent. The
+  dry run advanced its watermarks in memory to count what it would
+  write, and the save after the remote passes ran whenever a remote
+  backend was selected, which the default `all` always is, credentials
+  or not. A dry run now opens the archive read-only and writes nothing:
+  not the index, not the state, not the MCP pass's verbatim pages
+  (written before its dry-run check), and not a repository's .gitignore.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check

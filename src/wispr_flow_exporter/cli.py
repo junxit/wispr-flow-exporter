@@ -434,8 +434,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"  {error}")
         return EXIT_FAILURE
 
-    archive = Archive(root=config.archive_dir)
-    ensure_ignored(config.archive_dir)
     options = SyncOptions(
         full=getattr(args, "full", False),
         audio=config.audio,
@@ -446,6 +444,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
         dry_run=getattr(args, "dry_run", False),
         recheck_days=config.recheck_days,
     )
+    # A dry run touches nothing: not the archive, and not a repository's
+    # .gitignore either. The passes still mutate the index in memory to count
+    # what they would write, so the archive refuses to persist it.
+    archive = Archive(root=config.archive_dir, read_only=options.dry_run)
+    if not options.dry_run:
+        ensure_ignored(config.archive_dir)
 
     exit_code = EXIT_OK
     result = SyncResult()
@@ -1127,12 +1131,12 @@ def cmd_render(args: argparse.Namespace) -> int:
         Process exit code.
     """
     config = _config(args)
-    archive = Archive(root=config.archive_dir)
     options = SyncOptions(
         full=getattr(args, "force", False),
         dry_run=getattr(args, "dry_run", False),
         verbose=getattr(args, "verbose", False),
     )
+    archive = Archive(root=config.archive_dir, read_only=options.dry_run)
 
     print("wispr-flow-exporter render")
     counts = rerender(archive, options)

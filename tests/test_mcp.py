@@ -376,6 +376,29 @@ def test_a_second_pass_writes_nothing(tmp_path: Path) -> None:
     assert archive_snapshot(archive.root) == before
 
 
+def test_an_mcp_dry_run_writes_nothing(tmp_path: Path) -> None:
+    """The account snapshot and every search page used to land before the check.
+
+    A dry run may still ask the server what it has -- that is how it reports
+    what a real run would write -- but nothing it hears may reach the disk.
+    """
+    archive = Archive(root=tmp_path / "archive", read_only=True)
+    client = _Fake(
+        {
+            "get_account_info": {"name": "Murmur Pike"},
+            "search_meetings": _meeting_page(
+                {"id": MEETING_A, "title": "x", "has_transcript": False}
+            ),
+        }
+    )
+
+    counts = sync_mcp(archive, client, SyncOptions(dry_run=True))
+    archive.save()
+
+    assert counts.written == 2
+    assert not archive.root.exists()
+
+
 # --- drift ----------------------------------------------------------------
 
 
