@@ -8,6 +8,33 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.5.0
+-----
+- The live-installation tests are selected by a marker: `pytest -m
+  live`. The documented `-k "pin or live"` matched names, not intent --
+  on 0.4.0 it selected 23 tests, 20 of which run everywhere anyway, and
+  missed test_the_recorded_app_version_matches_the_bundle, one of the
+  four it was meant to find. Markers are now strict, so a misspelled one
+  fails instead of silently selecting nothing.
+- The live tests read the store the way the tool does, through
+  SqliteSource, so the production open path -- a URI containing
+  "Application Support", mode=ro on a WAL database, query_only -- is
+  finally exercised on the one machine that has a real store. The column
+  comparison reports every difference at once: against 1.6.957 the old
+  test stopped at the new FolderMeetings table and hid the column
+  changes on Folders and SharedNotes behind it.
+- Four tests promised more than they checked. The world-readable test
+  inspected only the finished mode, which a write-then-chmod
+  implementation also passes; it now captures the mode each file is
+  created with. The redaction test asserted that "[redacted]" appeared,
+  not that the secret was gone, and never tried the cloud backend's own
+  bare-token header form. The retry test accepted any count above one;
+  it now requires exactly four attempts. And pacing had no test at all,
+  because every test set the interval to zero -- two back-to-back
+  requests must now cost exactly one 0.25-second wait. Fixtures building
+  meeting directories from hostile ids no longer create them outside the
+  test's scratch directory, which they had been doing.
+
 0.4.1
 -----
 - A dry run could stop every later sync from archiving what it had seen.

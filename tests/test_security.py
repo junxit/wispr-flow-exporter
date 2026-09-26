@@ -15,6 +15,7 @@ import stat
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import (
@@ -31,7 +32,12 @@ from conftest import (
 from wispr_flow_exporter import paths
 from wispr_flow_exporter.local_config import Policy, redact
 from wispr_flow_exporter.schema import EXPECTED
-from wispr_flow_exporter.secure_io import DIR_MODE, FILE_MODE, secure_write_text
+from wispr_flow_exporter.secure_io import (
+    DIR_MODE,
+    FILE_MODE,
+    copy_file_secure,
+    secure_write_text,
+)
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import Archive, UnsafeArchivePathError
 from wispr_flow_exporter.sync import SyncOptions, sync_local
@@ -94,6 +100,11 @@ def synced(tmp_path: Path, wispr_db: Callable[..., Path]) -> Callable[..., Archi
                 if not isinstance(row.get("id"), str):
                     continue
                 directory = data_dir / "meetings" / str(row["id"])
+                # A hostile id is a path, not a name, and no such directory can
+                # exist inside meetings/. Creating one wrote outside tmp_path.
+                meetings = (data_dir / "meetings").resolve()
+                if not directory.resolve().is_relative_to(meetings):
+                    continue
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
                 except (OSError, ValueError):
@@ -254,20 +265,37 @@ def test_an_operator_created_root_is_narrowed(tmp_path: Path) -> None:
     assert stat.S_IMODE(root.stat().st_mode) == DIR_MODE
 
 
-def test_a_written_file_is_never_briefly_world_readable(tmp_path: Path) -> None:
+def test_a_written_file_is_never_briefly_world_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """0600 at rest is not the claim; 0600 at every instant is.
 
-    Writing and then chmodding leaves a window. Asserting on the finished file
-    cannot see it, so this asserts on the mode the file is *created* with, by
-    writing under a umask that would widen anything not opened with a mode.
+    Writing and then chmodding leaves a window, and a file that finishes at
+    0600 looks the same either way -- which is why the earlier version of this
+    test, checking only the finished mode, could not fail. So the mode is
+    captured from the ``open`` call that creates each file.
     """
-    target = tmp_path / "secret.json"
+    created: list[tuple[str, int]] = []
+    real_open = os.open
+
+    def spy(path: Any, flags: int, mode: int = 0o777, **kwargs: Any) -> int:
+        if flags & os.O_CREAT:
+            created.append((Path(path).name, mode))
+        return real_open(path, flags, mode, **kwargs)
+
+    source = tmp_path / "upload.ogg"
+    source.write_bytes(b"OggS" + bytes(64))
+    monkeypatch.setattr(os, "open", spy)
     previous = os.umask(0o000)
     try:
-        secure_write_text(target, "{}")
-        assert stat.S_IMODE(target.stat().st_mode) == FILE_MODE
+        secure_write_text(tmp_path / "secret.json", "{}")
+        copy_file_secure(source, tmp_path / "media" / "upload.ogg")
     finally:
         os.umask(previous)
+
+    assert created, "no file was created through os.open"
+    assert all(mode == FILE_MODE for _, mode in created), created
+    assert stat.S_IMODE((tmp_path / "secret.json").stat().st_mode) == FILE_MODE
 
 
 def test_a_symlink_at_the_destination_is_not_written_through(
@@ -360,13 +388,25 @@ def test_a_local_export_never_opens_the_session_file(
 
 
 def test_redaction_covers_every_credential_shape() -> None:
-    """Diagnostics pass through one redactor at the sink."""
-    for text in (
-        f"Authorization: Bearer {FAKE_JWT}",
-        f"missing key {FAKE_SESSION_KEY}",
-        "https://example.invalid/o?X-Amz-Signature=deadbeefcafebabe0123",
+    """Diagnostics pass through one redactor at the sink.
+
+    Asserting that "[redacted]" appears is not the property; asserting that the
+    secret is gone is. The earlier version checked the first, and would have
+    passed a redactor that prefixed the marker and left the token in place.
+    """
+    opaque = "q7Zr2mNpXw9LkVb3TyHc8JdF"
+    for text, secret in (
+        (f"Authorization: Bearer {FAKE_JWT}", FAKE_JWT),
+        # The cloud backend's own header form: the token bare, no scheme.
+        (f"Authorization: {FAKE_JWT}", FAKE_JWT),
+        (f"Authorization: Bearer {opaque}", opaque),
+        (f"missing key {FAKE_SESSION_KEY}", FAKE_SESSION_KEY),
+        (
+            "https://example.invalid/o?X-Amz-Signature=deadbeefcafebabe0123",
+            "deadbeefcafebabe0123",
+        ),
     ):
-        assert "[redacted]" in redact(text)
+        assert secret not in redact(text), text
 
 
 def test_a_presigned_url_is_redacted_at_read_time(

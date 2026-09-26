@@ -113,6 +113,12 @@ def scene(tmp_path: Path, wispr_db: Callable[..., Path]) -> Callable[..., tuple]
         if artifacts:
             for row in rows if rows is not None else [_meeting_row()]:
                 directory = data_dir / "meetings" / str(row["id"])
+                # A hostile id is a path, not a name; creating it would write
+                # outside tmp_path, and no such directory can exist upstream.
+                if not directory.resolve().is_relative_to(
+                    (data_dir / "meetings").resolve()
+                ):
+                    continue
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "refined.ndjson").write_text(
                     "\n".join(json.dumps(line) for line in REFINED) + "\n",

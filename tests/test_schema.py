@@ -8,8 +8,6 @@ twenty migrations a month it will.
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from wispr_flow_exporter import paths
@@ -21,18 +19,24 @@ from wispr_flow_exporter.schema import (
     TableSpec,
     pin_from_migrations,
 )
+from wispr_flow_exporter.sqlite_source import SqliteSource, open_source
 
 
-def _live_connection() -> sqlite3.Connection | None:
-    """Open the real database read-only, or report that there isn't one.
+def _live_source() -> SqliteSource | None:
+    """Open the real database the way the tool itself does, or report its absence.
+
+    Through ``open_source`` rather than a bare ``sqlite3.connect``, so the
+    production path -- a URI built from "Application Support", ``mode=ro`` on a
+    WAL database, ``query_only`` -- is exercised on the one machine that has a
+    real store, instead of never.
 
     Returns:
-        A read-only connection, or ``None`` when Wispr Flow is not installed.
+        An unopened reader, or ``None`` when Wispr Flow is not installed.
     """
     resolved = paths.resolve()
     if not resolved.db.exists():
         return None
-    return sqlite3.connect(f"file:{resolved.db}?mode=ro", uri=True)
+    return open_source(resolved.db, immutable=resolved.db_is_backup)
 
 
 # --- the pin --------------------------------------------------------------
@@ -180,14 +184,14 @@ def test_projection_excludes_by_name_not_by_position() -> None:
 # --- against a live installation ------------------------------------------
 
 
+@pytest.mark.live
 def test_pin_matches_the_live_database() -> None:
     """The declared pin must describe the installed app, or drift is reported."""
-    connection = _live_connection()
-    if connection is None:
+    source = _live_source()
+    if source is None:
         pytest.skip("no local Wispr Flow database to check")
-    with connection:
-        names = [row[0] for row in connection.execute("SELECT name FROM SequelizeMeta")]
-    live = pin_from_migrations(names)
+    with source:
+        live = source.pin()
 
     assert live == MIGRATION_PIN, (
         f"schema drift: live pin is {live}. This is expected as Wispr Flow "
@@ -195,28 +199,28 @@ def test_pin_matches_the_live_database() -> None:
     )
 
 
+@pytest.mark.live
 def test_expected_covers_the_live_database() -> None:
-    """Every live table and column must be declared, or drift is reported."""
-    connection = _live_connection()
-    if connection is None:
-        pytest.skip("no local Wispr Flow database to check")
-    with connection:
-        tables = [
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
-            )
-        ]
-        live = {
-            table: tuple(
-                row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
-            )
-            for table in tables
-        }
+    """Every live table and column must be declared, or drift is reported.
 
-    assert set(live) == set(EXPECTED), "table set differs from the declaration"
-    for table, columns in live.items():
-        assert set(columns) == set(EXPECTED[table].columns), (
-            f"{table}: column set differs from the declaration"
-        )
+    Every difference is collected before asserting. Stopping at the first one
+    meant a new table hid every column change behind it, so each re-pin became
+    a loop of fix one thing, run again, find the next.
+    """
+    source = _live_source()
+    if source is None:
+        pytest.skip("no local Wispr Flow database to check")
+    with source:
+        live = {table: set(source.columns(table)) for table in source.tables()}
+
+    stale: list[str] = []
+    stale += [f"undeclared table {name}" for name in sorted(set(live) - set(EXPECTED))]
+    stale += [f"declared table {name} is gone" for name in sorted(set(EXPECTED) - set(live))]
+    for table in sorted(set(live) & set(EXPECTED)):
+        declared = set(EXPECTED[table].columns)
+        if added := sorted(live[table] - declared):
+            stale.append(f"{table}: undeclared columns {', '.join(added)}")
+        if gone := sorted(declared - live[table]):
+            stale.append(f"{table}: declared columns gone {', '.join(gone)}")
+
+    assert not stale, "the declaration is stale:\n  " + "\n  ".join(stale)

@@ -331,6 +331,7 @@ def _live_app_version() -> str | None:
     return read_config(config).app_version
 
 
+@pytest.mark.live
 def test_the_pin_matches_the_installed_app() -> None:
     """The declaration must describe the app it was measured against.
 
@@ -348,6 +349,7 @@ def test_the_pin_matches_the_installed_app() -> None:
     )
 
 
+@pytest.mark.live
 def test_the_recorded_app_version_matches_the_bundle() -> None:
     """``prefs.version`` and Info.plist must agree, or one of them is stale."""
     version = _live_app_version()

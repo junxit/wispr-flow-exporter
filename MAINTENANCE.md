@@ -33,7 +33,7 @@ without a runner that has the app on it.
 So the cadence is manual, and it is short because the drift is not:
 
 ```bash
-uv run pytest -q -k "pin or live"   # the four that only run here
+uv run pytest -q -m live           # the four that only run here
 uv run wispr-export schema          # all three backends, read-only
 ```
 
@@ -56,7 +56,7 @@ window was measured against a declaration that no longer described anything.
 ### 1. Check the pin
 
 ```bash
-uv run pytest -q -k pin
+uv run pytest -q -m live
 ```
 
 `test_the_pin_matches_the_installed_app` compares `prefs.version` in

@@ -36,6 +36,12 @@ packages = ["src/wispr_flow_exporter"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Strict, so a misspelled marker is an error rather than a test that silently
+# never runs -- the failure mode the old `-k "pin or live"` selector had.
+addopts = "--strict-markers"
+markers = [
+    "live: compares the declarations against a local Wispr Flow installation; skips when there is none, so CI never runs it. Run with `pytest -m live` after every app update.",
+]
 
 [tool.ruff]
 target-version = "py313"

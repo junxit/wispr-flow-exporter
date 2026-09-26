@@ -472,7 +472,7 @@ transcribe a table definition and are meant to read as one.
 Two checks cannot run in CI at all, because they need Wispr Flow installed:
 
 ```bash
-uv run pytest -q -k "pin or live"   # skips silently without the app
+uv run pytest -q -m live           # skips silently without the app
 uv run wispr-export schema          # all three backends, read-only
 ```
 

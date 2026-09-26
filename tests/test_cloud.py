@@ -17,12 +17,13 @@ import httpx
 import pytest
 from conftest import FAKE_JWT, FAKE_SESSION_KEY, OWNER_EMAIL, archive_snapshot
 
-from wispr_flow_exporter import cloud_auth
+from wispr_flow_exporter import cloud_api, cloud_auth
 from wispr_flow_exporter.cloud_api import (
     ALLOWED_PREFIXES,
     CANDIDATES,
     DENIED,
     ENDPOINTS,
+    MAX_RETRIES,
     CloudClient,
     CloudError,
     EndpointResult,
@@ -297,8 +298,29 @@ def test_a_server_error_is_retried_then_recorded() -> None:
         patch.setattr("wispr_flow_exporter.cloud_api.MIN_INTERVAL", 0)
         assert client.fetch("notes") is None
 
-    assert calls["n"] > 1
+    assert calls["n"] == MAX_RETRIES
     assert client.failures == [("notes", "HTTP 503")]
+
+
+def test_requests_are_paced_to_four_a_second(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MAINTENANCE.md says do not raise the rate; this makes the rule a test.
+
+    With the clock frozen, two back-to-back requests must cost exactly one
+    wait of the minimum interval. Every other test patches the interval to
+    zero for speed, which is how the pacing itself went untested.
+    """
+    slept: list[float] = []
+    monkeypatch.setattr(cloud_api.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(cloud_api.time, "sleep", slept.append)
+    client = _client(lambda request: httpx.Response(200, json={"ok": True}))
+
+    client.fetch("user_profile")
+    client.fetch("user_preferences")
+
+    assert cloud_api.MIN_INTERVAL == 0.25
+    assert slept == [cloud_api.MIN_INTERVAL]
 
 
 def test_a_rejected_token_is_not_retried() -> None:
