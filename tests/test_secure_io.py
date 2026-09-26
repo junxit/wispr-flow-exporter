@@ -19,6 +19,7 @@ from wispr_flow_exporter.secure_io import (
     secure_mkdir,
     secure_write_bytes,
     secure_write_text,
+    write_bytes_if_changed,
     write_json,
     write_ndjson,
 )
@@ -191,3 +192,39 @@ def test_existing_directories_are_left_alone(tmp_path: Path) -> None:
 
     assert _mode(existing) == 0o755
     assert _mode(existing / "ours") == DIR_MODE
+
+
+def test_a_short_write_is_finished_not_renamed_into_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.write may stop early; the file must still hold every byte.
+
+    A nearly full disk makes write() return less than it was given. One call
+    and no check produced a truncated file that the caller then renamed over
+    the good one.
+    """
+    real_write = os.write
+
+    def dribble(fd: int, data: bytes | memoryview) -> int:
+        return real_write(fd, bytes(data[:7]))
+
+    monkeypatch.setattr(os, "write", dribble)
+    payload = b"quarterly whisper budget, " * 20
+
+    write_bytes_if_changed(tmp_path / "index.json", payload)
+
+    assert (tmp_path / "index.json").read_bytes() == payload
+
+
+def test_a_write_that_makes_no_progress_raises_and_keeps_the_old_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Better an error and yesterday's index than a silently empty one."""
+    target = tmp_path / "index.json"
+    target.write_bytes(b"yesterday")
+    monkeypatch.setattr(os, "write", lambda fd, data: 0)
+
+    with pytest.raises(OSError):
+        write_bytes_if_changed(target, b"today")
+
+    assert target.read_bytes() == b"yesterday"

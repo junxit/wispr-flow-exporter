@@ -18,6 +18,7 @@ module with one set of tests rather than being reimplemented per caller.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -104,9 +105,19 @@ def secure_write_bytes(path: Path, payload: bytes) -> None:
     open descriptor -- ``fchmod``, not ``chmod``, so the thing being narrowed
     is provably the file just created and not whatever now sits at that name.
 
+    ``os.write`` may write less than it was given -- POSIX allows it, and a
+    nearly full disk does it -- and returns how much it wrote. One call and no
+    check used to leave a truncated temp file for the caller to rename over the
+    good one, which for ``index.json`` meant an index the next run could not
+    read. The loop finishes the write or raises, and a raise leaves the good
+    file where it was.
+
     Args:
         path: Destination file.
         payload: Contents to write.
+
+    Raises:
+        OSError: The write could not be completed.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, FILE_MODE)
@@ -115,7 +126,12 @@ def secure_write_bytes(path: Path, payload: bytes) -> None:
             os.fchmod(fd, FILE_MODE)
         except OSError:
             pass
-        os.write(fd, payload)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, f"wrote nothing to {path}")
+            remaining = remaining[written:]
     finally:
         os.close(fd)
 

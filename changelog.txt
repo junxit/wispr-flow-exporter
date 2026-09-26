@@ -53,6 +53,11 @@ wrapped at 72 columns, US English.
   verify reports it until someone deals with it; .sync-state.json is
   treated the same way. Commands that only read report the damage
   without moving anything.
+- A short write could replace the file it was meant to update. os.write
+  may write less than it is given -- a nearly full disk does exactly
+  that -- and a single unchecked call left a truncated temp file that
+  was then renamed over the good one. Writes now loop to completion or
+  raise, and a raise leaves the old file where it was.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check
