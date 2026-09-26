@@ -435,18 +435,43 @@ def render_note(
     return front + "\n" + "\n".join(body).rstrip() + "\n"
 
 
-def render_dictionary(rows: Iterable[Mapping[str, Any]]) -> str:
+def _cell(value: Any) -> str:
+    """Make a value safe to place inside one Markdown table cell.
+
+    Flattened before escaping: a pipe is not the only way out of a table row.
+    A newline ends the row outright, and everything after it lands in the
+    document as its own Markdown -- which for the shared and team dictionaries
+    is text this account did not write.
+
+    Args:
+        value: The value to show.
+
+    Returns:
+        One line with every pipe escaped.
+    """
+    return inline(str(value if value is not None else "")).replace("|", "\\|")
+
+
+def render_dictionary(
+    rows: Iterable[Mapping[str, Any]],
+    removed: Sequence[tuple[Mapping[str, Any], str]] = (),
+) -> str:
     """Render the custom dictionary as a readable table.
 
     Deleted entries are kept and struck through rather than dropped. The
     dictionary is largely names, employers and project codenames, and what was
-    removed from it is part of the record.
+    removed from it is part of the record. Entries Wispr Flow deleted outright
+    -- no longer in the table at all, kept only in this archive's ledger -- get
+    a section of their own, with the date they were first seen gone.
 
     Args:
-        rows: Dictionary rows.
+        rows: Dictionary rows upstream holds now.
+        removed: ``(row, missing_since)`` for entries upstream no longer has.
 
     Returns:
-        The Markdown document.
+        The Markdown document. With nothing removed it is byte-for-byte what
+        this function produced before the section existed, so adding it did
+        not rewrite every archived dictionary.
     """
     entries = list(rows)
     snippets = [row for row in entries if row.get("isSnippet")]
@@ -457,6 +482,7 @@ def render_dictionary(rows: Iterable[Mapping[str, Any]]) -> str:
             "kind": "dictionary",
             "entries": len(entries),
             "snippets": len(snippets),
+            "removed_upstream": len(removed) or None,
             "source": "wispr-local",
             "tags": ["wispr/dictionary"],
         }
@@ -467,23 +493,31 @@ def render_dictionary(rows: Iterable[Mapping[str, Any]]) -> str:
             return []
         lines = [f"## {heading}", "", "| Phrase | Replacement |", "| --- | --- |"]
         for row in sorted(items, key=lambda item: str(item.get("phrase", "")).lower()):
-            # Flattened before escaping: a pipe is not the only way out of a
-            # table row. A newline ends the row outright, and everything after
-            # it lands in the document as its own Markdown -- which for the
-            # shared and team dictionaries is text this account did not write.
-            phrase = inline(str(row.get("phrase", "")))
-            replacement = inline(str(row.get("replacement") or ""))
+            phrase, replacement = _cell(row.get("phrase", "")), _cell(row.get("replacement"))
             if row.get("isDeleted"):
                 phrase, replacement = f"~~{phrase}~~", f"~~{replacement}~~"
-            lines.append(
-                f"| {phrase.replace('|', '\\|')} | {replacement.replace('|', '\\|')} |"
-            )
+            lines.append(f"| {phrase} | {replacement} |")
         lines.append("")
         return lines
 
     body = ["# Custom dictionary", ""]
     body += table(phrases, "Phrases")
     body += table(snippets, "Snippets")
+    if removed:
+        body += [
+            "## Removed upstream",
+            "",
+            "Deleted from Wispr Flow outright; kept here.",
+            "",
+            "| Phrase | Replacement | Gone since |",
+            "| --- | --- | --- |",
+        ]
+        for row, since in sorted(
+            removed, key=lambda item: str(item[0].get("phrase", "")).lower()
+        ):
+            phrase, replacement = _cell(row.get("phrase", "")), _cell(row.get("replacement"))
+            body.append(f"| ~~{phrase}~~ | ~~{replacement}~~ | {_cell(since[:10])} |")
+        body.append("")
     return front + "\n" + "\n".join(body).rstrip() + "\n"
 
 
@@ -495,19 +529,28 @@ def render_dictation_day(
     A per-row document would be noise: the useful unit of dictation history is
     the day, and a heavy user produces thousands of rows in one.
 
+    A dictation Wispr Flow has since deleted keeps its place in the day, at
+    the time it was spoken, with a line saying when it went: a log that
+    silently lost it would misrepresent the day.
+
     Args:
         day: The ``YYYY-MM-DD`` the entries belong to.
-        entries: ``{"text", "app", "when", "provenance"}`` per dictation.
+        entries: ``{"text", "app", "when", "provenance"}`` per dictation, in
+            the order to show them. An entry with ``"removed_on"`` is one
+            upstream no longer has.
 
     Returns:
-        The Markdown document.
+        The Markdown document. With nothing removed it is byte-for-byte what
+        this function produced before removals were shown.
     """
+    present = [entry for entry in entries if not entry.get("removed_on")]
     front = yaml_block(
         {
             "kind": "dictation",
             "date": day,
-            "entries": len(entries),
-            "words": sum(int(entry.get("words") or 0) for entry in entries),
+            "entries": len(present),
+            "words": sum(_count(entry.get("words")) for entry in present),
+            "removed": (len(entries) - len(present)) or None,
             "source": "wispr-local",
             "tags": ["wispr/dictation"],
         }
@@ -518,6 +561,28 @@ def render_dictation_day(
         app = entry.get("app")
         heading = f"**{stamp}**" + (f" — {app}" if app else "")
         body += [heading, "", str(entry.get("text", "")).strip(), ""]
+        if entry.get("removed_on"):
+            body += [f"> Removed from Wispr Flow on {entry['removed_on']}; kept here.", ""]
     if not entries:
         body += ["_No dictations recorded._", ""]
     return front + "\n" + "\n".join(body).rstrip() + "\n"
+
+
+def _count(value: Any) -> int:
+    """Read a word count, treating anything that is not a number as zero.
+
+    ``numWords`` is nominally an integer, and a string in it used to raise out
+    of the day renderer and take the rest of the run with it.
+
+    Args:
+        value: The column value.
+
+    Returns:
+        The count, or ``0``.
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0

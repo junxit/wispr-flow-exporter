@@ -439,3 +439,71 @@ def test_every_document_opens_with_exactly_one_frontmatter_block(
     assert document.startswith("---\n")
     delimiters = [line for line in document.splitlines() if line.strip() == "---"]
     assert len(delimiters) == 2
+
+
+# --- what upstream removed ------------------------------------------------
+# The two documents below are byte-for-byte what 0.4.x produced for the same
+# input. Showing removed rows must not change a document with nothing removed:
+# every archived dictionary and day log would otherwise be rewritten once, for
+# nothing, by the upgrade.
+
+_DICTIONARY_BEFORE_REMOVALS = (
+    '---\nkind: "dictionary"\nentries: 3\nsnippets: 1\nsource: "wispr-local"\n'
+    'tags:\n  - "wispr/dictionary"\n---\n\n# Custom dictionary\n\n## Phrases\n\n'
+    "| Phrase | Replacement |\n| --- | --- |\n| ~~gone~~ | ~~removed~~ |\n"
+    "| kubernetis | Kubernetes |\n\n## Snippets\n\n| Phrase | Replacement |\n"
+    "| --- | --- |\n| brb | be right back |\n"
+)
+_DAY_BEFORE_REMOVALS = (
+    '---\nkind: "dictation"\ndate: "2026-08-30"\nentries: 1\nwords: 5\n'
+    'source: "wispr-local"\ntags:\n  - "wispr/dictation"\n---\n\n'
+    "# Dictation — 2026-08-30\n\n**09:14** — com.example.NotepadApp\n\n"
+    "Send the whisper budget.\n"
+)
+
+
+def test_a_dictionary_with_nothing_removed_renders_as_it_always_has() -> None:
+    """The removed-rows section costs nothing when there is nothing in it."""
+    rows = [
+        {"phrase": "brb", "replacement": "be right back", "isSnippet": 1},
+        {"phrase": "kubernetis", "replacement": "Kubernetes"},
+        {"phrase": "gone", "replacement": "removed", "isDeleted": 1},
+    ]
+
+    assert render_dictionary(rows) == _DICTIONARY_BEFORE_REMOVALS
+
+
+def test_a_day_log_with_nothing_removed_renders_as_it_always_has() -> None:
+    """Same promise for the dictation log."""
+    entries = [
+        {
+            "when": "09:14",
+            "app": "com.example.NotepadApp",
+            "text": "Send the whisper budget.",
+            "words": 5,
+        }
+    ]
+
+    assert render_dictation_day("2026-08-30", entries) == _DAY_BEFORE_REMOVALS
+
+
+def test_a_removed_dictionary_entry_cannot_end_its_own_table_row() -> None:
+    """The escaping that protects live rows protects removed ones too.
+
+    Shared and team dictionary entries are text this account did not write,
+    and a removed one is shown just the same.
+    """
+    hostile = {"phrase": "hush|now", "replacement": "Hush\n# Injected heading"}
+
+    document = render_dictionary([], removed=[(hostile, "2026-09-01T10:00:00+00:00")])
+
+    assert "\n# Injected heading" not in document
+    assert "| ~~hush\\|now~~ | ~~Hush # Injected heading~~ | 2026-09-01 |" in document
+    assert "removed_upstream: 1" in document
+
+
+def test_a_non_numeric_word_count_does_not_stop_the_day_log() -> None:
+    """The numWords column is nominally an integer; a string used to raise."""
+    entries = [{"when": "09:14", "app": None, "text": "hush", "words": "n/a"}]
+
+    assert "words: 0" in render_dictation_day("2026-08-30", entries)

@@ -63,6 +63,39 @@ wrapped at 72 columns, US English.
   transcriptDeletedAt are now required on Meetings, the dictation text
   cascade and app on History, and replacement, isSnippet and isDeleted
   on Dictionary.
+- Rows Wispr Flow deletes are kept, for every table archived as a whole
+  file. The dictionary, todos, each day of dictation and every table
+  archived generically were rewritten from the rows upstream held at
+  that moment, so a hard-deleted row vanished from the archive on the
+  next run that touched its file -- and verify, comparing that file's
+  own count with the table's, called the result consistent. Measured on
+  0.4.1: two dictionary entries and two same-day dictations, one of each
+  deleted upstream, one plain sync, both gone. Each file still mirrors
+  upstream exactly, so 0.4.x archives need no migration; what upstream
+  drops now moves first to a <file>.removed.ndjson ledger beside it, one
+  verbatim row per line with the date it was first seen gone. Ledgers
+  are only ever appended to, at the byte level, and record each row once
+  however many runs see it gone, so a second run writes nothing. A table
+  emptied upstream becomes an empty file and a full ledger.
+- Dictation days outside the re-read window are watched too. Each run
+  now reads every History row's identity and timestamp -- two columns,
+  cheap -- and rewrites any day whose membership moved, carrying forward
+  the rows the window did not re-read. Before, three kinds of dictation
+  could be lost: one deleted on a day the window had passed (never
+  noticed); one stamped exactly on the window's midnight boundary, which
+  the strict `>` query never returned while its day was rewritten
+  without it; and one with no timestamp at all, which no windowed query
+  can match and only --full ever found. --full itself rewrote every day
+  from scratch, which made it the most destructive run there was; it is
+  now as safe as any other.
+- dictionary.md lists entries deleted upstream in a "Removed upstream"
+  section with the date each went, and a day's dictation log keeps a
+  removed entry at the time it was spoken, marked as removed. With
+  nothing removed both documents are byte-for-byte what 0.4.x wrote, so
+  the upgrade does not rewrite them. Sharded tables' rows are ordered by
+  date and identity rather than scan order, which may rewrite a few
+  shards once; a dictation day log no longer stops the run when numWords
+  holds something that is not a number.
 
 0.4.1
 -----

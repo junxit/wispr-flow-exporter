@@ -162,6 +162,54 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
+#: Refuse to read back an archived NDJSON larger than this. Our own files, but
+#: read on every run that rewrites them, so they get the same kind of bound the
+#: NDJSON transcript reader applies to files another application wrote.
+MAX_NDJSON_BYTES = 512 * 1024 * 1024
+
+
+def read_ndjson(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read an archived NDJSON file back, keeping what cannot be parsed.
+
+    Used before a snapshot or a shard is rewritten, to find the rows upstream
+    no longer has. A line that will not parse is returned as text rather than
+    dropped: it was in the archive, and the archive does not get to lose it
+    for being damaged.
+
+    Args:
+        path: The file. Absent reads as empty.
+
+    Returns:
+        ``(rows, unparsed)``: every line that decoded to a JSON object, and the
+        raw text of every non-empty line that did not.
+
+    Raises:
+        OSError: The file exists but is larger than :data:`MAX_NDJSON_BYTES`
+            or cannot be read.
+    """
+    try:
+        if path.stat().st_size > MAX_NDJSON_BYTES:
+            raise OSError(f"{path} is larger than {MAX_NDJSON_BYTES} bytes")
+        text = path.read_bytes().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return [], []
+    rows: list[dict[str, Any]] = []
+    unparsed: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except (ValueError, RecursionError):
+            unparsed.append(line)
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+        else:
+            unparsed.append(line)
+    return rows, unparsed
+
+
 def write_json(path: Path, payload: Any) -> None:
     """Write JSON atomically, so an interrupted run cannot truncate the file.
 

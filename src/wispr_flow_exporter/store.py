@@ -101,6 +101,36 @@ def content_hash(spec: TableSpec, data: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def row_identity(spec: TableSpec, row: Mapping[str, Any]) -> str:
+    """Name a row for retention: by its key, or by its content when keyless.
+
+    A row that cannot be named by a key is named by what it holds, so a keyless
+    table keeps every distinct version it has ever archived -- an edit reads as
+    a removal plus an addition, which loses nothing.
+
+    Args:
+        spec: The table's declaration.
+        row: One archived row.
+
+    Returns:
+        The key identity, or ``"#"`` followed by the row's content digest.
+    """
+    return spec.identity(row) or "#" + content_hash(spec, row)
+
+
+def rows_hash(spec: TableSpec, rows: Sequence[Mapping[str, Any]]) -> str:
+    """Digest a whole file's worth of rows, as snapshots and shards record it.
+
+    Args:
+        spec: The table's declaration.
+        rows: The rows, in file order.
+
+    Returns:
+        The digest stored as ``content_hash`` on the file's index entry.
+    """
+    return content_hash(spec, {"rows": [content_hash(spec, row) for row in rows]})
+
+
 def row_order(spec: TableSpec, row: Mapping[str, Any]) -> tuple[str, ...]:
     """Sort key that makes a snapshot's line order independent of scan order.
 

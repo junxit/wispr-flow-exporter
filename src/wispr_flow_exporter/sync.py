@@ -27,7 +27,7 @@ all.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,11 +45,19 @@ from .normalize import (
     to_instant,
 )
 from .paths import WisprPaths
-from .schema import EXPECTED, Layout
+from .retention import (
+    key_digest,
+    ledger_path,
+    read_ledger,
+    record_removals,
+    still_removed,
+)
+from .schema import EXPECTED, Layout, TableSpec
 from .secure_io import (
     copy_file_secure,
     file_digest,
     read_json,
+    read_ndjson,
     secure_mkdir,
     write_bytes_if_changed,
     write_json_if_changed,
@@ -57,7 +65,15 @@ from .secure_io import (
     write_text_if_changed,
 )
 from .sqlite_source import Record, SqliteSource
-from .store import Archive, content_hash, entity_name, row_order
+from .store import (
+    UNDATED,
+    Archive,
+    content_hash,
+    entity_name,
+    row_identity,
+    row_order,
+    rows_hash,
+)
 
 SOURCE_LOCAL = "wispr-local"
 
@@ -928,7 +944,7 @@ def sync_snapshot(
     source: SqliteSource,
     table: str,
     options: SyncOptions,
-    *, 
+    *,
     render_markdown: bool = False,
 ) -> SyncCounts:
     """Archive a small mutable table as one NDJSON snapshot.
@@ -937,6 +953,12 @@ def sync_snapshot(
     row. The file already contains every row including the tombstoned ones, so
     per-row index entries would restate what the artifact says while making
     ``index.json`` grow with data that has no separate location.
+
+    The file mirrors upstream exactly, which is also why a row Wispr Flow
+    hard-deletes used to vanish from it on the next rewrite. Before the file
+    is replaced, rows the old version held and upstream no longer does go to
+    the ledger beside it (see :mod:`.retention`); a table emptied upstream
+    becomes an empty file and a full ledger, never an empty archive.
 
     Args:
         archive: The destination archive.
@@ -960,7 +982,7 @@ def sync_snapshot(
     counts.scanned = len(rows)
 
     destination = archive.record_path(table, spec, "")
-    digest = content_hash(spec, {"rows": [content_hash(spec, row) for row in rows]})
+    digest = rows_hash(spec, rows)
     entry = archive.entry(entity, entity)
 
     if (
@@ -975,11 +997,16 @@ def sync_snapshot(
         counts.written = len(rows)
         return counts
 
-    wrote = write_ndjson_if_changed(destination, rows)
+    present = {row_identity(spec, row) for row in rows}
+    ledger = ledger_path(destination)
+    counts.absent = _keep_removed(destination, ledger, spec, present, now)
+    wrote = counts.absent > 0
+    wrote |= write_ndjson_if_changed(destination, rows)
+    removed = still_removed(read_ledger(ledger), spec, present)
     if render_markdown and table == "Dictionary":
         wrote |= _write_markdown(
             destination.with_name("dictionary.md"),
-            render.render_dictionary(rows),
+            render.render_dictionary(rows, removed),
             options,
         )
 
@@ -987,6 +1014,7 @@ def sync_snapshot(
         "path": archive.relative(destination),
         "records": len(rows),
         "deleted_records": sum(1 for row in rows if spec.is_soft_deleted(row)),
+        "removed_records": len(removed) or None,
         "content_hash": digest,
         "source": SOURCE_LOCAL,
     }
@@ -996,6 +1024,50 @@ def sync_snapshot(
     counts.written = len(rows) if wrote else 0
     counts.unchanged = 0 if wrote else len(rows)
     return counts
+
+
+def _keep_removed(
+    main: Path, ledger: Path, spec: TableSpec, present: set[str], when: str
+) -> int:
+    """Move rows upstream dropped from a file about to be rewritten into its ledger.
+
+    Called immediately before the main file is replaced, so the ledger is
+    always written first: there is no instant at which a removed row is in
+    neither file.
+
+    Args:
+        main: The snapshot or shard about to be rewritten.
+        ledger: Its ledger.
+        spec: The table's declaration.
+        present: Every identity upstream holds now -- across the whole table,
+            so a row that moved to another shard is not mistaken for removed.
+        when: ISO timestamp for ``missing_since``.
+
+    Returns:
+        How many rows were newly recorded as removed.
+    """
+    old_rows, unparsed = read_ndjson(main)
+    gone = [row for row in old_rows if row_identity(spec, row) not in present]
+    return record_removals(ledger, spec, gone, unparsed, when=when)
+
+
+def _day_start(day: str) -> datetime | None:
+    """Return the instant a ``YYYY-MM-DD`` shard name stands for.
+
+    A day whose rows have all gone upstream still has a shard on disk, and its
+    path has to come from the name rather than from a row that no longer
+    exists.
+
+    Args:
+        day: A shard's day, or ``"undated"``.
+
+    Returns:
+        Midnight UTC of that day, or ``None`` for the undated shard.
+    """
+    try:
+        return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 def _day_of(value: Any) -> str | None:
@@ -1045,9 +1117,21 @@ def sync_dictation(
     A document per dictation would be unusable: a heavy user produces
     thousands in a day, and the useful unit of dictation history is the day.
 
-    Whole days are rewritten rather than appended to. A run that only read the
-    newest rows would otherwise replace a day's shard with just those rows and
-    silently drop the rest of the day.
+    Rows are read in two ways. A trailing window is re-read in full every run,
+    because History rows are edited in place after creation and carry no
+    modification time. And every row's identity and timestamp are read every
+    run, which is cheap and is the only way to know that a day *outside* the
+    window lost a row -- or gained one, or holds one with no timestamp at all,
+    which no windowed query can ever match. A day is rewritten when it was
+    re-read or when its membership moved; rows it keeps that the window did
+    not re-read are carried forward from the archived shard, and rows
+    upstream deleted go to the shard's ledger instead of vanishing.
+
+    Before this, a whole day was rewritten from just the rows the window read.
+    A hard-deleted dictation vanished from the archive, a row stamped exactly
+    on the window's midnight boundary was dropped (the query is ``>``), and
+    ``sync --full`` rewrote every day from scratch -- the most destructive run
+    there was.
 
     When ``localDataPolicy`` is ``never_store`` this pass legitimately finds
     nothing, and that is recorded rather than inferred. An archive that is
@@ -1076,7 +1160,7 @@ def sync_dictation(
         )
     )
 
-    days: dict[str, list[dict[str, Any]]] = {}
+    read: dict[str, dict[str, Any]] = {}
     blobs: list[tuple[str, str, str, bytes]] = []
     highest: Any = None
 
@@ -1089,16 +1173,11 @@ def sync_dictation(
             include_blobs=options.include_blobs,
         ):
             counts.scanned += 1
-            data = record.data
-            day = _day_of(data.get("timestamp"))
-            if day is None:
-                # An unparseable timestamp still gets archived, under a name
-                # that says so rather than under today's date.
-                day = "undated"
-            days.setdefault(day, []).append(data)
-            raw = data.get("timestamp")
+            read[row_identity(spec, record.data)] = record.data
+            raw = record.data.get("timestamp")
             if isinstance(raw, str) and (highest is None or raw > highest):
                 highest = raw
+            day = _day_of(raw) or UNDATED
             for column, payload in record.blobs.items():
                 blobs.append((day, record.key, column, payload))
     except KeyboardInterrupt:
@@ -1110,37 +1189,88 @@ def sync_dictation(
         counts.written = counts.scanned
         return counts
 
-    for day, rows in sorted(days.items()):
-        when = to_instant(TimestampKind.SEQUELIZE, rows[0].get("timestamp"))
-        shard = archive.record_path("History", spec, "", when=when)
-        rows.sort(key=lambda row: str(row.get("timestamp", "")))
+    live = source.keys("History", also="timestamp")
+    archived = archive.entries("dictation")
+    members: dict[str, set[str]] = {}
+    if live is None:
+        # The key column is gone -- breaking drift, already reported. Without
+        # it nothing can be proven absent, so only the re-read days are
+        # rewritten and every row they held is kept.
+        for identity, row in read.items():
+            members.setdefault(_day_of(row.get("timestamp")) or UNDATED, set()).add(identity)
+        touched = set(members)
+    else:
+        for identity, stamp in live.items():
+            members.setdefault(_day_of(stamp) or UNDATED, set()).add(identity)
+        touched = {_day_of(row.get("timestamp")) or UNDATED for row in read.values()}
+        for day in set(members) | set(archived):
+            if _membership_moved(archived.get(day), members.get(day, set())):
+                touched.add(day)
 
-        wrote = write_ndjson_if_changed(shard, rows)
-        entries = []
-        for row in rows:
-            text, provenance = resolve_dictation_text(row)
-            stamp = to_instant(TimestampKind.SEQUELIZE, row.get("timestamp"))
-            entries.append(
-                {
-                    "when": f"{stamp:%H:%M}" if stamp else "",
-                    "app": row.get("app"),
-                    "text": text,
-                    "words": row.get("numWords"),
-                    "provenance": provenance,
-                }
-            )
+    shards: dict[str, Path] = {}
+    carried: dict[str, dict[str, dict[str, Any]]] = {}
+    unparsed: dict[str, list[str]] = {}
+    for day in touched:
+        shards[day] = archive.record_path("History", spec, "", when=_day_start(day))
+        old_rows, unparsed[day] = read_ndjson(shards[day])
+        carried[day] = {row_identity(spec, row): row for row in old_rows}
+
+    # Rows upstream holds for a day being rewritten that neither the window
+    # nor the archive has: a backfilled old dictation, one on the window's
+    # boundary, one with no timestamp. Fetched by key, blobs and all.
+    missing = {
+        identity
+        for day in touched
+        for identity in members.get(day, set())
+        if identity not in read and identity not in carried[day]
+    }
+    if missing:
+        for record in source.records(
+            "History",
+            keys=missing,
+            include_screen_context=options.include_screen_context,
+            include_blobs=options.include_blobs,
+        ):
+            read[row_identity(spec, record.data)] = record.data
+            day = _day_of(record.data.get("timestamp")) or UNDATED
+            for column, payload in record.blobs.items():
+                blobs.append((day, record.key, column, payload))
+
+    everywhere = set(live) if live is not None else None
+    for day in sorted(touched):
+        ids = members.get(day, set())
+        if live is None:
+            ids = ids | set(carried[day])
+        rows = [
+            found
+            for identity in ids
+            if (found := read.get(identity) or carried[day].get(identity)) is not None
+        ]
+        rows.sort(key=lambda row: (str(row.get("timestamp", "")), row_identity(spec, row)))
+        shard = shards[day]
+        ledger = ledger_path(shard)
+        removed: list[tuple[dict[str, Any], str]] = []
+        appended = 0
+        if everywhere is not None:
+            gone = [row for key, row in carried[day].items() if key not in everywhere]
+            appended = record_removals(ledger, spec, gone, unparsed[day], when=now)
+            removed = still_removed(read_ledger(ledger), spec, everywhere)
+        counts.absent += appended
+
+        wrote = appended > 0
+        wrote |= write_ndjson_if_changed(shard, rows)
         wrote |= _write_markdown(
             shard.with_suffix(".md"),
-            render.render_dictation_day(day, entries),
+            render.render_dictation_day(day, _day_entries(spec, rows, removed)),
             options,
         )
 
         fields: dict[str, Any] = {
             "path": archive.relative(shard),
             "records": len(rows),
-            "content_hash": content_hash(
-                spec, {"rows": [content_hash(spec, row) for row in rows]}
-            ),
+            "content_hash": rows_hash(spec, rows),
+            "key_digest": key_digest(ids) if live is not None else None,
+            "removed_records": len(removed) or None,
             "source": SOURCE_LOCAL,
         }
         if wrote:
@@ -1167,6 +1297,64 @@ def sync_dictation(
     return counts
 
 
+def _membership_moved(entry: Any, ids: set[str]) -> bool:
+    """Report whether a day's rows upstream differ from what was archived.
+
+    Args:
+        entry: The day's index entry, if it has one.
+        ids: Identities upstream holds for that day now.
+
+    Returns:
+        ``True`` when the day must be rewritten: it was never archived, or the
+        set of rows it holds moved. Entries written before identities were
+        recorded fall back to comparing the count, once, until rewritten.
+    """
+    if not isinstance(entry, dict):
+        return bool(ids)
+    recorded = entry.get("key_digest")
+    if isinstance(recorded, str):
+        return recorded != key_digest(ids)
+    return entry.get("records") != len(ids)
+
+
+def _day_entries(
+    spec: TableSpec,
+    rows: Sequence[dict[str, Any]],
+    removed: Sequence[tuple[dict[str, Any], str]],
+) -> list[dict[str, Any]]:
+    """Build a day log's entries, removed dictations in their original place.
+
+    Args:
+        spec: The History declaration.
+        rows: The day's rows upstream holds now.
+        removed: ``(row, missing_since)`` for the day's rows upstream deleted.
+
+    Returns:
+        One entry per dictation, in the order it was spoken.
+    """
+    combined = [(row, "") for row in rows] + [
+        (row, since[:10]) for row, since in removed
+    ]
+    combined.sort(
+        key=lambda item: (str(item[0].get("timestamp", "")), row_identity(spec, item[0]))
+    )
+    entries = []
+    for row, removed_on in combined:
+        text, provenance = resolve_dictation_text(row)
+        stamp = to_instant(TimestampKind.SEQUELIZE, row.get("timestamp"))
+        entry: dict[str, Any] = {
+            "when": f"{stamp:%H:%M}" if stamp else "",
+            "app": row.get("app"),
+            "text": text,
+            "words": row.get("numWords"),
+            "provenance": provenance,
+        }
+        if removed_on:
+            entry["removed_on"] = removed_on
+        entries.append(entry)
+    return entries
+
+
 # Tables with a dedicated pass. Everything else is archived generically, which
 # is what makes a table shipped in a future migration cost no code change.
 HANDLED_TABLES = frozenset(
@@ -1178,6 +1366,12 @@ def sync_sharded(
     archive: Archive, source: SqliteSource, table: str, options: SyncOptions
 ) -> SyncCounts:
     """Archive an append-mostly table as date-sharded NDJSON.
+
+    Every row is read every run, so the set of rows upstream holds is known
+    exactly. Days that held rows before are revisited even when no row now
+    lands on them, so a day emptied upstream keeps its rows -- in its ledger --
+    instead of keeping a stale file nobody checks. Rows within a day are
+    ordered by their date column and then identity, never by scan order.
 
     Args:
         archive: The destination archive.
@@ -1195,6 +1389,9 @@ def sync_sharded(
     date_column = spec.date_column
     kind = spec.timestamps.get(date_column or "", TimestampKind.SEQUELIZE)
 
+    def instant(row: Mapping[str, Any]) -> datetime | None:
+        return to_instant(kind, row.get(date_column)) if date_column else None
+
     days: dict[str, list[dict[str, Any]]] = {}
     for record in source.records(
         table,
@@ -1202,8 +1399,8 @@ def sync_sharded(
         include_blobs=options.include_blobs,
     ):
         counts.scanned += 1
-        when = to_instant(kind, record.data.get(date_column)) if date_column else None
-        days.setdefault(f"{when:%Y-%m-%d}" if when else "undated", []).append(
+        when = instant(record.data)
+        days.setdefault(f"{when:%Y-%m-%d}" if when else UNDATED, []).append(
             record.data
         )
 
@@ -1219,15 +1416,26 @@ def sync_sharded(
             f"{entity}:empty",
             table=table,
             records=0,
-            content_hash=content_hash(spec, {"rows": []}),
+            content_hash=rows_hash(spec, []),
             source=SOURCE_LOCAL,
         )
-        return counts
 
-    for day, rows in sorted(days.items()):
-        when = to_instant(kind, rows[0].get(date_column)) if date_column else None
-        shard = archive.record_path(table, spec, "", when=when)
-        digest = content_hash(spec, {"rows": [content_hash(spec, r) for r in rows]})
+    prefix = f"{entity}:"
+    archived_days = {
+        key.removeprefix(prefix)
+        for key in archive.entries("tables")
+        if key.startswith(prefix) and key != f"{entity}:empty"
+    }
+    everywhere = {row_identity(spec, row) for rows in days.values() for row in rows}
+
+    def order(row: Mapping[str, Any]) -> tuple[str, str]:
+        stamp = instant(row)
+        return (stamp.isoformat() if stamp else "", row_identity(spec, row))
+
+    for day in sorted(set(days) | archived_days):
+        rows = sorted(days.get(day, []), key=order)
+        shard = archive.record_path(table, spec, "", when=_day_start(day))
+        digest = rows_hash(spec, rows)
         key = f"{entity}:{day}"
         entry = archive.entry("tables", key)
         if (
@@ -1239,11 +1447,17 @@ def sync_sharded(
             counts.unchanged += len(rows)
             continue
 
-        wrote = write_ndjson_if_changed(shard, rows)
+        ledger = ledger_path(shard)
+        appended = _keep_removed(shard, ledger, spec, everywhere, now)
+        counts.absent += appended
+        wrote = appended > 0
+        wrote |= write_ndjson_if_changed(shard, rows)
+        removed = still_removed(read_ledger(ledger), spec, everywhere)
         fields: dict[str, Any] = {
             "path": archive.relative(shard),
             "table": table,
             "records": len(rows),
+            "removed_records": len(removed) or None,
             "content_hash": digest,
             "source": SOURCE_LOCAL,
         }
@@ -1287,6 +1501,8 @@ def sync_tables(
         counts.scanned += pass_counts.scanned
         counts.written += pass_counts.written
         counts.unchanged += pass_counts.unchanged
+        counts.absent += pass_counts.absent
+        counts.failed += pass_counts.failed
     return counts
 
 

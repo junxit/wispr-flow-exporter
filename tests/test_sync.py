@@ -991,6 +991,322 @@ def test_dictation_re_runs_write_nothing(scene: Callable[..., tuple]) -> None:
     assert _snapshot(archive.root) == before
 
 
+# --- what upstream deletes -------------------------------------------------
+# Each of these failed before the ledger existed: the row vanished from the
+# archive on the next run that rewrote its file, and verify still called the
+# result consistent.
+
+
+def _delete(db: Path, table: str, column: str, key: str) -> None:
+    """Hard-delete one row upstream, the way Wispr Flow itself can.
+
+    Args:
+        db: The source database.
+        table: Table name.
+        column: Key column.
+        key: Key value.
+    """
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(f'DELETE FROM "{table}" WHERE "{column}" = ?', (key,))
+
+
+def _ndjson(path: Path) -> list[dict[str, object]]:
+    """Read an archived NDJSON file's rows.
+
+    Args:
+        path: The file.
+
+    Returns:
+        One mapping per line.
+    """
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_hard_deleted_dictionary_entry_is_kept_in_the_ledger(
+    scene: Callable[..., tuple],
+) -> None:
+    """The snapshot mirrors upstream; the ledger keeps what upstream dropped."""
+    archive, resolved, db = scene(rows=[], tables={"Dictionary": DICTIONARY_ROWS})
+    _run(archive, resolved)
+
+    _delete(db, "Dictionary", "id", "d-1")
+    result = _run(Archive(root=archive.root), resolved)
+
+    root = archive.root / "dictionary"
+    assert [row["id"] for row in _ndjson(root / "dictionary.ndjson")] == ["d-2", "d-3"]
+    ledger = _ndjson(root / "dictionary.removed.ndjson")
+    assert [entry["row"]["id"] for entry in ledger] == ["d-1"]  # type: ignore[index]
+    assert result.counts["dictionary"].absent == 1
+    rendered = (root / "dictionary.md").read_text(encoding="utf-8")
+    assert "## Removed upstream" in rendered and "kubernetis" in rendered
+
+
+def test_a_table_emptied_upstream_keeps_every_row_it_had(
+    scene: Callable[..., tuple],
+) -> None:
+    """An empty table becomes an empty file and a full ledger, not a lost one."""
+    todos = [{"id": "t-1", "title": "Tally the murmurs"}, {"id": "t-2", "title": "Hush"}]
+    archive, resolved, db = scene(rows=[], tables={"Todos": todos})
+    _run(archive, resolved)
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute('DELETE FROM "Todos"')
+    _run(Archive(root=archive.root), resolved)
+
+    assert (archive.root / "todos" / "todos.ndjson").read_text(encoding="utf-8") == ""
+    ledger = _ndjson(archive.root / "todos" / "todos.removed.ndjson")
+    assert sorted(entry["row"]["id"] for entry in ledger) == ["t-1", "t-2"]  # type: ignore[index]
+
+
+def test_a_hard_deleted_row_of_a_generic_table_is_kept(
+    scene: Callable[..., tuple],
+) -> None:
+    """Tables with no pass of their own go through the same snapshot, and ledger."""
+    links = [
+        {"url": "https://example.invalid/a", "domain": "example.invalid"},
+        {"url": "https://example.invalid/b", "domain": "example.invalid"},
+    ]
+    archive, resolved, db = scene(rows=[], tables={"Links": links})
+    _run(archive, resolved)
+
+    _delete(db, "Links", "url", "https://example.invalid/b")
+    _run(Archive(root=archive.root), resolved)
+
+    ledger = _ndjson(archive.root / "tables" / "Links.removed.ndjson")
+    assert [entry["row"]["url"] for entry in ledger] == ["https://example.invalid/b"]  # type: ignore[index]
+
+
+def _polish(identifier: str, created: str) -> dict[str, object]:
+    """Build a Polish row.
+
+    Args:
+        identifier: The row id.
+        created: Its Sequelize createdAt.
+
+    Returns:
+        The row.
+    """
+    return {"id": identifier, "polishedText": f"polished {identifier}", "createdAt": created}
+
+
+def test_a_hard_deleted_row_of_a_sharded_table_is_kept(
+    scene: Callable[..., tuple],
+) -> None:
+    """Date-sharded tables are rewritten a day at a time; the day keeps its rows."""
+    rows = [
+        _polish("p-1", "2026-08-30 09:00:00.000 +00:00"),
+        _polish("p-2", "2026-08-30 10:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"Polish": rows})
+    _run(archive, resolved)
+
+    _delete(db, "Polish", "id", "p-2")
+    _run(Archive(root=archive.root), resolved)
+
+    day = archive.root / "tables" / "Polish" / "2026" / "08"
+    assert [row["id"] for row in _ndjson(day / "2026-08-30.ndjson")] == ["p-1"]
+    assert [e["row"]["id"] for e in _ndjson(day / "2026-08-30.removed.ndjson")] == ["p-2"]  # type: ignore[index]
+
+
+def test_a_sharded_day_emptied_upstream_is_kept(scene: Callable[..., tuple]) -> None:
+    """A day no row lands on any more is revisited, not forgotten with stale rows."""
+    rows = [
+        _polish("p-1", "2026-08-29 09:00:00.000 +00:00"),
+        _polish("p-2", "2026-08-30 10:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"Polish": rows})
+    _run(archive, resolved)
+
+    _delete(db, "Polish", "id", "p-1")
+    _run(Archive(root=archive.root), resolved)
+
+    day = archive.root / "tables" / "Polish" / "2026" / "08"
+    assert (day / "2026-08-29.ndjson").read_text(encoding="utf-8") == ""
+    assert [e["row"]["id"] for e in _ndjson(day / "2026-08-29.removed.ndjson")] == ["p-1"]  # type: ignore[index]
+
+
+def test_a_hard_deleted_dictation_in_the_window_is_kept(
+    scene: Callable[..., tuple],
+) -> None:
+    """The recheck window rewrites whole days; a deleted dictation is ledgered."""
+    history = [
+        _history_row(),
+        _history_row(transcriptEntityId=HISTORY_B, timestamp="2026-08-30 11:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    _delete(db, "History", "transcriptEntityId", HISTORY_B)
+    result = _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    day = archive.root / "dictation" / "2026" / "08"
+    assert [row["transcriptEntityId"] for row in _ndjson(day / "2026-08-30.ndjson")] == [HISTORY_A]
+    ledger = _ndjson(day / "2026-08-30.removed.ndjson")
+    assert [entry["row"]["transcriptEntityId"] for entry in ledger] == [HISTORY_B]  # type: ignore[index]
+    assert result.counts["dictation"].absent == 1
+
+
+def test_a_dictation_deleted_long_after_the_window_passed_it_is_noticed(
+    scene: Callable[..., tuple],
+) -> None:
+    """A day outside the window is not re-read, but its membership is checked."""
+    history = [
+        _history_row(transcriptEntityId=HISTORY_B, timestamp="2026-07-01 09:00:00.000 +00:00"),
+        _history_row(transcriptEntityId=HISTORY_C, timestamp="2026-07-01 10:00:00.000 +00:00"),
+        _history_row(),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    _delete(db, "History", "transcriptEntityId", HISTORY_B)
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    day = archive.root / "dictation" / "2026" / "07"
+    assert [row["transcriptEntityId"] for row in _ndjson(day / "2026-07-01.ndjson")] == [HISTORY_C]
+    ledger = _ndjson(day / "2026-07-01.removed.ndjson")
+    assert [entry["row"]["transcriptEntityId"] for entry in ledger] == [HISTORY_B]  # type: ignore[index]
+
+
+def test_a_full_rescan_no_longer_erases_hard_deleted_dictation(
+    scene: Callable[..., tuple],
+) -> None:
+    """--full used to rewrite every day from scratch: the most destructive run."""
+    history = [
+        _history_row(transcriptEntityId=HISTORY_B, timestamp="2026-07-01 09:00:00.000 +00:00"),
+        _history_row(transcriptEntityId=HISTORY_C, timestamp="2026-07-01 10:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    _delete(db, "History", "transcriptEntityId", HISTORY_C)
+    _run(Archive(root=archive.root), resolved, full=True, policy=_policy("store_normally"))
+
+    ledger = archive.root / "dictation" / "2026" / "07" / "2026-07-01.removed.ndjson"
+    assert [e["row"]["transcriptEntityId"] for e in _ndjson(ledger)] == [HISTORY_C]  # type: ignore[index]
+
+
+def test_a_dictation_on_the_recheck_floor_is_not_dropped(
+    scene: Callable[..., tuple],
+) -> None:
+    """The window starts at midnight and the query is strict, so this row was lost.
+
+    Stamped exactly on the floor, it was never returned by the windowed read,
+    and its day -- re-read for the row after it -- was rewritten without it.
+    """
+    floor = "2026-08-16 00:00:00.000 +00:00"
+    history = [
+        _history_row(transcriptEntityId=HISTORY_B, timestamp=floor),
+        _history_row(transcriptEntityId=HISTORY_C, timestamp="2026-08-16 12:00:00.000 +00:00"),
+        _history_row(),
+    ]
+    archive, resolved, _ = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    day = archive.root / "dictation" / "2026" / "08" / "2026-08-16.ndjson"
+    assert [row["transcriptEntityId"] for row in _ndjson(day)] == [HISTORY_B, HISTORY_C]
+
+
+def test_a_dictation_with_no_timestamp_is_archived_without_a_full_scan(
+    scene: Callable[..., tuple],
+) -> None:
+    """No windowed query can match a NULL timestamp; only --full ever found one."""
+    archive, resolved, db = scene(rows=[], tables={"History": [_history_row()]})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    import sqlite3
+
+    with sqlite3.connect(db) as writer:
+        writer.execute(
+            'INSERT INTO "History" ("transcriptEntityId", "formattedText") VALUES (?, ?)',
+            (HISTORY_D, "Undated murmur."),
+        )
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    undated = archive.root / "dictation" / "undated" / "undated.ndjson"
+    assert [row["transcriptEntityId"] for row in _ndjson(undated)] == [HISTORY_D]
+
+
+def test_the_day_log_marks_a_removed_dictation_in_place(
+    scene: Callable[..., tuple],
+) -> None:
+    """A log that silently lost an entry would misrepresent the day."""
+    history = [
+        _history_row(),
+        _history_row(
+            transcriptEntityId=HISTORY_B,
+            timestamp="2026-08-30 11:00:00.000 +00:00",
+            formattedText="The murmur quota is halved.",
+        ),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+
+    _delete(db, "History", "transcriptEntityId", HISTORY_B)
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    log = (archive.root / "dictation" / "2026" / "08" / "2026-08-30.md").read_text(
+        encoding="utf-8"
+    )
+    assert "The murmur quota is halved." in log
+    assert "Removed from Wispr Flow on" in log
+    assert "removed: 1" in log and "entries: 1" in log
+
+
+def test_a_second_run_after_a_hard_delete_writes_nothing(
+    scene: Callable[..., tuple],
+) -> None:
+    """Once recorded, a removal costs nothing on every run after it."""
+    history = [
+        _history_row(),
+        _history_row(transcriptEntityId=HISTORY_B, timestamp="2026-08-30 11:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(
+        rows=[], tables={"History": history, "Dictionary": DICTIONARY_ROWS}
+    )
+    _run(archive, resolved, policy=_policy("store_normally"))
+    _delete(db, "History", "transcriptEntityId", HISTORY_B)
+    _delete(db, "Dictionary", "id", "d-1")
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+    before = _snapshot(archive.root)
+
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+    _run(Archive(root=archive.root), resolved, full=True, policy=_policy("store_normally"))
+
+    assert _snapshot(archive.root) == before
+
+
+def test_an_archive_from_before_ledgers_is_not_rewritten_by_the_upgrade(
+    scene: Callable[..., tuple],
+) -> None:
+    """Index entries written by 0.4.x lack day fingerprints; nothing else changes.
+
+    Only index.json may move on the first run after upgrading -- the window's
+    days gain their fingerprint once -- and no archived file is rewritten.
+    """
+    history = [
+        _history_row(transcriptEntityId=HISTORY_B, timestamp="2026-07-01 09:00:00.000 +00:00"),
+        _history_row(),
+    ]
+    archive, resolved, _ = scene(rows=[], tables={"History": history})
+    _run(archive, resolved, policy=_policy("store_normally"))
+    for entry in archive.entries("dictation").values():
+        entry.pop("key_digest", None)
+    archive.save()
+    before = _snapshot(archive.root)
+
+    _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
+
+    after = _snapshot(archive.root)
+    moved = {path for path in set(before) | set(after) if before.get(path) != after.get(path)}
+    assert moved <= {"index.json"}
+
+
 # --- misc tables and account ----------------------------------------------
 
 

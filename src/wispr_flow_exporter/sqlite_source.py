@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -392,6 +392,36 @@ class SqliteSource:
             columns=self.columns(table),
         )
 
+    def keys(self, table: str, *, also: str | None = None) -> dict[str, Any] | None:
+        """Read every row's identity, and optionally one more column, cheaply.
+
+        What a watermarked pass cannot know on its own: the full set of rows
+        upstream holds right now. Absence can only be established against
+        that, and before this existed only a full re-read could supply it.
+
+        Args:
+            table: Table name, which must come from :meth:`tables`.
+            also: A second column to return per row, such as a timestamp.
+
+        Returns:
+            Identity to the ``also`` value (``None`` without one), or ``None``
+            when a key column is missing -- under key drift, "no rows" would
+            read as "every row was deleted", so the answer is "cannot say".
+        """
+        spec = self.spec_for(table)
+        available = self.columns(table)
+        if not spec.key_columns or any(c not in available for c in spec.key_columns):
+            return None
+        selected = [*spec.key_columns, *([also] if also and also in available else [])]
+        quoted = ", ".join(f'"{name}"' for name in selected)
+        found: dict[str, Any] = {}
+        for row in self.connection.execute(f'SELECT {quoted} FROM "{table}"'):
+            values = dict(zip(selected, row, strict=True))
+            identity = spec.identity(values)
+            if identity is not None:
+                found[identity] = values.get(also) if also else None
+        return found
+
     def records(
         self,
         table: str,
@@ -400,6 +430,7 @@ class SqliteSource:
         include_blobs: bool = False,
         since: Any = None,
         since_column: str | None = None,
+        keys: Collection[str] | None = None,
     ) -> Iterator[Record]:
         """Read a table's rows, coerced into archivable records.
 
@@ -416,9 +447,15 @@ class SqliteSource:
                 are returned. Compared in SQL against the raw stored value,
                 which is why the watermark is stored raw rather than parsed.
             since_column: Column the watermark applies to.
+            keys: Read only these rows, by single-column key. Used to fetch
+                rows a pass needs but its watermark window did not return.
 
         Yields:
             One :class:`Record` per row.
+
+        Raises:
+            SourceError: ``keys`` was given for a table without a
+                single-column key.
         """
         spec = self.spec_for(table)
         available = self.columns(table)
@@ -430,6 +467,18 @@ class SqliteSource:
 
         quoted = ", ".join(f'"{name}"' for name in projected)
         query = f'SELECT {quoted} FROM "{table}"'
+        if keys is not None:
+            if len(spec.key_columns) != 1:
+                raise SourceError(f"{table} has no single-column key to read by")
+            wanted = sorted(set(keys))
+            # Bounded batches: SQLite limits bound parameters per statement.
+            for start in range(0, len(wanted), 500):
+                batch = wanted[start : start + 500]
+                marks = ", ".join("?" for _ in batch)
+                clause = f' WHERE "{spec.key_columns[0]}" IN ({marks})'
+                for row in self.connection.execute(query + clause, batch):
+                    yield self._coerce(spec, table, row, include_blobs=include_blobs)
+            return
         params: tuple[Any, ...] = ()
         if since is not None and since_column and since_column in available:
             query += f' WHERE "{since_column}" > ?'
