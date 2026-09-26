@@ -146,6 +146,8 @@ class SyncCounts:
         absent: Records flagged as gone from the source.
         failed: Records that raised.
         bytes_copied: Binary bytes written.
+        held_back: Documents breaking drift kept from being rewritten. Each is
+            marked ``render_stale`` so a later run rebuilds it.
     """
 
     scanned: int = 0
@@ -155,6 +157,7 @@ class SyncCounts:
     absent: int = 0
     failed: int = 0
     bytes_copied: int = 0
+    held_back: int = 0
 
     def line(self, entity: str) -> str:
         """Summarize this pass in one line.
@@ -174,6 +177,8 @@ class SyncCounts:
             parts.append(f"{self.absent} gone upstream")
         if self.failed:
             parts.append(f"{self.failed} FAILED")
+        if self.held_back:
+            parts.append(f"{self.held_back} held back")
         return f"{entity}: " + ", ".join(parts)
 
 
@@ -284,11 +289,12 @@ def _needs_reading(
 ) -> set[str]:
     """Name the live records a watermarked read would skip but this run must visit.
 
-    A watermark only returns rows modified since the last run. Three kinds of
+    A watermark only returns rows modified since the last run. Four kinds of
     record can hide behind it: one the index never recorded a file for -- a
     dry run before 0.4.1 left exactly that behind, with the watermark already
-    past it -- one flagged as gone upstream that has since come back, and one
-    missing from the index altogether.
+    past it -- one flagged as gone upstream that has since come back, one
+    missing from the index altogether, and one whose documents breaking drift
+    held back, which must be rebuilt although its content has not moved.
 
     Args:
         archive: The archive.
@@ -314,6 +320,7 @@ def _needs_reading(
             not isinstance(entry, dict)
             or not isinstance(entry.get("path"), str)
             or entry.get("upstream_state") == STATE_ABSENT
+            or entry.get("render_stale")
         ):
             wanted.add(identity)
     return wanted
@@ -466,6 +473,7 @@ def _archive_meeting(
         and not options.full
         and destination.is_dir()
         and archive.existing_path("meetings", key) == destination
+        and not entry.get("render_stale")
     )
     archive.mark_seen("meetings", key, soft_deleted=record.soft_deleted, when=now)
     if up_to_date:
@@ -477,6 +485,7 @@ def _archive_meeting(
     if archive.relocate("meetings", key, destination):
         counts.relocated += 1
 
+    held = counts.held_back
     wrote = _write_meeting_files(
         archive, destination, record, artifacts, options, counts
     )
@@ -490,6 +499,7 @@ def _archive_meeting(
         "content_hash": digest,
         "artifacts": list(artifacts.present) if artifacts else [],
         "transcript_deleted_upstream": transcript_deleted or None,
+        "render_stale": True if counts.held_back > held else None,
         "source": SOURCE_LOCAL,
     }
     # Only set when something was actually written. put() treats None as
@@ -552,8 +562,6 @@ def _write_meeting_files(
         wrote |= write_json_if_changed(raw_dir / "speaker_map.json", speakers.raw)
 
     # Verbatim copies, so a parser change never needs the source again.
-    refined = read_transcript(artifacts.refined if artifacts else None)
-    live = read_transcript(artifacts.live if artifacts else None)
     if artifacts is not None:
         for name, filename in (
             ("refined", "refined.ndjson"),
@@ -590,6 +598,34 @@ def _write_meeting_files(
                     },
                 )
 
+    for name, text in _meeting_documents(record, artifacts).items():
+        wrote |= _write_markdown(destination / name, text, options, counts)
+    return wrote
+
+
+def _meeting_documents(
+    record: Record, artifacts: MeetingArtifacts | None
+) -> dict[str, str]:
+    """Render every document a meeting's directory holds, writing none of them.
+
+    A pure function of the meeting row and its transcript files, shared by
+    sync -- which passes the files in Wispr Flow's directory -- and by render,
+    which passes the verbatim copies already in the archive. One builder is
+    what makes re-rendering produce exactly what a sync would have.
+
+    Args:
+        record: The meeting row, with its soft-deletion state.
+        artifacts: Its transcript files, when there are any.
+
+    Returns:
+        File name inside the meeting's directory to document text.
+    """
+    data = record.data
+    speakers = SpeakerMap.parse(data.get("speakerMap"))
+    refined = read_transcript(artifacts.refined if artifacts else None)
+    live = read_transcript(artifacts.live if artifacts else None)
+    documents: dict[str, str] = {}
+
     title = _text(data.get("title"))
     raw_summary = _text(data.get("summary"))
     # Resolved once. The hub inlines this body and summary.md wraps it, and
@@ -597,48 +633,38 @@ def _write_meeting_files(
     # two files through the exact shape of a Markdown heading.
     resolved_summary, unresolved = resolve_speaker_tokens(raw_summary, speakers)
     if raw_summary.strip():
-        summary_text, _ = render.render_summary(
+        documents["summary.md"], _ = render.render_summary(
             raw_summary,
             speakers,
             title=title,
             meeting_id=record.key,
             heading="Summary",
         )
-        wrote |= _write_markdown(destination / "summary.md", summary_text, options)
 
     notes = data.get("notes")
     if isinstance(notes, str) and notes.strip():
-        notes_text, _ = render.render_summary(
+        documents["notes.md"], _ = render.render_summary(
             notes, speakers, title=title, meeting_id=record.key, heading="Notes"
         )
-        wrote |= _write_markdown(destination / "notes.md", notes_text, options)
 
     if refined.turns:
-        wrote |= _write_markdown(
-            destination / "transcript.refined.md",
-            render.render_transcript(
-                refined.turns,
-                title=title,
-                meeting_id=record.key,
-                kind="refined",
-                speakers=speakers,
-                malformed=refined.malformed,
-                truncated=refined.truncated_tail,
-            ),
-            options,
+        documents["transcript.refined.md"] = render.render_transcript(
+            refined.turns,
+            title=title,
+            meeting_id=record.key,
+            kind="refined",
+            speakers=speakers,
+            malformed=refined.malformed,
+            truncated=refined.truncated_tail,
         )
     if live.turns:
-        wrote |= _write_markdown(
-            destination / "transcript.live.md",
-            render.render_transcript(
-                live.turns,
-                title=title,
-                meeting_id=record.key,
-                kind="live",
-                malformed=live.malformed,
-                truncated=live.truncated_tail,
-            ),
-            options,
+        documents["transcript.live.md"] = render.render_transcript(
+            live.turns,
+            title=title,
+            meeting_id=record.key,
+            kind="live",
+            malformed=live.malformed,
+            truncated=live.truncated_tail,
         )
 
     participants = data.get("participantNames")
@@ -647,26 +673,43 @@ def _write_meeting_files(
     ] if isinstance(participants, list) else []
     speaker_names = sorted({person.name for person in speakers.people.values()})
 
-    wrote |= _write_markdown(
-        destination / "meeting.md",
-        render.render_meeting(
-            data,
-            meeting_id=record.key,
-            title=title,
-            created_at=to_instant(TimestampKind.SEQUELIZE, data.get("createdAt")),
-            ended_at=to_instant(TimestampKind.EPOCH_MS, data.get("endedAt")),
-            modified_at=to_instant(TimestampKind.SEQUELIZE, data.get("modifiedAt")),
-            participants=participants,
-            speaker_names=speaker_names,
-            artifacts=list(artifacts.present) if artifacts else [],
-            summary_resolved=resolved_summary,
-            soft_deleted=record.soft_deleted,
-            transcript_deleted_upstream=data.get("transcriptDeletedAt") is not None,
-            unresolved_tokens=unresolved,
-        ),
-        options,
+    documents["meeting.md"] = render.render_meeting(
+        data,
+        meeting_id=record.key,
+        title=title,
+        created_at=to_instant(TimestampKind.SEQUELIZE, data.get("createdAt")),
+        ended_at=to_instant(TimestampKind.EPOCH_MS, data.get("endedAt")),
+        modified_at=to_instant(TimestampKind.SEQUELIZE, data.get("modifiedAt")),
+        participants=participants,
+        speaker_names=speaker_names,
+        artifacts=list(artifacts.present) if artifacts else [],
+        summary_resolved=resolved_summary,
+        soft_deleted=record.soft_deleted,
+        transcript_deleted_upstream=data.get("transcriptDeletedAt") is not None,
+        unresolved_tokens=unresolved,
     )
-    return wrote
+    return documents
+
+
+def _note_document(key: str, data: Mapping[str, Any]) -> str:
+    """Render a note's document from its raw payload, for sync and render alike.
+
+    Args:
+        key: The note id.
+        data: The note row, as archived.
+
+    Returns:
+        The Markdown document.
+    """
+    return render.render_note(
+        note_id=key,
+        title=_text(data.get("title")),
+        content=_text(data.get("content")),
+        created_at=to_instant(TimestampKind.SEQUELIZE, data.get("createdAt")),
+        modified_at=to_instant(TimestampKind.SEQUELIZE, data.get("modifiedAt")),
+        pinned=bool(data.get("pinned")),
+        soft_deleted=EXPECTED["Notes"].is_soft_deleted(data),
+    )
 
 
 def _copy_if_changed(src: Path, dest: Path, counts: SyncCounts) -> bool:
@@ -790,7 +833,9 @@ def _document_paths(stem: Path, suffix: str) -> Path:
     return stem.parent / f"{stem.name}{suffix}"
 
 
-def _write_markdown(path: Path, text: str, options: SyncOptions) -> bool:
+def _write_markdown(
+    path: Path, text: str, options: SyncOptions, counts: SyncCounts | None = None
+) -> bool:
     """Write a rendering, unless doing so would degrade one already on disk.
 
     The raw path is schema-driven and survives anything; renderers are not.
@@ -807,21 +852,42 @@ def _write_markdown(path: Path, text: str, options: SyncOptions) -> bool:
     its degraded rendering, because the alternative is an index entry pointing
     at a file that was never written.
 
-    Renderings held back this way stay stale until the declaration is updated
-    and ``wispr-export render`` is run; the sync pass says so rather than
-    leaving that to be discovered.
+    A held-back rendering is counted, and the caller marks its record
+    ``render_stale``, so once the declaration is updated the next sync
+    rebuilds it -- as does ``wispr-export render``. It used to stay stale
+    until someone ran ``sync --full``, the only thing that re-rendered a record
+    whose content had not changed.
 
     Args:
         path: Destination document.
         text: Rendered Markdown.
         options: This run's options.
+        counts: The pass's counts, which record a held-back document.
 
     Returns:
         Whether the file changed.
     """
     if options.drift_blocks_rendering and path.exists():
+        if counts is not None and _differs(path, text):
+            counts.held_back += 1
         return False
     return write_text_if_changed(path, text)
+
+
+def _differs(path: Path, text: str) -> bool:
+    """Report whether a document on disk is not already this text.
+
+    Args:
+        path: The document.
+        text: What it would become.
+
+    Returns:
+        ``True`` when writing would change it, or it cannot be read.
+    """
+    try:
+        return path.read_text(encoding="utf-8") != text
+    except (OSError, ValueError):
+        return True
 
 
 def sync_notes(
@@ -872,6 +938,7 @@ def sync_notes(
                 and not options.full
                 and archive.existing_path("notes", key)
                 == _document_paths(stem, ".md")
+                and not entry.get("render_stale")
             ):
                 counts.unchanged += 1
                 continue
@@ -891,20 +958,9 @@ def sync_notes(
                 when=now,
                 project=partial(project_record, spec),
             )
+            held = counts.held_back
             wrote |= _write_markdown(
-                _document_paths(stem, ".md"),
-                render.render_note(
-                    note_id=key,
-                    title=title,
-                    content=data.get("content") or "",
-                    created_at=created,
-                    modified_at=to_instant(
-                        TimestampKind.SEQUELIZE, data.get("modifiedAt")
-                    ),
-                    pinned=bool(data.get("pinned")),
-                    soft_deleted=record.soft_deleted,
-                ),
-                options,
+                _document_paths(stem, ".md"), _note_document(key, data), options, counts
             )
             fields: dict[str, Any] = {
                 # The .md file, not the bare stem: an index path has to point
@@ -914,6 +970,7 @@ def sync_notes(
                 "title": title or None,
                 "created_at": created.isoformat() if created else None,
                 "content_hash": digest,
+                "render_stale": True if counts.held_back > held else None,
                 "source": SOURCE_LOCAL,
             }
             if wrote:
@@ -1095,6 +1152,7 @@ def sync_snapshot(
         and entry.get("content_hash") == digest
         and not options.full
         and destination.is_file()
+        and not entry.get("render_stale")
     ):
         counts.unchanged = len(rows)
         return counts
@@ -1114,6 +1172,7 @@ def sync_snapshot(
             destination.with_name("dictionary.md"),
             render.render_dictionary(rows, removed),
             options,
+            counts,
         )
 
     fields: dict[str, Any] = {
@@ -1122,6 +1181,7 @@ def sync_snapshot(
         "deleted_records": sum(1 for row in rows if spec.is_soft_deleted(row)),
         "removed_records": len(removed) or None,
         "content_hash": digest,
+        "render_stale": True if counts.held_back else None,
         "source": SOURCE_LOCAL,
     }
     if wrote:
@@ -1328,6 +1388,12 @@ def sync_dictation(
         for day in set(members) | set(archived):
             if _membership_moved(archived.get(day), members.get(day, set())):
                 touched.add(day)
+    # A log breaking drift held back is rebuilt once drift clears.
+    touched |= {
+        day
+        for day, entry in archived.items()
+        if isinstance(entry, dict) and entry.get("render_stale")
+    }
 
     shards: dict[str, Path] = {}
     carried: dict[str, dict[str, dict[str, Any]]] = {}
@@ -1390,10 +1456,12 @@ def sync_dictation(
 
         wrote = appended > 0
         wrote |= write_ndjson_if_changed(shard, rows)
+        held = counts.held_back
         wrote |= _write_markdown(
             shard.with_suffix(".md"),
             render.render_dictation_day(day, _day_entries(spec, rows, removed)),
             options,
+            counts,
         )
 
         fields: dict[str, Any] = {
@@ -1402,6 +1470,7 @@ def sync_dictation(
             "content_hash": rows_hash(spec, rows),
             "key_digest": key_digest(ids) if live is not None else None,
             "removed_records": len(removed) or None,
+            "render_stale": True if counts.held_back > held else None,
             "source": SOURCE_LOCAL,
         }
         if wrote:
@@ -1709,7 +1778,7 @@ def sync_account(
     return counts
 
 
-def rerender(archive: Archive, options: SyncOptions) -> SyncCounts:
+def rerender(archive: Archive, options: SyncOptions) -> dict[str, SyncCounts]:
     """Rebuild every rendered document from what is already archived.
 
     This is what the raw-before-render rule buys. Rendering is a pure function
@@ -1718,15 +1787,69 @@ def rerender(archive: Archive, options: SyncOptions) -> SyncCounts:
     most in exactly the case the archive exists for, where Wispr Flow has since
     deleted the transcript being re-rendered.
 
+    Every local document, not only meetings'. Breaking drift holds back notes,
+    the dictionary and dictation logs too, and the run tells the operator to
+    re-render once the declaration is fixed; for years of this tool's life only
+    meeting documents were rebuilt, so that advice repaired a fraction of what
+    it described. Documents are built by the same functions sync uses, so a
+    re-render of a healthy archive writes nothing. ``transcript.mcp.md`` is
+    left to the MCP pass, its one writer.
+
     Args:
         archive: The archive to rebuild in place.
-        options: What this run was asked to do; only ``full`` (rewrite even
-            when unchanged) and ``dry_run`` are consulted.
+        options: What this run was asked to do; only ``dry_run`` is
+            consulted, and it compares instead of writing.
+
+    Returns:
+        What each entity's pass did, keyed by entity.
+    """
+    return {
+        "meetings": _rerender_meetings(archive, options),
+        "notes": _rerender_notes(archive, options),
+        "dictionary": _rerender_dictionary(archive, options),
+        "dictation": _rerender_dictation(archive, options),
+    }
+
+
+def _render_to(path: Path, text: str, options: SyncOptions) -> bool:
+    """Write one re-rendered document, or in a dry run report that it would be.
+
+    Args:
+        path: The document.
+        text: What it should say.
+        options: This run's options.
+
+    Returns:
+        Whether the document changed, or would have.
+    """
+    if options.dry_run:
+        return _differs(path, text)
+    return write_text_if_changed(path, text)
+
+
+def _tally(counts: SyncCounts, changed: bool) -> None:
+    """Count one re-rendered record.
+
+    Args:
+        counts: The pass's counts.
+        changed: Whether any of its documents changed.
+    """
+    counts.written += 1 if changed else 0
+    counts.unchanged += 0 if changed else 1
+
+
+def _rerender_meetings(archive: Archive, options: SyncOptions) -> SyncCounts:
+    """Rebuild each meeting's documents from its archived payload and transcripts.
+
+    Args:
+        archive: The archive.
+        options: This run's options.
 
     Returns:
         What the pass did.
     """
     counts = SyncCounts()
+    spec = EXPECTED["Meetings"]
     for key, entry in sorted(archive.entries("meetings").items()):
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             continue
@@ -1751,25 +1874,116 @@ def rerender(archive: Archive, options: SyncOptions) -> SyncCounts:
             ),
             audio=_archived(directory / "media" / "upload.ogg"),
         )
-        if options.dry_run:
-            counts.written += 1
-            continue
-
-        record = Record(table="Meetings", key=key, data=data)
-        # audio="skip": the media file is already in the archive, and this
-        # pass must not need the source for anything at all.
-        wrote = _write_meeting_files(
-            archive,
-            directory,
-            record,
-            artifacts,
-            SyncOptions(audio=AUDIO_SKIP),
-            counts,
+        # The soft-deletion state comes from the payload. Building the record
+        # without it made every re-render strip "deleted: true" and its banner
+        # from a meeting Wispr Flow had tombstoned.
+        record = Record(
+            table="Meetings", key=key, data=data, soft_deleted=spec.is_soft_deleted(data)
         )
-        if options.full:
-            wrote = True
-        counts.written += 1 if wrote else 0
-        counts.unchanged += 0 if wrote else 1
+        changed = False
+        for name, text in _meeting_documents(record, artifacts).items():
+            changed |= _render_to(directory / name, text, options)
+        if not options.dry_run:
+            archive.put("meetings", key, render_stale=None)
+        _tally(counts, changed)
+    return counts
+
+
+def _rerender_notes(archive: Archive, options: SyncOptions) -> SyncCounts:
+    """Rebuild each note's document from the raw payload beside it.
+
+    Args:
+        archive: The archive.
+        options: This run's options.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    for key, entry in sorted(archive.entries("notes").items()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        counts.scanned += 1
+        document = archive.existing_path("notes", key)
+        raw = (
+            document.with_name(document.name.removesuffix(".md") + ".raw.json")
+            if document is not None
+            else None
+        )
+        data = read_json(raw, None) if raw is not None else None
+        if document is None or not isinstance(data, dict):
+            # Reported, never invented: without the payload there is nothing
+            # true to render.
+            counts.failed += 1
+            continue
+        changed = _render_to(document, _note_document(key, data), options)
+        if not options.dry_run:
+            archive.put("notes", key, render_stale=None)
+        _tally(counts, changed)
+    return counts
+
+
+def _rerender_dictionary(archive: Archive, options: SyncOptions) -> SyncCounts:
+    """Rebuild ``dictionary.md`` from the snapshot and its ledger.
+
+    Args:
+        archive: The archive.
+        options: This run's options.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    snapshot = archive.existing_path("dictionary", "dictionary")
+    if snapshot is None or not snapshot.is_file():
+        return counts
+    counts.scanned = 1
+    spec = EXPECTED["Dictionary"]
+    rows, _ = read_ndjson(snapshot)
+    present = {row_identity(spec, row) for row in rows}
+    removed = still_removed(read_ledger(ledger_path(snapshot)), spec, present)
+    changed = _render_to(
+        snapshot.with_name("dictionary.md"), render.render_dictionary(rows, removed), options
+    )
+    if not options.dry_run:
+        archive.put("dictionary", "dictionary", render_stale=None)
+    _tally(counts, changed)
+    return counts
+
+
+def _rerender_dictation(archive: Archive, options: SyncOptions) -> SyncCounts:
+    """Rebuild each day's dictation log from its shard and ledger.
+
+    Args:
+        archive: The archive.
+        options: This run's options.
+
+    Returns:
+        What the pass did.
+    """
+    counts = SyncCounts()
+    spec = EXPECTED["History"]
+    shards: dict[str, tuple[Path, list[dict[str, Any]]]] = {}
+    for day, entry in sorted(archive.entries("dictation").items()):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        shard = archive.existing_path("dictation", day)
+        if shard is None or not shard.is_file():
+            counts.scanned += 1
+            counts.failed += 1
+            continue
+        shards[day] = (shard, read_ndjson(shard)[0])
+    # Identities held on any day, so a row that moved day is not shown as
+    # removed from the one it left -- the same rule sync applies.
+    everywhere = {row_identity(spec, row) for _, rows in shards.values() for row in rows}
+    for day, (shard, rows) in shards.items():
+        counts.scanned += 1
+        removed = still_removed(read_ledger(ledger_path(shard)), spec, everywhere)
+        text = render.render_dictation_day(day, _day_entries(spec, rows, removed))
+        changed = _render_to(shard.with_suffix(".md"), text, options)
+        if not options.dry_run:
+            archive.put("dictation", day, render_stale=None)
+        _tally(counts, changed)
     return counts
 
 

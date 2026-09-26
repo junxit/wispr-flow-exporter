@@ -214,7 +214,7 @@ uv run wispr-export sync --audio skip
 uv run wispr-export sync --include-screen-context --i-understand
 
 # Re-render Markdown from what is already archived. Touches no source at all.
-uv run wispr-export render --force
+uv run wispr-export render
 
 # Reconcile the archive against the database, record by record. --deep also
 # recomputes each meeting's digest from its archived payload.
@@ -352,7 +352,7 @@ connection trusts. Set them in the real environment if you need them; see
 | `schema --source cloud` | Probe the live API and report its response shapes against the declaration. `GET` only; writes nothing, to the archive or to Wispr Flow. Add `--candidates` to also probe paths not yet adopted. |
 | `schema --source mcp` | Handshake with the MCP server and report its tools against the pin. Calls no tool; writes nothing. |
 | `verify` | Check integrity and reconcile against the database. |
-| `render` | Re-render Markdown from archived payloads, with no source access. |
+| `render` | Rebuild every document — meetings, notes, the dictionary, dictation logs — from archived payloads, with no source access. |
 
 ## Known limitations
 
@@ -382,7 +382,7 @@ connection trusts. Set them in the real environment if you need them; see
   undo for you. A record archived for the first time during breaking drift is
   still rendered, because the alternative is an index entry pointing at a file
   that was never written. Held-back documents are stale, not lost: fix the
-  declaration and run `wispr-export render`.
+  declaration and the next sync rebuilds them, or run `wispr-export render`.
 - **Nothing automated will tell you the declaration is stale.** The tests that
   compare this tool against a live Wispr Flow skip when it is not installed, and
   CI has no installation, so a green badge says nothing about drift.

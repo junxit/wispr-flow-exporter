@@ -438,6 +438,36 @@ def test_render_rebuilds_without_touching_the_source(
     code = main(["render"])
 
     assert code == EXIT_OK
+    out = capsys.readouterr().out
+    for entity in ("meetings", "notes", "dictionary", "dictation"):
+        assert f"{entity}: " in out
+
+
+def test_render_force_is_accepted_and_changes_nothing(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Scripts that pass --force still run; the flag never forced anything.
+
+    It used to report every meeting as written while rewriting none of them.
+    """
+    data_dir = _data_dir(
+        tmp_path,
+        wispr_db,
+        rows={"Meetings": [{"id": MEETING_A, "title": TITLE_PLAIN}]},
+    )
+    main(["sync", "--source", "local", "--data-dir", str(data_dir)])
+    capsys.readouterr()
+    before = archive_snapshot(tmp_path / "archive")
+
+    code = main(["render", "--force"])
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    assert "no longer needed" in captured.err
+    assert "meetings: 1 scanned, 0 written" in captured.out
+    assert archive_snapshot(tmp_path / "archive") == before
 
 
 # --- dry run --------------------------------------------------------------

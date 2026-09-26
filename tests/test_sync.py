@@ -34,7 +34,7 @@ from wispr_flow_exporter.normalize import calendar_key
 from wispr_flow_exporter.schema import EXPECTED
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import STATE_ABSENT, STATE_SOFT_DELETED, Archive
-from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, sync_local
+from wispr_flow_exporter.sync import SOURCE_LOCAL, SyncOptions, rerender, sync_local
 
 REFINED = [
     {
@@ -1072,6 +1072,119 @@ def test_dictation_re_runs_write_nothing(scene: Callable[..., tuple]) -> None:
     _run(Archive(root=archive.root), resolved, policy=_policy("store_normally"))
 
     assert _snapshot(archive.root) == before
+
+
+# --- re-rendering ---------------------------------------------------------
+
+
+def _everything(scene: Callable[..., tuple]) -> tuple:
+    """Build and sync an archive holding every kind of rendered document.
+
+    Returns:
+        ``(archive, resolved, db)``.
+    """
+    rows = [_meeting_row(), _meeting_row(id=MEETING_B, title="Hush weekly", isDeleted=1)]
+    archive, resolved, db = scene(
+        rows=rows,
+        tables={
+            "Notes": [NOTE_ROW],
+            "Dictionary": DICTIONARY_ROWS,
+            "History": [_history_row()],
+        },
+    )
+    _run(archive, resolved, policy=_policy("store_normally"))
+    return archive, resolved, db
+
+
+def test_re_rendering_a_fresh_archive_writes_nothing(scene: Callable[..., tuple]) -> None:
+    """Render builds with sync's own functions, so it agrees with sync byte for byte.
+
+    The soft-deleted meeting is here on purpose: re-rendering used to drop its
+    "deleted: true" and its banner, because the rebuilt record never carried
+    the tombstone.
+    """
+    archive, _, _ = _everything(scene)
+    before = _snapshot(archive.root)
+
+    results = rerender(Archive(root=archive.root), SyncOptions())
+
+    assert _snapshot(archive.root) == before
+    assert set(results) == {"meetings", "notes", "dictionary", "dictation"}
+    assert all(counts.written == 0 and not counts.failed for counts in results.values())
+
+
+def test_a_soft_deleted_meeting_keeps_its_flag_when_re_rendered(
+    scene: Callable[..., tuple],
+) -> None:
+    """A tombstone upstream stays visible in every rebuilt document."""
+    archive, _, _ = _everything(scene)
+    hub = archive.root / archive.entry("meetings", MEETING_B)["path"] / "meeting.md"
+    hub.write_text("clobbered", encoding="utf-8")
+
+    rerender(Archive(root=archive.root), SyncOptions())
+
+    text = hub.read_text(encoding="utf-8")
+    assert "deleted: true" in text and "Deleted in Wispr Flow" in text
+
+
+@pytest.mark.parametrize(
+    ("entity", "document"),
+    [
+        ("notes", lambda a: a.root / a.entry("notes", NOTE_A)["path"]),
+        ("dictionary", lambda a: a.root / "dictionary" / "dictionary.md"),
+        (
+            "dictation",
+            lambda a: a.root / "dictation" / "2026" / "08" / "2026-08-30.md",
+        ),
+    ],
+)
+def test_re_rendering_repairs_every_kind_of_document(
+    scene: Callable[..., tuple], entity: str, document: Callable[[Archive], Path]
+) -> None:
+    """Only meetings used to be rebuilt; drift holds back all four kinds."""
+    archive, _, _ = _everything(scene)
+    path = document(archive)
+    expected = path.read_text(encoding="utf-8")
+    path.write_text("clobbered", encoding="utf-8")
+
+    results = rerender(Archive(root=archive.root), SyncOptions())
+
+    assert path.read_text(encoding="utf-8") == expected
+    assert results[entity].written == 1
+
+
+def test_a_note_whose_raw_payload_is_gone_is_reported_not_invented(
+    scene: Callable[..., tuple],
+) -> None:
+    """Without the payload there is nothing true to render."""
+    archive, _, _ = _everything(scene)
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    document.with_name(document.name.removesuffix(".md") + ".raw.json").unlink()
+
+    results = rerender(Archive(root=archive.root), SyncOptions())
+
+    assert results["notes"].failed == 1
+
+
+def test_a_plain_sync_repairs_what_drift_held_back(scene: Callable[..., tuple]) -> None:
+    """Held back, marked stale, rebuilt by the next ordinary run once drift clears.
+
+    Before, a held-back note stayed stale through every plain sync -- its
+    content hash had not moved -- and only sync --full rebuilt it.
+    """
+    archive, resolved, _ = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+    document = archive.root / archive.entry("notes", NOTE_A)["path"]
+    document.write_text("sentinel", encoding="utf-8")
+
+    held = _run(Archive(root=archive.root), resolved, full=True, drift_blocks_rendering=True)
+    assert held.counts["notes"].held_back == 1
+    assert Archive(root=archive.root).entry("notes", NOTE_A)["render_stale"] is True
+
+    _run(Archive(root=archive.root), resolved)
+
+    assert "murmur quota" in document.read_text(encoding="utf-8")
+    assert "render_stale" not in Archive(root=archive.root).entry("notes", NOTE_A)
 
 
 # --- what upstream deletes -------------------------------------------------

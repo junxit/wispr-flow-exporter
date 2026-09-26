@@ -617,8 +617,8 @@ def _run_local(
             options.drift_blocks_rendering = drift.blocks_rendering
             _say(
                 "render",
-                "existing documents kept as they are; re-run "
-                "`wispr-export render` once the declaration is updated",
+                "existing documents kept as they are; once the declaration is "
+                "updated, the next sync or `wispr-export render` rebuilds them",
             )
         elif drift.kind is DriftClass.ADDITIVE and config.strict_schema:
             exit_code = EXIT_ADDITIVE_DRIFT
@@ -1212,7 +1212,6 @@ def cmd_render(args: argparse.Namespace) -> int:
     """
     config = _config(args)
     options = SyncOptions(
-        full=getattr(args, "force", False),
         dry_run=getattr(args, "dry_run", False),
         verbose=getattr(args, "verbose", False),
     )
@@ -1220,11 +1219,17 @@ def cmd_render(args: argparse.Namespace) -> int:
 
     print("wispr-flow-exporter render")
     _announce(archive)
-    counts = rerender(archive, options)
+    if getattr(args, "force", False):
+        # Kept so scripts that pass it still run. It never forced anything:
+        # every write is compare-then-write, and rewriting identical bytes
+        # would only move mtimes. It used to inflate the "written" count.
+        print("  note         : --force is no longer needed and changes nothing", file=sys.stderr)
+    results = rerender(archive, options)
     if not options.dry_run:
         archive.save()
-    _say("", counts.line("meetings"))
-    return EXIT_FAILURE if counts.failed else EXIT_OK
+    for entity, counts in results.items():
+        _say("", counts.line(entity))
+    return EXIT_FAILURE if any(counts.failed for counts in results.values()) else EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1375,11 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
     render_parser = sub.add_parser(
         "render", help="re-render Markdown from archived payloads"
     )
-    render_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="rewrite even when the rendered output is unchanged",
-    )
+    render_parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     render_parser.add_argument(
         "--dry-run", action="store_true", help="report without writing"
     )

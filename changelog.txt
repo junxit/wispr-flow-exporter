@@ -137,6 +137,28 @@ wrapped at 72 columns, US English.
   upstream since the last sync is reported, not failed: the next sync
   flags it. A table whose key column is gone is reported as not
   reconciled rather than as every record missing.
+- wispr-export render rebuilds every local document, not only meetings'.
+  Breaking drift holds back notes, dictionary.md and dictation logs too,
+  and the run tells the operator to re-render once the declaration is
+  fixed -- advice that repaired meetings and nothing else. Measured on
+  0.4.0: a held-back note survived both `render --force` and a plain
+  sync, and only `sync --full` rebuilt it. Render now builds each
+  document with the same function sync uses, so re-rendering a healthy
+  archive writes nothing, and it reports each kind of document on its
+  own line.
+- A document breaking drift holds back is marked stale, so the next
+  ordinary sync after the declaration is fixed rebuilds it, as render
+  does. It used to stay stale until a --full run, because its record's
+  content had not changed and a plain sync never looked at it again.
+- Re-rendering no longer strips a soft-deleted meeting's tombstone.
+  Measured on 0.4.1: after `wispr-export render`, a meeting deleted in
+  Wispr Flow lost `deleted: true` and its "Deleted in Wispr Flow" banner
+  from meeting.md, because the record render rebuilt it from never
+  carried the flag.
+- render --force is accepted and hidden. It never forced a rewrite --
+  every write is compare-then-write, and rewriting identical bytes would
+  only move mtimes -- it only reported every meeting as written. It now
+  says it is no longer needed.
 
 0.4.1
 -----

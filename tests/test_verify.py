@@ -325,7 +325,7 @@ def test_re_rendering_needs_no_source_and_changes_nothing(
         for path in sorted(archive.root.rglob("*.md"))
     }
 
-    counts = rerender(archive, SyncOptions())
+    counts = rerender(archive, SyncOptions())["meetings"]
 
     assert counts.scanned == 1
     assert counts.written == 0
@@ -344,7 +344,7 @@ def test_re_rendering_repairs_a_damaged_document(
     )
     document.write_text("clobbered", encoding="utf-8")
 
-    counts = rerender(archive, SyncOptions())
+    counts = rerender(archive, SyncOptions())["meetings"]
 
     assert counts.written == 1
     assert OWNER in document.read_text(encoding="utf-8")
@@ -362,7 +362,7 @@ def test_re_rendering_reports_a_meeting_whose_payload_is_gone(
         / "meeting.json"
     ).unlink()
 
-    counts = rerender(archive, SyncOptions())
+    counts = rerender(archive, SyncOptions())["meetings"]
 
     assert counts.failed == 1
 
