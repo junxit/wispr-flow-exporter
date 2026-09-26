@@ -553,9 +553,11 @@ disagrees with the length of the range before it, in both units, is rendered
 with a warning but not recorded as recovered.
 
 Recoveries carry `assembly: 2`. One without it was assembled by 0.4.x's
-splicer, which lost characters at every seam, and is fetched again once.
-`sync --full` fetches every recovered transcript again, and is the repair
-path whenever one is in doubt.
+splicer, which lost characters at every seam, and is fetched again when a
+run next lists its meeting. An incremental run lists back only to its
+watermark less the recheck window, and at least one page of 200, so on a
+larger account an old recovery waits for `sync --full`, which fetches every
+recovered transcript again and is the repair path whenever one is in doubt.
 
 ## What cannot be reached
 

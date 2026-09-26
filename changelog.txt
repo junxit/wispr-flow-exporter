@@ -10,6 +10,41 @@ wrapped at 72 columns, US English.
 
 0.5.0
 -----
+- Upgrading from 0.4.x needs no migration, and moves or deletes nothing
+  already archived. Measured on a real archive last written by 0.4.0, a
+  week behind its account: the first sync added 9 files and changed 14,
+  removed none and superseded none; a second changed no byte and no
+  mtime; `verify --deep` found it consistent, and a dry run wrote
+  nothing. What the upgrade itself wrote, once: the drift ledgers' new
+  form in .sync-state.json, .lock, account/context.json, and the MCP
+  listing page and account info under their new names. The rest was a
+  week of upstream change -- five migrations and a new table, four new
+  calendar events and two refreshed, six cloud payloads, three account
+  files -- and four calendar events deleted upstream, flagged by that
+  first ordinary run where 0.4.0 flagged absence only under --full.
+  `wispr-export render` then rewrote four documents, each for one
+  "labeled", and a second render wrote nothing.
+- On an account with more than 200 meetings, run `sync --full` once
+  after upgrading. Transcripts 0.4.x recovered over MCP, and meetings
+  only the server has, are fetched again when a run next lists them,
+  and an incremental run lists most recently modified first, 200 to a
+  page, stopping at the first page that reaches back past its watermark
+  less the 14-day recheck window. With fewer meetings, the first
+  ordinary sync lists them all.
+- What 0.4.x already lost stays lost. 0.5.0 keeps what upstream deletes
+  or empties from its first run on; it cannot bring back a row a 0.4.x
+  run had already rewritten out of its file, or a payload a 0.4.x run
+  had already replaced with less. The characters 0.4.x dropped at a
+  recovered transcript's seams come back only while the server still
+  holds that transcript.
+- Scripts that run `schema` may need changing. A bare `schema` now
+  contacts the cloud and MCP services as well as reading the local
+  store, and its --json output is keyed by backend when more than one
+  is checked; `--source local` keeps the old scope. `schema --json`
+  exits 4 on breaking drift, where it always exited 0. Elsewhere: a
+  setting that cannot be read, or an unknown entity name, exits 2;
+  WISPR_ENTITIES, if set, now selects what is archived; and sync exits
+  with the most severe code any pass produced.
 - The live-installation tests are selected by a marker: `pytest -m
   live`. The documented `-k "pin or live"` matched names, not intent --
   on 0.4.0 it selected 23 tests, 20 of which run everywhere anyway, and
@@ -327,8 +362,8 @@ wrapped at 72 columns, US English.
   called recovered. A character split across two ranges -- as a server
   counting UTF-16 units splits an emoji -- is assembled whole, and a
   range holding half of one is archived with JSON escapes rather than
-  failing to write. Transcripts recovered by 0.4.x are fetched again
-  once; `sync --full` fetches them all again.
+  failing to write. A transcript recovered by 0.4.x is fetched again
+  when a run next lists its meeting; `sync --full` fetches them all.
 - Meetings only the server has are archived whole. Measured on 0.4.1:
   their notes stopped at 12,087 of 30,000 characters, the server's
   default range; the transcript was never asked for; the directory was
@@ -338,7 +373,8 @@ wrapped at 72 columns, US English.
   last one set. Every range of the notes and of the transcript is now
   archived, with transcript.mcp.md beside them; a retitle moves the
   directory; and a meeting whose listing has not changed costs no
-  request at all. Each is fetched in full once after upgrading.
+  request at all. Each is fetched in full once more, when a run next
+  lists it.
 - An incremental MCP run finds what changed, not what started recently.
   0.4.1 sent a `since` a week before its watermark, and `since` filters
   on when a meeting started: measured, a June meeting whose notes were
