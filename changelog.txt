@@ -470,6 +470,29 @@ wrapped at 72 columns, US English.
   path or value, an ignored .env key, the authorization URL -- passes
   through the same redaction and control-character escaping as the
   diagnostic lines, where some had printed it raw.
+- Re-pinned the remote backends against Wispr Flow 1.6.957. All 18
+  archived endpoints and all 8 candidates answered exactly their
+  declared status, so CLIENT_PIN moves from 1.6.897 with its table
+  digest unchanged. MCP_PIN is taken again with the constraint-form
+  digest; the server's name, version and tool count are unchanged, and
+  it swapped get_meeting_attendee_emails for
+  get_meeting_participants_enriched -- neither on the allowlist.
+  Measured after the re-pin: local ok, cloud ok, and MCP additive only
+  because an archive's recorded tool ledger predates the swap, until its
+  next sync records the new one.
+- Documentation corrected where it had drifted from the code. SECURITY
+  said the local backend never opens session.json; the local pass and
+  doctor read it for identity and expiry, through a reader that returns
+  no credential. The redaction list named two of the four patterns it
+  applies. The maintenance rules said the cloud was reached only when
+  asked for by name, which stopped being true when `all` became the
+  default. The README's doctor sample, its layout (which left out
+  todos/) and what --only selects are fixed, and what a dry run may and
+  may not write is stated precisely.
+- US spelling throughout, which changes two rendered strings: the
+  banner of transcript.live.md and the artifact list in meeting.md now
+  say "labeled". The next `wispr-export render` rewrites those
+  documents once, as does a sync when their meeting next changes.
 
 0.4.1
 -----

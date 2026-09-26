@@ -13,7 +13,8 @@ policy and no promise that any of it still exists tomorrow. **This document is
 the price of reaching data that is otherwise unreachable.** Read it when
 something stops working, or after Wispr Flow updates.
 
-Everything below was measured against **app 1.6.897** on macOS. Nothing in it is
+Everything below was measured against **app 1.6.897** on macOS, and every
+endpoint status was measured again on **1.6.957**, unchanged. Nothing in it is
 inferred from documentation, because there is none.
 
 ---
@@ -330,10 +331,11 @@ make a change pass, stop.
   may ever start with, asserted by `test_no_endpoint_reaches_a_denied_path`.
   `/api/v1/support/` is account deletion, which the borrowed credential is
   perfectly entitled to call. The rest are other people's data.
-- **`--source auto` stays local-only.** Cloud is reached on an explicit
-  `--source cloud` or `--source both` and never otherwise. This was changed
-  after an `auto` run silently sent nine requests to an undocumented private API
-  nobody had asked for.
+- **A run says which backends it will contact before it contacts any.** The
+  default, `all`, is local plus every remote backend that has a credential;
+  `auto` and `local` never touch the network. `auto` once silently sent nine
+  requests to an undocumented private API nobody had asked for, which is why
+  it no longer reaches the cloud and why the default announces itself.
 - **Never write to `session.json`,** never copy it into the archive, never log a
   token. `redact()` in `local_config.py` runs at the output sink so a new code
   path cannot forget it.
@@ -348,7 +350,7 @@ make a change pass, stop.
 
 ---
 
-## Measured endpoint table (app 1.6.897)
+## Measured endpoint table (app 1.6.897, unchanged on 1.6.957)
 
 Archived. Every status observed against the live service.
 

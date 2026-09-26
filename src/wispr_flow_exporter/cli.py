@@ -151,7 +151,7 @@ _ANNOUNCED_DOTENV: set[Path] = set()
 def _load_dotenv(path: Path) -> None:
     """Apply this tool's settings from a ``.env``, and nothing else.
 
-    ``load_dotenv`` exports every key in the file, and the process then honours
+    ``load_dotenv`` exports every key in the file, and the process then honors
     them -- including ``HTTPS_PROXY`` and ``SSL_CERT_FILE``, which httpx reads by
     default. Measured: a ``.env`` in the working directory setting those two
     routed every request through a proxy of the file's choosing while trusting

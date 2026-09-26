@@ -329,7 +329,7 @@ def detect_cloud_drift(
 # the classification above -- but it is always reported. Refresh it with
 # `wispr-export schema --source cloud`; MAINTENANCE.md has the procedure.
 CLIENT_PIN = ClientPin(
-    app_version="1.6.897",
+    app_version="1.6.957",
     count=18,
     sha256="926960a4f81461ba363213ee8cc02ad35835d0d18cf8166e5b9d036694e319bc",
 )

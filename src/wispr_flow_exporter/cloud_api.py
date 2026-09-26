@@ -91,8 +91,9 @@ class Endpoint:
 # partial one. Incremental cursors and one-file-per-endpoint verbatim archiving
 # are incompatible, and the zero-bytes invariant already makes a full re-fetch
 # free on disk. The parameter names are recorded so the choice stays visible.
-# Every status below was measured against the live service on app 1.6.897, not
-# inferred from the bundle. MAINTENANCE.md has the procedure for re-measuring.
+# Every status below was measured against the live service -- on app 1.6.897,
+# and again on 1.6.957, where each answered as declared -- not inferred from
+# the bundle. MAINTENANCE.md has the procedure for re-measuring.
 ENDPOINTS: Mapping[str, Endpoint] = {
     "user_profile": Endpoint("/api/v1/user/profile"),
     "user_preferences": Endpoint("/api/v1/user/preferences"),
@@ -150,7 +151,7 @@ ENDPOINTS: Mapping[str, Endpoint] = {
 # Paths read from the bundle and probed, but deliberately not archived. Kept so
 # `schema --source cloud --candidates` can re-check them after an app update,
 # and so the reason for each omission survives longer than the decision to omit
-# it. Statuses measured on app 1.6.897.
+# it. Statuses measured on app 1.6.897 and unchanged on 1.6.957.
 CANDIDATES: Mapping[str, Endpoint] = {
     # Answers, but only usefully when sent the client's own timestamp map,
     # which this tool does not maintain. The same information is archived from
@@ -380,7 +381,7 @@ class CloudClient:
                             return self._record(
                                 name, path, status, reason=f"HTTP {status}"
                             )
-                        # Honour Retry-After when the server sends one; it
+                        # Honor Retry-After when the server sends one; it
                         # knows more about its own load than a fixed ladder.
                         wait = retry_after(response.headers.get("Retry-After"))
                         sleep_for = wait if wait is not None else BACKOFF[attempt]

@@ -59,9 +59,13 @@ spoke.
   credential sits one parse deeper than it looks and a redactor keyed on
   top-level shape would miss it entirely.
 
-  Only the cloud backend reads that file, lazily at the call site. The local
-  backend never opens it, the MCP backend cannot reach it at all, and there
-  are regression tests asserting both.
+  Only the cloud backend reads the token itself, lazily at the call site,
+  through `read_access_token`. The local pass and `doctor` open the file for
+  the account's identity and the token's expiry, through `read_session`,
+  which returns a `SessionInfo` that carries no credential — so a code path
+  holding one has nothing to leak. The MCP backend cannot reach the file at
+  all. The credential-free `SessionInfo` and the MCP separation are both
+  asserted by test.
 
   **Invariant:** no *credential* byte from `session.json` — the access token or
   the refresh token — is ever written to a file this tool creates, printed to a
@@ -145,6 +149,14 @@ spoke.
   where this client registers, where the operator's browser is sent, and where
   codes and refresh tokens go.
 
+- **A dry run reads and does not write.** `sync --dry-run` opens the archive
+  read-only, so nothing reaches its files, index or state, nor a repository's
+  `.gitignore`; through 0.4.0 it saved advanced watermarks, and the next real
+  sync archived nothing it had seen. Remote backends are still read, with the
+  same credentials and the same limits as a real run. The one write a dry run
+  can make is to the MCP token store, when the access token is due for its
+  refresh: a rotated refresh token that was not kept would end the login.
+
 - **Where the minted token lives.** `~/.config/wispr-flow-exporter/`
   (`XDG_CONFIG_HOME` when set), file `0600` in a directory `0700`. Deliberately
   **outside the archive**: an archive is the thing people copy to a backup drive
@@ -218,7 +230,9 @@ spoke.
 - **Redaction is at the sink, not the source.** Every diagnostic stream — log
   lines, `--verbose` output, exception messages, the run summary — passes
   through one `redact()` before it is emitted, replacing JWTs,
-  `sb-<ref>-auth-token` keys and `X-Amz-(Signature|Credential)` parameters.
+  `sb-<ref>-auth-token` keys, `X-Amz-Signature`, `X-Amz-Credential` and
+  `X-Amz-Security-Token` parameters, and a `Bearer` followed by any opaque token
+  of sixteen characters or more.
   Redacting at the sink rather than at each call site is deliberate: a new code
   path cannot forget to do it. The same sink shows control characters and
   bidirectional overrides as escapes (`printable()`), so text from a remote host

@@ -161,7 +161,7 @@ def test_an_expired_token_stops_rather_than_refreshing(
 
     Supabase GoTrue rotates refresh tokens and detects reuse, so a second
     client that refreshes either revokes the desktop app's session or races
-    it. Stopping is the correct behaviour, and the message says what to do.
+    it. Stopping is the correct behavior, and the message says what to do.
     """
     monkeypatch.delenv("WISPR_ACCESS_TOKEN", raising=False)
     _session_file(tmp_path, expires_in=-60)

@@ -40,7 +40,7 @@ def yaml_scalar(value: Any) -> str:
     Strings are always double-quoted, even when they would not need to be.
     Unquoted YAML would let a title beginning with ``-`` or containing ``: ``
     change the document's structure, and deciding case by case is exactly the
-    kind of judgement that goes wrong on the one input that matters.
+    kind of judgment that goes wrong on the one input that matters.
 
     Args:
         value: The value to render.
@@ -193,7 +193,7 @@ def render_transcript(
     malformed: int = 0,
     truncated: bool = False,
 ) -> str:
-    """Render a transcript as speaker-labelled runs.
+    """Render a transcript as speaker-labeled runs.
 
     Args:
         turns: Turns in file order.
@@ -224,7 +224,7 @@ def render_transcript(
     body = [f"# {inline(title, fallback='Untitled meeting')} — {kind} transcript", ""]
     if kind == "live":
         body += [
-            "> Live-pass transcript, kept verbatim. Speakers are labelled by",
+            "> Live-pass transcript, kept verbatim. Speakers are labeled by",
             "> capture channel (`mic`, `system`) rather than by name: the live",
             "> pass numbers speakers in a different space from the refined one,",
             "> and the name the meeting platform attaches to a live turn lags",
@@ -386,7 +386,7 @@ def render_meeting(
         if "refined" in artifacts:
             lines.append("- [`transcript.refined.md`](transcript.refined.md) — canonical, speakers named")
         if "live" in artifacts:
-            lines.append("- [`transcript.live.md`](transcript.live.md) — verbatim live pass, channel-labelled")
+            lines.append("- [`transcript.live.md`](transcript.live.md) — verbatim live pass, channel-labeled")
         if "audio" in artifacts:
             lines.append("- [`media/upload.ogg`](media/upload.ogg) — source recording")
         lines.append("")

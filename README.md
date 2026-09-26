@@ -52,7 +52,7 @@ disk, in formats you can still read in ten years.
 | Meeting audio | yes, while the app still has it | no | no |
 | Transcript fidelity | raw turns, speakers, timestamps | — | normalized plaintext only |
 | Stability | app schema, ~20 migrations/month | undocumented, unversioned | versioned, but no stability promise |
-| Confirmed live | yes | yes, on app 1.6.897 | yes, on `wispr-meetings` 1 |
+| Confirmed live | yes | yes, on app 1.6.897 and 1.6.957 | yes, on `wispr-meetings` 1 |
 
 The local backend is the primary one and is fully functional on its own. The two
 remote backends are reached only when you ask for them, and each announces
@@ -98,7 +98,11 @@ silently contains no dictation is indistinguishable from a complete one — the
 worst failure mode an archival tool has:
 
 ```
-policy       : localDataPolicy = never_store   <-- DICTATION HISTORY IS NOT RECORDED
+  policy       : localDataPolicy = never_store   transcript retention = never_delete
+  …
+  WARNING: History is empty because localDataPolicy is
+           "never_store". This is a Wispr Flow
+           setting, not a failure of this tool.
 ```
 
 The policy and the moment it was observed are recorded in `.sync-state.json`, so
@@ -204,7 +208,8 @@ uv run wispr-export doctor
 # a credential exists for them.
 uv run wispr-export sync
 
-# Just meetings, verbosely.
+# Just meetings, verbosely. --only and --skip choose among the local backend's
+# entities; add --source local to leave the remote backends out as well.
 uv run wispr-export sync --only meetings -v
 
 # Skip the audio (~16 MB per meeting).
@@ -274,7 +279,7 @@ archive/
     transcript.refined.md transcript.live.md
     raw/…                       # verbatim JSON and NDJSON
     media/upload.ogg
-  notes/  dictation/  dictionary/  calendar/  account/  tables/
+  notes/  todos/  dictation/  dictionary/  calendar/  account/  tables/
   notes/images/<note uuid>/     # pasted images, with --include-images
   dictation/media/  tables/FlowLensHistory/media/  # dictation audio and
                                 # screenshots, each with its own opt-in
@@ -292,7 +297,7 @@ archive/
 ```
 
 Both backends record the Wispr Flow build that produced the archive
-(`prefs.version`, `1.6.897` here), because a future reader looking at these
+(`prefs.version`, `1.6.957` here), because a future reader looking at these
 files otherwise has no way to tell which client wrote them.
 
 Frontmatter is Obsidian-friendly: `aliases` so `[[` autocomplete finds a meeting
@@ -326,8 +331,11 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
 - **A damaged `index.json` is set aside, never overwritten.** It is kept as
   `index.json.corrupt-<time>`, and `verify` reports it until someone restores
   or merges it: the index is where the flags above live.
-- **`--dry-run` writes nothing** — not the archive, not its index, not a
-  repository's `.gitignore`.
+- **`--dry-run` writes nothing to the archive** — not its files, its index or
+  its state, and not a repository's `.gitignore`. It still reads from every
+  selected backend, which is how it reports what a real run would write; the
+  one file it may touch is the MCP token store, when the access token is due
+  for its refresh.
 
 ## Configuration
 
@@ -408,7 +416,7 @@ connection trusts. Set them in the real environment if you need them; see
 - **Live-transcript speaker names are wrong, and are not used.** `live.ndjson`
   carries a `speaker.name` populated from the meeting platform's active-speaker
   marker, which lags — a verified line in the development dataset attributes one
-  participant's words to the other. Live turns are labelled mechanically
+  participant's words to the other. Live turns are labeled mechanically
   (`mic#1`, `system#1001`) and the refined pass is the only source of names.
 - **No historical archaeology.** Only one backup database is retained upstream.
   This tool can only archive what exists on the day you first run it.

@@ -50,7 +50,7 @@ line-length = 88
 [tool.ruff.lint]
 # N is here because the source already carries a `# noqa: N802`, and D because
 # every docstring in the package is already Google-style. Both were being
-# honoured by hand; this is what makes them checked.
+# honored by hand; this is what makes them checked.
 select = ["E", "F", "I", "N", "UP", "B", "D", "RUF"]
 ignore = [
     # The column tuples in schema.py are deliberately packed several names to a

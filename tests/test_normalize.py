@@ -256,7 +256,7 @@ def test_resolve_speaker_tokens_on_empty_text() -> None:
 
 
 def test_live_speaker_labels_are_mechanical() -> None:
-    """The two live id spaces are labelled distinctly and never joined."""
+    """The two live id spaces are labeled distinctly and never joined."""
     assert label_live_speaker({"id": 1, "source": "mic"}) == "mic#1"
     assert label_live_speaker({"id": 1001, "source": "system"}) == "system#1001"
 
@@ -265,7 +265,7 @@ def test_live_speaker_name_is_never_used_as_an_attribution() -> None:
     """The platform's active-speaker marker lags and is demonstrably wrong.
 
     A verified line in the development dataset carries a system-channel turn
-    labelled with the *other* participant's name, because the meeting platform
+    labeled with the *other* participant's name, because the meeting platform
     had not yet switched its marker. Using that name would put words in the
     wrong person's mouth, permanently, in an archive.
     """

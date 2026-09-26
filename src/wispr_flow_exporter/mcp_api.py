@@ -15,7 +15,7 @@ question is closed.
 **On method, and why the GET-only rule does not transfer.** The REST client
 issues ``GET`` and nothing else, asserted by a test that reads its source. MCP
 is JSON-RPC and every call is an HTTP POST, so that test cannot extend here and
-pretending otherwise would be theatre. What the GET-only rule actually protects
+pretending otherwise would be theater. What the GET-only rule actually protects
 is *this tool cannot change anything upstream*, and the MCP-shaped form of that
 guarantee is stronger, not weaker:
 

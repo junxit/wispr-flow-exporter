@@ -41,7 +41,7 @@ def token_store_path() -> Path:
 
     The one piece of state this tool holds outside an archive. It is *not* in
     the archive on purpose: an archive is the thing people copy to a backup
-    drive or hand to somebody else, and a credential that travelled with it
+    drive or hand to somebody else, and a credential that traveled with it
     would be a disclosure every time.
 
     Honors ``XDG_CONFIG_HOME`` where it is set, on macOS too -- somebody who has
