@@ -261,6 +261,13 @@ spoke.
   already exists. Until 0.4.1 an existing destination was deleted to make
   room.
 
+  An index that no longer parses is set aside as `index.json.corrupt-<time>`,
+  owner-only, rather than overwritten by the next save, and `verify` keeps
+  reporting it until someone restores or merges it. The index is the only
+  place some facts live — which records upstream deleted and when, and that
+  Wispr Flow deleted a transcript this archive still holds — so silently
+  rebuilding it would forget exactly those.
+
 - **Third parties who never consented.** This is the risk most specific to this
   tool. A meeting archive contains other people's voices and words, recorded
   under whatever expectation they had at the time — which was almost certainly

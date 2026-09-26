@@ -30,8 +30,8 @@ import hashlib
 import json
 import shutil
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -177,32 +177,77 @@ class Archive:
         root: The archive root. Every write is verified to land inside it.
         index: Namespaced record index, loaded from ``index.json``.
         state: Watermarks, cursors, schema pin and observed policy.
-        read_only: Never persist the index or the state. Set for a dry run,
-            whose passes still update both in memory -- that is how they count
-            what they *would* write -- and whose watermarks, once saved, told
-            the next real run that records it had never written were done.
+        read_only: Never persist the index or the state, and never move a
+            file. Set for a dry run, whose passes still update both in memory
+            -- that is how they count what they *would* write -- and whose
+            watermarks, once saved, told the next real run that records it had
+            never written were done. Also set by commands that only read.
+        notices: Things found while loading that the operator should hear.
+        unreadable: Bookkeeping files present but unreadable, when read-only
+            loading could not set them aside.
     """
 
     root: Path
     index: dict[str, Any] = None  # type: ignore[assignment]
     state: dict[str, Any] = None  # type: ignore[assignment]
     read_only: bool = False
+    notices: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Normalize the root and load any existing index and state."""
         self.root = self.root.expanduser().resolve()
         if self.index is None:
-            self.index = read_json(
-                self.root / INDEX_NAME,
-                {"schema_version": SCHEMA_VERSION, "entities": {}},
+            self.index = self._load(
+                INDEX_NAME, {"schema_version": SCHEMA_VERSION, "entities": {}}
             )
         if self.state is None:
-            self.state = read_json(
-                self.root / STATE_NAME,
-                {"schema_version": SCHEMA_VERSION, "sources": {}},
+            self.state = self._load(
+                STATE_NAME, {"schema_version": SCHEMA_VERSION, "sources": {}}
             )
         self.index.setdefault("entities", {})
         self.state.setdefault("sources", {})
+
+    def _load(self, name: str, default: dict[str, Any]) -> dict[str, Any]:
+        """Read one bookkeeping file, setting a corrupt one aside, never over it.
+
+        A torn or hand-damaged ``index.json`` used to load as empty and be
+        overwritten by the next save. The files stay on disk either way, but
+        the index is the only place some facts live: which records upstream
+        has deleted and since when, and that Wispr Flow deleted a transcript
+        this archive still holds. Rebuilding forgets those. So the damaged file
+        is renamed rather than replaced -- still owner-only, still there to be
+        restored or merged by hand -- and the rebuild is said out loud.
+
+        Args:
+            name: File name inside the root.
+            default: What to start from when the file is absent or unusable.
+
+        Returns:
+            The decoded mapping, or ``default``.
+        """
+        path = self.root / name
+        if not path.exists():
+            return default
+        payload = read_json(path, None)
+        if isinstance(payload, dict):
+            return payload
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        kept = path.with_name(f"{name}.corrupt-{stamp}")
+        if self.read_only:
+            self.unreadable.append(name)
+            self.notices.append(
+                f"{name} is unreadable; the next sync will keep it as "
+                f"{name}.corrupt-<time> and rebuild it"
+            )
+            return default
+        path.replace(kept)
+        self.notices.append(
+            f"{name} was unreadable and is kept as {kept.name}. It has been "
+            "rebuilt, so flags on records already gone upstream are missing "
+            "until it is restored or merged"
+        )
+        return default
 
     # --- paths ------------------------------------------------------------
 

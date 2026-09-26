@@ -296,6 +296,9 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
 - **A retitle moves the directory** rather than duplicating it — and a move
   never lands on, or deletes, anything already there. A record is only moved
   out of a path named for its own id.
+- **A damaged `index.json` is set aside, never overwritten.** It is kept as
+  `index.json.corrupt-<time>`, and `verify` reports it until someone restores
+  or merges it: the index is where the flags above live.
 - **`--dry-run` writes nothing** — not the archive, not its index, not a
   repository's `.gitignore`.
 

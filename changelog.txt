@@ -46,6 +46,13 @@ wrapped at 72 columns, US English.
   named for its own id and only onto a path that is free; anything else
   stays on disk for verify to report. Notes and calendar events follow
   the same rules.
+- A damaged index.json was replaced rather than kept. It loaded as empty
+  and the next save overwrote it, taking every missing_since and
+  transcript_deleted_upstream with it -- facts that exist nowhere else.
+  It is now set aside as index.json.corrupt-<time>, the run says so, and
+  verify reports it until someone deals with it; .sync-state.json is
+  treated the same way. Commands that only read report the damage
+  without moving anything.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check

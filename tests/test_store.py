@@ -218,6 +218,52 @@ def test_a_corrupt_index_does_not_stop_a_run(tmp_path: Path) -> None:
     assert Archive(root=root).count() == 0
 
 
+def test_a_corrupt_index_is_kept_not_overwritten(tmp_path: Path) -> None:
+    """The index is the only record of what upstream deleted; keep its remains.
+
+    Measured before the fix: the next save wrote a fresh index.json over the
+    damaged one, and with it went every missing_since and every
+    transcript_deleted_upstream the archive had recorded.
+    """
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "index.json").write_text("{ truncated", encoding="utf-8")
+
+    archive = Archive(root=root)
+    archive.save()
+
+    kept = list(root.glob("index.json.corrupt-*"))
+    assert len(kept) == 1
+    assert kept[0].read_text(encoding="utf-8") == "{ truncated"
+    assert json.loads((root / "index.json").read_text(encoding="utf-8"))["entities"] == {}
+    assert any("index.json" in notice for notice in archive.notices)
+
+
+def test_corrupt_sync_state_is_kept_too(tmp_path: Path) -> None:
+    """Watermarks are cheaper to lose than tombstones, but not free."""
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / ".sync-state.json").write_text("[]", encoding="utf-8")
+
+    Archive(root=root).save()
+
+    assert len(list(root.glob(".sync-state.json.corrupt-*"))) == 1
+
+
+def test_a_read_only_archive_never_moves_a_corrupt_index(tmp_path: Path) -> None:
+    """A dry run or a verify reports the damage and leaves it exactly where it is."""
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "index.json").write_text("{ truncated", encoding="utf-8")
+
+    archive = Archive(root=root, read_only=True)
+    archive.save()
+
+    assert (root / "index.json").read_text(encoding="utf-8") == "{ truncated"
+    assert not list(root.glob("*.corrupt-*"))
+    assert archive.unreadable == ["index.json"]
+
+
 # --- relocation -----------------------------------------------------------
 
 

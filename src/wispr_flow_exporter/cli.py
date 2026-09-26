@@ -319,6 +319,16 @@ def _say(label: str, value: str) -> None:
     print(f"  {label:<13}: {redact(value)}", flush=True)
 
 
+def _announce(archive: Archive) -> None:
+    """Print what loading the archive found, before the command's own output.
+
+    Args:
+        archive: The archive just opened.
+    """
+    for notice in archive.notices:
+        _say("archive", notice)
+
+
 def _defaults() -> Answers:
     """Build the interactive defaults from the environment and .env.
 
@@ -514,6 +524,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     # .gitignore either. The passes still mutate the index in memory to count
     # what they would write, so the archive refuses to persist it.
     archive = Archive(root=config.archive_dir, read_only=options.dry_run)
+    _announce(archive)
     if not options.dry_run:
         ensure_ignored(config.archive_dir)
 
@@ -946,7 +957,7 @@ def _schema_cloud(args: argparse.Namespace, config: Config) -> int:
     app_version = read_config(resolved.config).app_version
     # Read for the baseline, never written. A report that mutated the archive
     # would not be safe to run while diagnosing one.
-    recorded = Archive(root=config.archive_dir).source_state(CLOUD_BACKEND)
+    recorded = Archive(root=config.archive_dir, read_only=True).source_state(CLOUD_BACKEND)
     drift = detect_cloud_drift(
         results, recorded.get("endpoint_shapes"), table, app_version
     )
@@ -1043,7 +1054,7 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
         print(f"  {redact(str(error))}")
         return EXIT_SOURCE_UNREACHABLE
 
-    recorded = Archive(root=config.archive_dir).source_state(MCP_BACKEND)
+    recorded = Archive(root=config.archive_dir, read_only=True).source_state(MCP_BACKEND)
     drift = detect_mcp_drift(tools, server, recorded.get("tool_shapes"))
     live = pin_from_tools(tools, server)
     advertised = sorted(str(tool.get("name", "")) for tool in tools)
@@ -1170,9 +1181,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     """
     config = _config(args)
     resolved = paths.resolve(config.data_dir, config.db)
-    archive = Archive(root=config.archive_dir)
+    # Read-only: verification reports what it finds and changes nothing, not
+    # even setting aside a corrupt index.
+    archive = Archive(root=config.archive_dir, read_only=True)
 
     print("wispr-flow-exporter verify")
+    _announce(archive)
     if resolved.db.exists():
         with open_source(resolved.db, immutable=resolved.db_is_backup) as source:
             report = verify_archive(archive, source, deep=getattr(args, "deep", False))
@@ -1205,6 +1219,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     archive = Archive(root=config.archive_dir, read_only=options.dry_run)
 
     print("wispr-flow-exporter render")
+    _announce(archive)
     counts = rerender(archive, options)
     if not options.dry_run:
         archive.save()

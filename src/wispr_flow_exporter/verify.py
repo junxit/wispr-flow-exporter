@@ -64,6 +64,9 @@ class VerifyReport:
             archive kept is not a discrepancy.
         tombstoned: Entries upstream has deleted, kept deliberately.
         unresolved_tokens: Speaker mentions that could not be resolved.
+        corrupt: Bookkeeping files that are unreadable, or were set aside as
+            ``*.corrupt-*`` by an earlier run. Each means facts the index held
+            may be missing until someone restores or merges it.
     """
 
     checked: int = 0
@@ -75,6 +78,7 @@ class VerifyReport:
     counts: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     tombstoned: int = 0
     unresolved_tokens: int = 0
+    corrupt: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -93,6 +97,7 @@ class VerifyReport:
             or self.untracked
             or self.unarchived
             or self.counts
+            or self.corrupt
         )
 
     def lines(self) -> list[str]:
@@ -108,6 +113,7 @@ class VerifyReport:
             ("payload digest mismatch", self.stale_hashes),
             ("on disk but not indexed", self.untracked),
             ("in the source but not archived", self.unarchived),
+            ("unreadable or set-aside bookkeeping file", self.corrupt),
         ):
             if items:
                 shown = ", ".join(items[:5])
@@ -144,6 +150,10 @@ def verify_archive(
         What was found.
     """
     report = VerifyReport()
+    report.corrupt = sorted(
+        {*archive.unreadable}
+        | {path.name for path in archive.root.glob("*.corrupt-*") if path.is_file()}
+    )
     _check_entries(archive, report, deep=deep)
     _check_untracked(archive, report)
     if source is not None:

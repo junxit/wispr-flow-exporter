@@ -333,3 +333,30 @@ def test_a_dry_run_rebuild_writes_nothing(
     rerender(archive, SyncOptions(dry_run=True))
 
     assert document.read_text(encoding="utf-8") == "clobbered"
+
+
+def test_a_set_aside_index_is_reported_until_someone_deals_with_it(
+    tmp_path: Path,
+) -> None:
+    """A kept corrupt index means lost flags; verify must not call that consistent."""
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "index.json.corrupt-20260926T120000Z").write_text("{ torn", encoding="utf-8")
+
+    report = verify_archive(Archive(root=root, read_only=True))
+
+    assert not report.ok
+    assert "index.json.corrupt-20260926T120000Z" in " ".join(report.lines())
+
+
+def test_an_unreadable_index_is_reported_without_being_moved(tmp_path: Path) -> None:
+    """Verification changes nothing, not even to tidy up what it found."""
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "index.json").write_text("{ torn", encoding="utf-8")
+
+    report = verify_archive(Archive(root=root, read_only=True))
+
+    assert not report.ok
+    assert report.corrupt == ["index.json"]
+    assert (root / "index.json").read_text(encoding="utf-8") == "{ torn"
