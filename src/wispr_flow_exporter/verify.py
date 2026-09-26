@@ -21,12 +21,15 @@ the live table rather than inferred from the previous run's own counts.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from .normalize import calendar_key
+from .retention import ledger_path, read_ledger
 from .schema import EXPECTED
-from .secure_io import read_json
+from .secure_io import read_json, read_ndjson
 from .sqlite_source import SqliteSource
 from .store import (
     STATE_ABSENT,
@@ -34,16 +37,18 @@ from .store import (
     Archive,
     UnsafeArchivePathError,
     content_hash,
+    row_identity,
 )
 
-# Entities whose records are indexed one-per-record, and the table each comes
-# from. Snapshot entities are reconciled by count instead.
-PER_RECORD = (("Meetings", "meetings"), ("Notes", "notes"))
-BY_COUNT = (
-    ("Meetings", "meetings"),
-    ("Notes", "notes"),
-    ("CalendarEvents", "calendar"),
+# Entities whose records are indexed one-per-record: the table, the index
+# namespace, and how a source identity becomes an index key.
+PER_RECORD: tuple[tuple[str, str, Callable[[str], str]], ...] = (
+    ("Meetings", "meetings", str),
+    ("Notes", "notes", str),
+    ("CalendarEvents", "calendar", calendar_key),
 )
+# Entities archived as one snapshot, reconciled by row identity against the
+# snapshot and its ledger together.
 SNAPSHOT_ENTITIES = (("Dictionary", "dictionary"), ("Todos", "todos"))
 
 
@@ -57,11 +62,14 @@ class VerifyReport:
         unsafe_paths: Entries whose path resolves outside the archive.
         stale_hashes: Entries whose archived payload no longer matches.
         untracked: Meeting directories on disk with no index entry.
-        unarchived: Source records with no index entry.
-        counts: Tables whose totals disagree, as
-            ``(in_source, archived, retained)``. The comparison is against
-            ``archived - retained``: a record the source dropped and the
-            archive kept is not a discrepancy.
+        unarchived: Source records the archive holds no file for. The one
+            finding an archival tool must never miss.
+        retained: Per table, records the archive holds that upstream no
+            longer does. Never a fault: keeping them is the point.
+        unflagged: Of those, how many sync has not yet flagged as gone --
+            deleted upstream since the last run.
+        unreconciled: Tables that could not be reconciled because their key
+            column is gone upstream, which drift reports as breaking.
         tombstoned: Entries upstream has deleted, kept deliberately.
         unresolved_tokens: Speaker mentions that could not be resolved.
         corrupt: Bookkeeping files that are unreadable, or were set aside as
@@ -75,7 +83,9 @@ class VerifyReport:
     stale_hashes: list[str] = field(default_factory=list)
     untracked: list[str] = field(default_factory=list)
     unarchived: list[str] = field(default_factory=list)
-    counts: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    retained: dict[str, int] = field(default_factory=dict)
+    unflagged: int = 0
+    unreconciled: list[str] = field(default_factory=list)
     tombstoned: int = 0
     unresolved_tokens: int = 0
     corrupt: list[str] = field(default_factory=list)
@@ -96,7 +106,6 @@ class VerifyReport:
             or self.stale_hashes
             or self.untracked
             or self.unarchived
-            or self.counts
             or self.corrupt
         )
 
@@ -119,15 +128,16 @@ class VerifyReport:
                 shown = ", ".join(items[:5])
                 more = f" (+{len(items) - 5} more)" if len(items) > 5 else ""
                 out.append(f"{len(items)} {label}: {shown}{more}")
-        for table, (in_source, archived, retained) in sorted(self.counts.items()):
-            line = f"{table}: {in_source} in source, {archived} archived"
-            if retained:
-                # Say what was already accounted for, or the numbers look like
-                # they simply fail to add up.
-                line += f" ({retained} kept after upstream deletion)"
-            out.append(line)
+        for table in self.unreconciled:
+            out.append(f"{table}: not reconciled -- its key column is gone upstream")
         if self.tombstoned:
             out.append(f"{self.tombstoned} deleted upstream, kept here")
+        if self.unflagged:
+            # Said, not failed: the next sync records when they went.
+            out.append(
+                f"{self.unflagged} more gone upstream since the last sync, "
+                "kept here; the next sync flags them"
+            )
         if self.unresolved_tokens:
             out.append(f"{self.unresolved_tokens} unresolved speaker mentions")
         out.append("archive is consistent" if self.ok else "archive has problems")
@@ -251,29 +261,17 @@ def _check_untracked(archive: Archive, report: VerifyReport) -> None:
             report.untracked.append(archive.relative(candidate))
 
 
-def _retained(archive: Archive, entity: str) -> int:
-    """Count entries kept although the source no longer holds them.
-
-    Args:
-        archive: The archive.
-        entity: Archive directory name.
-
-    Returns:
-        How many entries are flagged as gone upstream. Uses ``entries``, which
-        is deliberately non-mutating, so counting an empty entity does not
-        create it in the index.
-    """
-    return sum(
-        1
-        for entry in archive.entries(entity).values()
-        if isinstance(entry, dict) and entry.get("upstream_state") == STATE_ABSENT
-    )
-
-
 def _check_against_source(
     archive: Archive, source: SqliteSource, report: VerifyReport
 ) -> None:
-    """Reconcile the archive against what the database still holds.
+    """Reconcile the archive against what the database holds, record by record.
+
+    By identity rather than by count. Counting compared a table's rows with
+    the archive's entries, so every record upstream deleted was a mismatch
+    until sync flagged it -- which, before 0.5.0, took a --full run -- and a
+    healthy archive reported "problems". It also could not tell which record
+    was missing, and treated an index entry with no file behind it as
+    archived.
 
     Args:
         archive: The archive.
@@ -282,33 +280,47 @@ def _check_against_source(
     """
     available = set(source.tables())
 
-    for table, entity in PER_RECORD:
+    for table, entity, index_key in PER_RECORD:
         if table not in available:
             continue
-        indexed = set(archive.entries(entity))
-        for record in source.records(table):
-            if record.key and record.key not in indexed:
-                report.unarchived.append(f"{table}/{record.key}")
-
-    for table, entity in BY_COUNT:
-        if table not in available:
+        live = source.keys(table)
+        if live is None:
+            report.unreconciled.append(table)
             continue
-        in_source = source.row_count(table)
-        archived = len(archive.entries(entity))
-        # Records the source has dropped and the archive deliberately keeps do
-        # not belong in an equality check. Without this, the first time
-        # anything is deleted upstream the archive reports "problems" and exits
-        # non-zero forever, for doing exactly what this tool promises -- and an
-        # operator who sees that every run stops reading it.
-        retained = _retained(archive, entity)
-        if in_source != archived - retained:
-            report.counts[table] = (in_source, archived, retained)
+        wanted = {index_key(identity): identity for identity in live}
+        entries = archive.entries(entity)
+        archived = {
+            key
+            for key, entry in entries.items()
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
+        report.unarchived += [f"{table}/{key}" for key in sorted(set(wanted) - archived)]
+        gone = set(entries) - set(wanted)
+        if gone:
+            report.retained[table] = len(gone)
+            report.unflagged += sum(
+                1
+                for key in gone
+                if isinstance(entries[key], dict)
+                and entries[key].get("upstream_state") != STATE_ABSENT
+            )
 
     for table, entity in SNAPSHOT_ENTITIES:
         if table not in available:
             continue
-        entry = archive.entry(entity, entity)
-        archived = int(entry.get("records", 0)) if entry else 0
-        in_source = source.row_count(table)
-        if in_source != archived:
-            report.counts[table] = (in_source, archived, 0)
+        live = source.keys(table)
+        if live is None:
+            report.unreconciled.append(table)
+            continue
+        spec = EXPECTED[table]
+        snapshot = archive.existing_path(entity, entity)
+        rows: list[dict[str, Any]] = []
+        if snapshot is not None:
+            rows, _ = read_ndjson(snapshot)
+            rows += [
+                entry["row"]
+                for entry in read_ledger(ledger_path(snapshot))
+                if isinstance(entry.get("row"), dict)
+            ]
+        held = {row_identity(spec, row) for row in rows}
+        report.unarchived += [f"{table}/{key}" for key in sorted(set(live) - held)]

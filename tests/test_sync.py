@@ -366,31 +366,114 @@ def test_a_deleted_transcript_is_recorded_as_such(
     assert "transcript_deleted_upstream: true" in document
 
 
-def test_a_vanished_meeting_is_flagged_only_on_a_full_scan(
-    scene: Callable[..., tuple], tmp_path: Path, wispr_db: Callable[..., Path]
+def test_a_vanished_meeting_is_flagged_without_a_full_scan(
+    scene: Callable[..., tuple],
 ) -> None:
-    """Absence can only be established by a pass that looked at everything.
+    """Absence is checked against a key-only scan on every run.
 
-    A watermarked run has not seen the records it deliberately skipped, so it
-    must not conclude they are gone.
+    It used to need --full, because a watermarked read has not seen what it
+    skipped -- so until someone happened to run one, verify reported a healthy
+    archive as broken after any upstream deletion.
     """
     archive, resolved, db = scene([_meeting_row(), _meeting_row(id=MEETING_B)])
-    _run(archive, resolved, full=True)
+    _run(archive, resolved)
+
+    _delete(db, "Meetings", "id", MEETING_B)
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved)
+
+    assert result.counts["meetings"].absent == 1
+    assert fresh.entry("meetings", MEETING_B)["upstream_state"] == STATE_ABSENT
+    assert (fresh.root / fresh.entry("meetings", MEETING_B)["path"]).exists()
+
+
+def test_a_vanished_note_is_flagged_without_a_full_scan(
+    scene: Callable[..., tuple],
+) -> None:
+    """The same check covers every record with a file of its own."""
+    archive, resolved, db = scene(rows=[], tables={"Notes": [NOTE_ROW]})
+    _run(archive, resolved)
+
+    _delete(db, "Notes", "id", NOTE_A)
+    fresh = Archive(root=archive.root)
+    _run(fresh, resolved)
+
+    assert fresh.entry("notes", NOTE_A)["upstream_state"] == STATE_ABSENT
+
+
+def test_a_vanished_calendar_event_is_flagged_without_a_full_scan(
+    scene: Callable[..., tuple],
+) -> None:
+    """Calendar events are keyed by a hash of their id; absence still lines up."""
+    archive, resolved, db = scene(rows=[], tables={"CalendarEvents": [CALENDAR_ROW]})
+    _run(archive, resolved)
+
+    _delete(db, "CalendarEvents", "externalId", LONG_EXTERNAL_ID)
+    fresh = Archive(root=archive.root)
+    _run(fresh, resolved)
+
+    assert fresh.entry("calendar", calendar_key(LONG_EXTERNAL_ID))["upstream_state"] == (
+        STATE_ABSENT
+    )
+
+
+def test_a_meeting_that_comes_back_is_unflagged_and_re_read(
+    scene: Callable[..., tuple],
+) -> None:
+    """Restored upstream with its old modification time, it is still noticed."""
+    archive, resolved, db = scene([_meeting_row(), _meeting_row(id=MEETING_B)])
+    _run(archive, resolved)
+    _delete(db, "Meetings", "id", MEETING_B)
+    _run(Archive(root=archive.root), resolved)
 
     import sqlite3
 
+    row = _meeting_row(id=MEETING_B)
     with sqlite3.connect(db) as writer:
-        writer.execute('DELETE FROM "Meetings" WHERE id = ?', (MEETING_B,))
+        names = ", ".join(f'"{key}"' for key in row)
+        marks = ", ".join("?" for _ in row)
+        writer.execute(f'INSERT INTO "Meetings" ({names}) VALUES ({marks})', tuple(row.values()))
+    fresh = Archive(root=archive.root)
+    _run(fresh, resolved)
 
-    incremental = _run(Archive(root=archive.root), resolved)
-    assert incremental.counts["meetings"].absent == 0
+    entry = fresh.entry("meetings", MEETING_B)
+    assert entry["upstream_state"] != STATE_ABSENT
+    assert "missing_since" not in entry
+
+
+def test_a_record_the_index_never_wrote_is_archived_without_a_full_scan(
+    scene: Callable[..., tuple],
+) -> None:
+    """What a pre-0.4.1 dry run left behind: an entry with no file, a watermark past it.
+
+    Before, only --full could recover such a record; now the next sync does.
+    """
+    archive, resolved, _ = scene()
+    _run(archive, resolved)
+    archive.index["entities"]["meetings"][MEETING_A] = {"upstream_state": "present"}
+    archive.save()
 
     fresh = Archive(root=archive.root)
-    full = _run(fresh, resolved, full=True)
+    _run(fresh, resolved)
 
-    assert full.counts["meetings"].absent == 1
-    assert fresh.entry("meetings", MEETING_B)["upstream_state"] == STATE_ABSENT
-    assert (fresh.root / fresh.entry("meetings", MEETING_B)["path"]).exists()
+    entry = fresh.entry("meetings", MEETING_A)
+    assert (fresh.root / entry["path"] / "meeting.md").is_file()
+
+
+def test_a_key_scan_that_cannot_see_the_key_flags_nothing(
+    tmp_path: Path, scene: Callable[..., tuple], wispr_db: Callable[..., Path]
+) -> None:
+    """With the key column gone, "no rows" would read as "everything deleted"."""
+    archive, resolved, _ = scene()
+    _run(archive, resolved)
+    wispr_db({"Meetings": []}, drop_columns={"Meetings": ("id",)}, name="keyless.sqlite").replace(
+        resolved.db
+    )
+
+    fresh = Archive(root=archive.root)
+    _run(fresh, resolved)
+
+    assert fresh.entry("meetings", MEETING_A)["upstream_state"] != STATE_ABSENT
 
 
 # --- options and safety ---------------------------------------------------

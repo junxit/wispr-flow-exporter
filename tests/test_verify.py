@@ -10,6 +10,7 @@ import pytest
 from conftest import MEETING_A, OWNER, SECOND, TITLE_PLAIN
 
 from wispr_flow_exporter import paths
+from wispr_flow_exporter.normalize import calendar_key
 from wispr_flow_exporter.sqlite_source import open_source
 from wispr_flow_exporter.store import Archive
 from wispr_flow_exporter.sync import SyncOptions, rerender, sync_local
@@ -235,27 +236,75 @@ def test_a_tombstone_is_not_a_fault(
     report = _verify(archive, resolved)
 
     assert report.tombstoned == 1
-    assert report.counts == {}
+    assert report.retained == {"Meetings": 1}
     assert report.ok
 
 
-def test_a_genuine_count_mismatch_still_fails(
+def test_a_record_gone_since_the_last_sync_is_not_a_fault(
     archived: tuple[Archive, object], wispr_db: Callable[..., Path]
 ) -> None:
-    """Reconciling tombstones must not blunt the check it lives in.
+    """Deleted upstream but not yet flagged is still the archive doing its job.
 
-    A record that vanished from the source *without* being tombstoned is a
-    real inconsistency and must still be reported, with the retained count
-    shown so the numbers visibly add up.
+    This used to be a count mismatch -- "0 in source, 1 archived", exit 1 --
+    until someone ran sync --full. It is said, not failed.
     """
     archive, resolved = archived
     wispr_db({"Meetings": []}).replace(resolved.db)  # type: ignore[attr-defined]
 
     report = _verify(archive, resolved)
 
-    assert report.counts["Meetings"] == (0, 1, 0)
+    assert report.ok
+    assert report.unflagged == 1
+    assert any("the next sync flags them" in line for line in report.lines())
+
+
+def test_a_calendar_event_the_archive_lacks_is_reported(
+    archived: tuple[Archive, object], wispr_db: Callable[..., Path]
+) -> None:
+    """Calendar events were only ever counted; now a missing one is named."""
+    archive, resolved = archived
+    event = {"externalId": "q" * 181, "title": "Whisper sync", "startAtUtc": 1787272400000}
+    wispr_db({"CalendarEvents": [event]}).replace(resolved.db)  # type: ignore[attr-defined]
+
+    report = _verify(archive, resolved)
+
     assert not report.ok
-    assert any("0 in source, 1 archived" in line for line in report.lines())
+    assert report.unarchived == [f"CalendarEvents/{calendar_key('q' * 181)}"]
+
+
+def test_an_entry_with_no_file_is_not_counted_as_archived(
+    archived: tuple[Archive, object],
+) -> None:
+    """A pre-0.4.1 dry run could leave entries like this; they held nothing."""
+    archive, resolved = archived
+    archive.index["entities"]["meetings"][MEETING_A] = {"upstream_state": "present"}
+
+    report = _verify(archive, resolved)
+
+    assert report.unarchived == [f"Meetings/{MEETING_A}"]
+
+
+def test_the_dictionary_is_reconciled_by_identity(
+    tmp_path: Path, wispr_db: Callable[..., Path]
+) -> None:
+    """A row in the ledger is archived; a row upstream added since is not."""
+    data_dir = tmp_path / "Wispr Flow"
+    data_dir.mkdir()
+    rows = [{"id": "d-1", "phrase": "hush"}, {"id": "d-2", "phrase": "murmur"}]
+    wispr_db({"Dictionary": rows}).replace(data_dir / "flow.sqlite")
+    resolved = paths.resolve(data_dir=data_dir)
+    archive = Archive(root=tmp_path / "archive")
+    with open_source(resolved.db) as source:
+        sync_local(archive, source, resolved, SyncOptions())
+    replaced = [{"id": "d-1", "phrase": "hush"}, {"id": "d-3", "phrase": "static"}]
+    wispr_db({"Dictionary": rows[:1]}, name="second.sqlite").replace(resolved.db)
+    with open_source(resolved.db) as source:
+        sync_local(Archive(root=archive.root), source, resolved, SyncOptions())
+    wispr_db({"Dictionary": replaced}, name="third.sqlite").replace(resolved.db)
+
+    report = _verify(Archive(root=archive.root), resolved)
+
+    assert report.unarchived == ["Dictionary/d-3"]
 
 
 # --- render ---------------------------------------------------------------

@@ -27,7 +27,7 @@ all.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -70,6 +70,7 @@ from .secure_io import (
 )
 from .sqlite_source import Record, SqliteSource
 from .store import (
+    STATE_ABSENT,
     UNDATED,
     Archive,
     content_hash,
@@ -273,6 +274,73 @@ def _meeting_records(source: SqliteSource, since: Any) -> Iterator[Record]:
     )
 
 
+def _needs_reading(
+    archive: Archive,
+    entity: str,
+    live: Mapping[str, Any] | None,
+    *,
+    index_key: Callable[[str], str] = str,
+    readable: Callable[[str], object] = bool,
+) -> set[str]:
+    """Name the live records a watermarked read would skip but this run must visit.
+
+    A watermark only returns rows modified since the last run. Three kinds of
+    record can hide behind it: one the index never recorded a file for -- a
+    dry run before 0.4.1 left exactly that behind, with the watermark already
+    past it -- one flagged as gone upstream that has since come back, and one
+    missing from the index altogether.
+
+    Args:
+        archive: The archive.
+        entity: The index namespace.
+        live: Every identity upstream holds, from a key-only scan, or ``None``
+            when the scan could not see the key.
+        index_key: Maps a source identity to its index key.
+        readable: Whether an identity can be archived at all; an id that
+            fails validation is never fetched just to fail again.
+
+    Returns:
+        Source identities to read by key.
+    """
+    if live is None:
+        return set()
+    entries = archive.entries(entity)
+    wanted: set[str] = set()
+    for identity in live:
+        if not readable(identity):
+            continue
+        entry = entries.get(index_key(identity))
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("path"), str)
+            or entry.get("upstream_state") == STATE_ABSENT
+        ):
+            wanted.add(identity)
+    return wanted
+
+
+def _and_by_key(
+    records: Iterable[Record], source: SqliteSource, table: str, keys: set[str]
+) -> Iterator[Record]:
+    """Yield a watermarked read, then any wanted record it did not include.
+
+    Args:
+        records: The watermarked read.
+        source: The open reader.
+        table: Table name.
+        keys: Identities that must be visited this run.
+
+    Yields:
+        Every record to process, each once.
+    """
+    seen: set[str] = set()
+    for record in records:
+        seen.add(record.key)
+        yield record
+    if remaining := keys - seen:
+        yield from source.records(table, keys=remaining)
+
+
 def sync_meetings(
     archive: Archive,
     source: SqliteSource,
@@ -300,11 +368,12 @@ def sync_meetings(
 
     by_id = {item.meeting_id: item for item in files_source.discover_meetings(wispr.meetings)}
     since = None if options.full else archive.watermark(SOURCE_LOCAL, entity)
-    seen: list[str] = []
+    live = source.keys("Meetings")
+    wanted = _needs_reading(archive, entity, live, readable=MEETING_DIR_RE.match)
     failed = False
 
     try:
-        for record in _meeting_records(source, since):
+        for record in _and_by_key(_meeting_records(source, since), source, "Meetings", wanted):
             counts.scanned += 1
             key = record.key
             # The id becomes a directory name, so it is validated before it is
@@ -313,7 +382,6 @@ def sync_meetings(
                 counts.failed += 1
                 failed = True
                 continue
-            seen.append(key)
             try:
                 changed = _archive_meeting(
                     archive, record, by_id.get(key), spec, options, counts, now
@@ -341,10 +409,12 @@ def sync_meetings(
             archive.save()
         raise
 
-    # Absence can only be established by a scan that looked at everything. A
-    # watermarked pass has not seen the records it deliberately skipped.
-    if options.full and not failed:
-        counts.absent = len(archive.mark_absent(entity, seen, when=now))
+    # Absence is established against a key-only scan of the whole table, on
+    # every run. It used to wait for a --full pass, because a watermarked read
+    # has not seen what it skipped -- so verify reported a healthy archive as
+    # broken from an upstream deletion until someone happened to run --full.
+    if live is not None:
+        counts.absent = len(archive.mark_absent(entity, live, when=now))
 
     if not failed:
         archive.set_watermark(
@@ -771,12 +841,16 @@ def sync_notes(
     counts = SyncCounts()
     now = _now()
     since = None if options.full else archive.watermark(SOURCE_LOCAL, "notes")
-    seen: list[str] = []
+    live = source.keys("Notes")
+    wanted = _needs_reading(archive, "notes", live, readable=MEETING_DIR_RE.match)
     failed = False
 
     try:
-        for record in source.records(
-            "Notes", since=since, since_column="modifiedAt"
+        for record in _and_by_key(
+            source.records("Notes", since=since, since_column="modifiedAt"),
+            source,
+            "Notes",
+            wanted,
         ):
             counts.scanned += 1
             key = record.key
@@ -784,7 +858,6 @@ def sync_notes(
                 counts.failed += 1
                 failed = True
                 continue
-            seen.append(key)
             data = record.data
             created = to_instant(TimestampKind.SEQUELIZE, data.get("createdAt"))
             title = _text(data.get("title"))
@@ -853,8 +926,8 @@ def sync_notes(
             archive.save()
         raise
 
-    if options.full and not failed:
-        counts.absent = len(archive.mark_absent("notes", seen, when=now))
+    if live is not None:
+        counts.absent = len(archive.mark_absent("notes", live, when=now))
     if not failed:
         archive.set_watermark(
             SOURCE_LOCAL, "notes", "modifiedAt", source.max_value("Notes", "modifiedAt")
@@ -884,11 +957,15 @@ def sync_calendar(
     counts = SyncCounts()
     now = _now()
     since = None if options.full else archive.watermark(SOURCE_LOCAL, "calendar")
-    seen: list[str] = []
+    live = source.keys("CalendarEvents")
+    wanted = _needs_reading(archive, "calendar", live, index_key=calendar_key)
 
     try:
-        for record in source.records(
-            "CalendarEvents", since=since, since_column="updatedAt"
+        for record in _and_by_key(
+            source.records("CalendarEvents", since=since, since_column="updatedAt"),
+            source,
+            "CalendarEvents",
+            wanted,
         ):
             counts.scanned += 1
             data = record.data
@@ -897,7 +974,6 @@ def sync_calendar(
             # it cannot be a path component and truncating it is not
             # injective. A hash prefix is the only stable short name.
             key = calendar_key(external_id)
-            seen.append(key)
 
             starts = to_instant(TimestampKind.EPOCH_MS, data.get("startAtUtc"))
             title = _text(data.get("title"))
@@ -956,8 +1032,9 @@ def sync_calendar(
             archive.save()
         raise
 
-    if options.full:
-        counts.absent = len(archive.mark_absent("calendar", seen, when=now))
+    if live is not None:
+        present = {calendar_key(external_id) for external_id in live}
+        counts.absent = len(archive.mark_absent("calendar", present, when=now))
     archive.set_watermark(
         SOURCE_LOCAL,
         "calendar",

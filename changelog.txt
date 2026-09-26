@@ -114,6 +114,29 @@ wrapped at 72 columns, US English.
   rendered from them, which broke the rule every other entity keeps: raw
   first, so a rendering can always be rebuilt and nothing depends on
   one.
+- A record deleted upstream is flagged on the next run, not the next
+  --full run. Absence used to be established only by a --full pass,
+  since a watermarked read has not seen what it skipped, so a meeting,
+  note or calendar event deleted upstream stayed unflagged -- and
+  verify, counting rows against entries, reported the archive as broken.
+  Measured on 0.4.0, and unchanged in 0.4.1: one meeting deleted, one
+  plain sync, then `verify` printed "Meetings: 1 in source, 2 archived |
+  archive has problems" and exited 1, the same false alarm 0.3.1 fixed
+  for the flagged case. Each run now reads the three tables' keys -- one
+  column each, cheap -- flags what is gone, and re-reads what has come
+  back.
+- The same key scan re-reads any record the index lost track of, without
+  --full. A dry run before 0.4.1 could leave an index entry with no file
+  behind it and the watermark already past the record; only --full
+  recovered it. Now the next sync does.
+- verify reconciles by identity, not by count. Meetings, notes and
+  calendar events are checked record by record -- calendar events were
+  only ever counted -- and an index entry with no file behind it no
+  longer counts as archived. The dictionary and todos are checked row by
+  row against the snapshot and its ledger together. A record gone
+  upstream since the last sync is reported, not failed: the next sync
+  flags it. A table whose key column is gone is reported as not
+  reconciled rather than as every record missing.
 
 0.4.1
 -----

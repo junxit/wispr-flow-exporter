@@ -216,7 +216,8 @@ uv run wispr-export sync --include-screen-context --i-understand
 # Re-render Markdown from what is already archived. Touches no source at all.
 uv run wispr-export render --force
 
-# Reconcile the archive against the database.
+# Reconcile the archive against the database, record by record. --deep also
+# recomputes each meeting's digest from its archived payload.
 uv run wispr-export verify --deep
 
 # Every backend that is ready. This is the default: local always, plus cloud
@@ -291,8 +292,8 @@ whose filename ends in a UUID, hierarchical `tags` (`wispr/meeting`), and
 ## Retention guarantees
 
 - **Nothing is ever deleted.** A record that disappears upstream is flagged
-  `missing_since`; a soft-deleted one is flagged `deleted: true` and still
-  rendered.
+  `missing_since` on the next run; a soft-deleted one is flagged `deleted: true`
+  and still rendered.
 - **That includes rows of tables archived as whole files** — the dictionary,
   todos, each day of dictation and every table archived generically. Each file
   mirrors upstream exactly, and a row upstream drops moves to a
