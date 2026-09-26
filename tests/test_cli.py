@@ -27,6 +27,7 @@ from wispr_flow_exporter.cli import (
     EXIT_FAILURE,
     EXIT_OK,
     EXIT_SOURCE_UNREACHABLE,
+    EXIT_USAGE,
     main,
 )
 from wispr_flow_exporter.endpoints import EndpointError
@@ -119,6 +120,45 @@ def test_screen_context_with_the_acknowledgement_parses(
     assert main(
         ["sync", "--data-dir", str(data_dir), "--include-screen-context", "--i-understand"]
     ) == EXIT_OK
+
+
+def test_the_environment_cannot_skip_the_screen_context_acknowledgement(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The variable widens the export exactly as the flag does, so it asks the same.
+
+    Measured before the fix: WISPR_INCLUDE_SCREEN_CONTEXT=1 alone -- which a
+    .env in the working directory can set -- archived screen captures with no
+    acknowledgement, although .env.example and SECURITY.md both said the CLI
+    required --i-understand.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db)
+    monkeypatch.setenv("WISPR_INCLUDE_SCREEN_CONTEXT", "1")
+
+    code = main(["sync", "--source", "local", "--data-dir", str(data_dir)])
+
+    assert code == EXIT_USAGE
+    assert "--i-understand" in capsys.readouterr().err
+    assert not (tmp_path / "archive").exists()
+
+
+def test_the_environment_with_the_acknowledgement_runs(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scheduled run keeps its setting and adds the flag, and then it works."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+    monkeypatch.setenv("WISPR_INCLUDE_SCREEN_CONTEXT", "1")
+
+    code = main(
+        ["sync", "--source", "local", "--data-dir", str(data_dir), "--i-understand"]
+    )
+
+    assert code == EXIT_OK
 
 
 def test_an_invalid_source_is_rejected() -> None:

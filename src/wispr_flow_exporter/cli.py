@@ -103,6 +103,7 @@ DEFAULT_MAX_AUDIO_MB = 512
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
+EXIT_USAGE = 2
 EXIT_ADDITIVE_DRIFT = 3
 EXIT_BREAKING_DRIFT = 4
 EXIT_SOURCE_UNREACHABLE = 5
@@ -474,6 +475,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
         Process exit code.
     """
     config = _config(args)
+    if config.include_screen_context and not getattr(args, "i_understand", False):
+        # main() refuses the bare flag before any command runs. This catches the
+        # same widening arriving from the environment or a .env, which used to
+        # skip the acknowledgement entirely: WISPR_INCLUDE_SCREEN_CONTEXT=1 on
+        # its own archived screen captures.
+        print(
+            "  WISPR_INCLUDE_SCREEN_CONTEXT also requires --i-understand on the "
+            "command line: it archives screenshots and accessibility captures of "
+            "whatever was on screen while you dictated",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
     resolved = paths.resolve(config.data_dir, config.db)
     backends = _backends(config.source)
     runs_local = SOURCE_LOCAL in backends

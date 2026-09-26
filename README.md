@@ -316,7 +316,7 @@ connection trusts. Set them in the real environment if you need them; see
 | `WISPR_SYNC_SOURCE` | `all` | `all`, `local`, `cloud`, `mcp`, `both`, `auto`. `all` is local plus every remote backend that has a credential; `local` and `auto` never touch the network |
 | `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written |
 | `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
-| `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures |
+| `WISPR_INCLUDE_SCREEN_CONTEXT` | `0` | Screenshots and accessibility captures; still requires `--i-understand` on the command line |
 | `WISPR_STRICT_SCHEMA` | `0` | Exit non-zero on additive schema drift |
 
 ### Commands
@@ -426,8 +426,9 @@ this tool cannot evaluate either for you.
 The archive is the most sensitive thing this tool produces: verbatim transcripts
 of real conversations, everything you have dictated, and — if you opt in — screen
 captures taken while you spoke. Files are written `0600` in `0700` directories,
-`archive/` is gitignored, screen context requires two explicit flags, and the
-session token is never copied into the archive or printed.
+`archive/` is gitignored, screen context requires two explicit flags however it
+is switched on, and the session token is never copied into the archive or
+printed.
 
 Note that an archive also contains **other people's** voices and words. Sharing
 one is a disclosure decision about people who are not in the room.

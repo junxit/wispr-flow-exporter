@@ -193,7 +193,10 @@ spoke.
   Wispr Flow garbage-collects it — on the machine this was developed against,
   only one of three meetings still had its audio on disk. Dictation audio blobs
   and note images are opt-in. Screen context requires both
-  `--include-screen-context` and `--i-understand`.
+  `--include-screen-context` and `--i-understand`; enabling it through
+  `WISPR_INCLUDE_SCREEN_CONTEXT` instead still requires `--i-understand` on the
+  command line. Before 0.4.1 the variable alone was enough, which let a `.env`
+  in the working directory widen the export with no acknowledgement at all.
 
   **Invariant:** screen-context columns are excluded **by name in the `SELECT`**,
   not filtered out of a `SELECT *`. A column added upstream is excluded until it

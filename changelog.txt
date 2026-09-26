@@ -31,6 +31,10 @@ wrapped at 72 columns, US English.
   making the two-setting consent one accident. A .env now sets only
   WISPR_* options, never the override, and names what it ignored on
   stderr.
+- WISPR_INCLUDE_SCREEN_CONTEXT=1 archived screen captures with no
+  acknowledgement, although .env.example and SECURITY.md both said
+  --i-understand was required. It now is, however screen context is
+  switched on.
 - The test suite could reach real data. Isolation lived in test_cli.py
   alone, so a test elsewhere calling main(["sync", ...]) from the
   repository root was relying on argparse to stop it; had that check
