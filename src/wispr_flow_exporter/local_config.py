@@ -59,6 +59,39 @@ def redact(text: str) -> str:
     return text
 
 
+# What a remote host, or anyone who can reach the login listener, must not be
+# able to put in front of the operator as-is: C0 and C1 controls, terminal
+# escapes among them, and the bidirectional overrides that make a line display
+# as something other than what it says.
+_UNPRINTABLE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]"
+)
+
+
+def printable(text: str, *, limit: int | None = None) -> str:
+    r"""Neutralize control characters in text bound for the terminal.
+
+    Each is shown as its escape -- ``\x1b``, ``\n`` -- rather than dropped, so
+    what arrived stays visible without being able to act: clear the screen,
+    move the cursor, forge a second line, or reorder what the operator reads.
+    Measured on 0.4.1: an authorization error of ``\x1b[2J\x1b[H`` reached
+    the terminal intact.
+
+    Args:
+        text: Text that came from somewhere else.
+        limit: Cut to this many characters, marking the cut.
+
+    Returns:
+        Text that prints as one line saying what it says.
+    """
+    shown = _UNPRINTABLE.sub(
+        lambda match: match.group().encode("unicode_escape").decode("ascii"), text
+    )
+    if limit is not None and len(shown) > limit:
+        return shown[: limit - 1] + "…"
+    return shown
+
+
 @dataclass(frozen=True, slots=True)
 class Policy:
     """The Wispr Flow preferences that decide what exists on disk.

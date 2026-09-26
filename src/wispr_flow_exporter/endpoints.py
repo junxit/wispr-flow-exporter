@@ -47,6 +47,43 @@ def host_of(url: str) -> str:
     return (urlsplit(url).hostname or "").lower()
 
 
+def same_host_https(url: object, *, anchor: str, what: str) -> str:
+    """Require a discovered URL to be https on the same host as another.
+
+    For endpoints a server advertises about itself. An authorization server's
+    metadata decides where this client registers, where the operator's browser
+    is sent and where codes and refresh tokens go; a document that could name
+    any host for those would make the issuer check above it decorative.
+
+    Args:
+        url: The advertised value, not yet known to be a string.
+        anchor: The URL whose host it must share.
+        what: What the URL is, for the error message.
+
+    Returns:
+        The URL, unchanged.
+
+    Raises:
+        EndpointError: The value is missing, is not https, carries credentials,
+            or names a different host.
+    """
+    if not isinstance(url, str) or not url:
+        raise EndpointError(f"{what} is missing")
+    try:
+        split = urlsplit(url)
+        hostname = (split.hostname or "").lower()
+        userinfo = split.username is not None or split.password is not None
+    except ValueError as error:
+        raise EndpointError(f"{what} is not a URL: {url!r}") from error
+    if split.scheme != "https":
+        raise EndpointError(f"{what} must use https: {url!r}")
+    if userinfo or hostname != host_of(anchor):
+        raise EndpointError(
+            f"{what} is on {hostname or 'no host'!r}, not {host_of(anchor)!r}: {url!r}"
+        )
+    return url
+
+
 def validated_endpoint(
     raw: str, *, default: str, variable: str, allow_override: bool = False
 ) -> str:

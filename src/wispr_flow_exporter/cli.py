@@ -22,15 +22,16 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dotenv import dotenv_values
 
 from . import files_source, paths
 from .endpoints import OVERRIDE_ENV, EndpointError, validated_endpoint
-from .local_config import LocalConfig, read_config, read_session, redact
+from .local_config import LocalConfig, printable, read_config, read_session, redact
 from .prompts import Answers, PromptAborted, collect, ensure_ignored
 from .schema import EXPECTED, MIGRATION_PIN
 from .sqlite_source import DriftClass, SourceError, open_source
@@ -41,6 +42,9 @@ from .store import Archive, ArchiveBusy
 from .sync import SOURCE_LOCAL as LOCAL_BACKEND
 from .sync import SyncOptions, SyncResult, rerender, sync_local
 from .verify import verify_archive
+
+if TYPE_CHECKING:  # pragma: no cover - the MCP modules load only when used
+    from .mcp_auth import McpCredential
 
 SOURCE_AUTO = "auto"
 SOURCE_LOCAL = "local"
@@ -316,7 +320,9 @@ def _say(label: str, value: str) -> None:
     """
     # Flushed: an interactive flow prints a URL the operator has to act on,
     # and a buffered stdout shows it only after the step it belongs to.
-    print(f"  {label:<13}: {redact(value)}", flush=True)
+    # printable() here too: values carry text from remote hosts and from the
+    # login listener, and a terminal escape in one should arrive as text.
+    print(f"  {label:<13}: {redact(printable(value))}", flush=True)
 
 
 def _announce(archive: Archive) -> None:
@@ -575,17 +581,33 @@ def _sync_passes(
         return EXIT_SOURCE_UNREACHABLE
 
     explicit = config.source not in (SOURCE_ALL, SOURCE_AUTO)
-    if SOURCE_CLOUD in backends:
-        exit_code = (
-            _run_cloud(archive, resolved, config, options, result, explicit=explicit)
-            or exit_code
-        )
-    if SOURCE_MCP in backends:
-        exit_code = (
-            _run_mcp(archive, config, options, result, explicit=explicit) or exit_code
-        )
-    if backends - {SOURCE_LOCAL}:
-        archive.save()
+    remote = backends - {SOURCE_LOCAL}
+    if result.interrupted and remote:
+        # Ctrl-C means stop. Measured on 0.4.1: it stopped the local pass and
+        # then both remote services were contacted anyway.
+        _say("", "interrupted; not contacting " + ", ".join(sorted(remote)))
+    elif remote:
+        try:
+            if SOURCE_CLOUD in remote:
+                exit_code = (
+                    _run_cloud(
+                        archive, resolved, config, options, result, explicit=explicit
+                    )
+                    or exit_code
+                )
+            if SOURCE_MCP in remote:
+                exit_code = (
+                    _run_mcp(archive, config, options, result, explicit=explicit)
+                    or exit_code
+                )
+        except KeyboardInterrupt:
+            result.interrupted = True
+        finally:
+            # Whatever ended the passes, what they recorded is kept. Measured
+            # on 0.4.1: an MCP pass that raised took the cloud pass's state
+            # with it, because the save came after both. A dry run's archive
+            # is read-only and saves nothing.
+            archive.save()
 
     for entity, counts in result.counts.items():
         _say("", counts.line(entity))
@@ -808,24 +830,26 @@ def _run_mcp(
     Returns:
         An exit code contribution, or 0.
     """
-    import httpx
-
     from .mcp_api import McpClient, McpError
-    from .mcp_auth import McpAuthError, resolve_credential
+    from .mcp_auth import McpAuthError, open_client, resolve_credential
     from .mcp_schema import MCP_PIN, detect_mcp_drift, tool_shapes
     from .sync_mcp import SOURCE_MCP as MCP_BACKEND
     from .sync_mcp import sync_mcp
 
-    with httpx.Client(timeout=30.0) as auth_client:
+    with open_client() as auth_client:
         try:
-            credential = resolve_credential(auth_client)
+            credential = resolve_credential(auth_client, config.mcp_endpoint)
         except McpAuthError as error:
             _say("mcp", redact(str(error)))
             return EXIT_FAILURE if explicit else EXIT_OK
 
     _say("mcp", f"using the token from {credential.origin}")
     try:
-        with McpClient(credential, endpoint=config.mcp_endpoint) as client:
+        with McpClient(
+            credential,
+            endpoint=config.mcp_endpoint,
+            renew=_renewer(config.mcp_endpoint, credential),
+        ) as client:
             counts = sync_mcp(archive, client, options)
             failures = list(client.failures)
             tools = list(client.tools)
@@ -857,6 +881,31 @@ def _run_mcp(
     return EXIT_FAILURE if counts.failed and not counts.written else EXIT_OK
 
 
+def _renewer(
+    endpoint: str, credential: McpCredential
+) -> Callable[[McpCredential], McpCredential] | None:
+    """Build the callback an MCP client uses to replace a rejected token.
+
+    Args:
+        endpoint: The MCP endpoint this run talks to.
+        credential: The credential the client starts with.
+
+    Returns:
+        The callback, or ``None`` for a token from the environment -- which is
+        the operator's to replace, never this tool's to refresh.
+    """
+    if credential.origin != "token store":
+        return None
+
+    def renew(rejected: McpCredential) -> McpCredential:
+        from .mcp_auth import open_client, renew_credential
+
+        with open_client() as client:
+            return renew_credential(client, endpoint, rejected)
+
+    return renew
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     """Authorize this tool against the MCP server.
 
@@ -870,15 +919,16 @@ def cmd_login(args: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
-    import httpx
-
-    from .mcp_auth import McpAuthError, login
+    from .mcp_auth import McpAuthError, login, open_client
 
     print("wispr-export login", flush=True)
-    _say("server", _config(args).mcp_endpoint)
+    endpoint = _config(args).mcp_endpoint
+    _say("server", endpoint)
     try:
-        with httpx.Client(timeout=30.0) as client:
-            credential = login(client, announce=lambda line: print(line, flush=True))
+        with open_client() as client:
+            credential = login(
+                client, endpoint, announce=lambda line: print(line, flush=True)
+            )
     except McpAuthError as error:
         _say("failed", redact(str(error)))
         return EXIT_FAILURE
@@ -1063,22 +1113,24 @@ def _schema_mcp(args: argparse.Namespace, config: Config) -> int:
     Returns:
         Process exit code.
     """
-    import httpx
-
     from .mcp_api import READ_TOOLS, McpClient, McpError
-    from .mcp_auth import McpAuthError, resolve_credential
+    from .mcp_auth import McpAuthError, open_client, resolve_credential
     from .mcp_schema import MCP_PIN, detect_mcp_drift, pin_from_tools
     from .sync_mcp import SOURCE_MCP as MCP_BACKEND
 
-    with httpx.Client(timeout=30.0) as auth_client:
+    with open_client() as auth_client:
         try:
-            credential = resolve_credential(auth_client)
+            credential = resolve_credential(auth_client, config.mcp_endpoint)
         except McpAuthError as error:
-            print(f"  {redact(str(error))}")
+            print(f"  {redact(printable(str(error)))}")
             return EXIT_SOURCE_UNREACHABLE
 
     try:
-        with McpClient(credential, endpoint=config.mcp_endpoint) as client:
+        with McpClient(
+            credential,
+            endpoint=config.mcp_endpoint,
+            renew=_renewer(config.mcp_endpoint, credential),
+        ) as client:
             tools = list(client.tools)
             server = dict(client.server)
     except McpError as error:

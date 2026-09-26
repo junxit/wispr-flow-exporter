@@ -57,10 +57,11 @@ ignore = [
     # line: they are a transcription of a table definition, and one name per
     # line would make a 40-column table unreadable as the table it is.
     "E501",
-    # "Exception names should end in Error." Two of the three this flags are
-    # control flow rather than failure -- PromptAborted is the operator saying
-    # no, and _Retry leaves a streaming block so the response closes before the
-    # backoff sleep. Naming those "...Error" would describe them wrongly.
+    # "Exception names should end in Error." Most of what this flags is not a
+    # failure: PromptAborted is the operator saying no, Retry and _Renew leave
+    # a streaming block so the response closes before the wait, and
+    # ResponseTooLarge is a verdict on a response. Naming those "...Error"
+    # would describe them wrongly.
     "N818",
 ]
 

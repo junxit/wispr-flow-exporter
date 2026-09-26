@@ -12,15 +12,19 @@ import base64
 import gzip
 import hashlib
 import json
+import socket
 import stat
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 import pytest
@@ -656,92 +660,384 @@ def test_the_state_ledger_carries_no_timestamp() -> None:
 
 # --- the authorization flow -----------------------------------------------
 #
-# This module is the one that mints a credential rather than borrowing one, and
-# until now it was covered only by a source-text scan. The tests below exercise
-# the decisions that scan cannot see: the CSRF check on the redirect, the PKCE
-# relationship, where the token lands, and the two discovery hops that decide
-# who this client will talk to.
+# This module is the one that mints a credential rather than borrowing one.
+# The tests below exercise the decisions a source scan cannot see: the checks
+# on the loopback redirect, the PKCE relationship, where the token lands, every
+# discovery hop that decides who this client talks to, and the binding that
+# keeps a token away from anyone it was not minted for. The authorization
+# server is a fake behind MockTransport; the listener is real, on loopback.
+
+_RESOURCE = "https://api.wisprflow.ai/connect/mcp"
+_ISSUER = "https://mcp-auth.wisprflow.com"
+_STAGING = "https://staging.example.invalid/mcp"
+_ELSEWHERE = "https://issuer.example.invalid"
 
 
-def _serve(state: str, timeout: float = 5.0) -> tuple[threading.Thread, list[Any]]:
-    """Run ``_await_code`` on a free port in a thread.
+class _Issuer:
+    """A protected resource and its authorization server, as measured.
+
+    Answers the two discovery documents, registration, and the token endpoint,
+    and remembers every request so a test can assert what was never sent.
+    """
+
+    def __init__(
+        self,
+        *,
+        issuer: str = _ISSUER,
+        resource: str = _RESOURCE,
+        named: list[str] | None = None,
+        endpoints: dict[str, Any] | None = None,
+        token: Callable[[dict[str, str]], httpx.Response] | None = None,
+    ) -> None:
+        """Describe the server.
+
+        Args:
+            issuer: The authorization server's identity.
+            resource: What the protected-resource document says it is.
+            named: The authorization servers that document names.
+            endpoints: Overrides for the issuer's advertised endpoints.
+            token: Answers the token endpoint; by default, fresh tokens.
+        """
+        self.issuer = issuer
+        self.protected = {
+            "resource": resource,
+            "authorization_servers": [issuer] if named is None else named,
+        }
+        self.metadata: dict[str, Any] = {
+            "issuer": issuer,
+            "authorization_endpoint": f"{issuer}/authorize",
+            "token_endpoint": f"{issuer}/token",
+            "registration_endpoint": f"{issuer}/register",
+            **(endpoints or {}),
+        }
+        self.token = token or (
+            lambda form: httpx.Response(
+                200,
+                json={
+                    "access_token": "access-2",
+                    "refresh_token": "refresh-2",
+                    "expires_in": 604800,
+                },
+            )
+        )
+        self.requests: list[httpx.Request] = []
+        self.forms: list[dict[str, str]] = []
+        self.registered = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request.
+
+        Args:
+            request: What the client sent.
+
+        Returns:
+            The server's answer.
+        """
+        self.requests.append(request)
+        url = str(request.url)
+        if request.url.path.startswith("/.well-known/oauth-protected-resource"):
+            return httpx.Response(200, json=self.protected)
+        if url == f"{self.issuer}/.well-known/oauth-authorization-server":
+            return httpx.Response(200, json=self.metadata)
+        if request.method == "POST" and url == self.metadata.get("registration_endpoint"):
+            self.registered += 1
+            return httpx.Response(201, json={"client_id": f"client-{self.registered}"})
+        if request.method == "POST" and url == self.metadata.get("token_endpoint"):
+            form = dict(parse_qsl(request.content.decode()))
+            self.forms.append(form)
+            return self.token(form)
+        return httpx.Response(404)
+
+    def client(self) -> Any:
+        """Open an OAuth client whose requests reach this server.
+
+        Returns:
+            The client, built as a real run builds it.
+        """
+        return mcp_auth.open_client(network(self))
+
+    @property
+    def posts(self) -> list[httpx.Request]:
+        """Every request that could have spent or minted something."""
+        return [request for request in self.requests if request.method == "POST"]
+
+
+def _store(**fields: Any) -> None:
+    """Write a token store bound to the shipped endpoint, then apply ``fields``.
 
     Args:
-        state: The value the callback must echo back.
-        timeout: How long the listener waits.
+        **fields: Values to change; ``None`` removes the key.
+    """
+    store: dict[str, Any] = {
+        "client_id": "client-7",
+        "issuer": _ISSUER,
+        "resource": _RESOURCE,
+        "access_token": FAKE_JWT,
+        "refresh_token": "refresh-1",
+        "expires_at": time.time() + 3600,
+    }
+    store.update(fields)
+    mcp_auth.write_store({key: value for key, value in store.items() if value is not None})
+
+
+def _browser(urls: list[str]) -> Callable[[str], object]:
+    """Stand in for a browser that is already signed in.
+
+    It connects to the redirect and sends the callback before returning --
+    nothing waits for the listener to start serving -- and it records the
+    URL it was sent to.
+
+    Args:
+        urls: Receives each URL opened.
 
     Returns:
-        The running thread and a one-slot list that receives the outcome.
+        The opener.
     """
-    port = mcp_auth._free_port()
+    sockets: list[socket.socket] = []
+
+    def open_url(url: str) -> object:
+        urls.append(url)
+        query = dict(parse_qsl(urlsplit(url).query))
+        port = urlsplit(query["redirect_uri"]).port
+        assert port is not None
+        connection = socket.create_connection(("127.0.0.1", port), timeout=5)
+        connection.sendall(
+            f"GET /callback?code=the-code&state={query['state']} HTTP/1.0\r\n\r\n".encode()
+        )
+        sockets.append(connection)
+        return True
+
+    return open_url
+
+
+# --- the listener ---------------------------------------------------------
+
+
+def _serve(
+    state: str = "the-state",
+    *,
+    timeout: float = 5.0,
+    connection_timeout: float = 5.0,
+    iss_required: bool = False,
+) -> tuple[threading.Thread, list[Any], int]:
+    """Bind a listener and serve it in a thread.
+
+    Args:
+        state: This login's state.
+        timeout: How long the listener waits in all.
+        connection_timeout: How long one connection may stay silent.
+        iss_required: Whether the redirect must name its issuer.
+
+    Returns:
+        The thread, a list that receives the outcome, and the port.
+    """
+    server = mcp_auth._bind_listener(
+        state,
+        issuer=_ISSUER,
+        iss_required=iss_required,
+        connection_timeout=connection_timeout,
+    )
     outcome: list[Any] = []
 
     def run() -> None:
         try:
-            outcome.append(mcp_auth._await_code(port, state, timeout))
+            outcome.append(mcp_auth._await_code(server, timeout))
         except Exception as error:
             outcome.append(error)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    time.sleep(0.1)
-    return thread, outcome, port  # type: ignore[return-value]
+    return thread, outcome, server.server_port
+
+
+def _visit(port: int, target: str) -> tuple[int, str]:
+    """Request one path from the listener, as a browser would.
+
+    Args:
+        port: The listener's port.
+        target: Path and query.
+
+    Returns:
+        The status and the page.
+    """
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{target}", timeout=5) as page:
+            return page.status, page.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
 
 
 def test_a_matching_state_yields_the_code() -> None:
     """The happy path, so the refusals below are known not to be vacuous."""
-    thread, outcome, port = _serve("the-state")
+    thread, outcome, port = _serve()
 
-    urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/?code=the-code&state=the-state", timeout=5
-    ).read()
+    status, page = _visit(port, "/callback?code=the-code&state=the-state")
     thread.join(timeout=5)
+
+    assert outcome == ["the-code"]
+    assert status == 200
+    assert "authorized" in page
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        "/callback?code=forged&state=not-the-state",
+        "/favicon.ico",
+        "/callback?error=access_denied",
+        "/callback?code=forged&state=%C3%A9",
+        "/?code=forged&state=the-state",
+    ],
+    ids=["wrong-state", "favicon", "error-without-state", "non-ascii-state", "wrong-path"],
+)
+def test_a_request_that_is_not_this_logins_redirect_is_turned_away(stray: str) -> None:
+    """Turned away, and the login goes on waiting for the real one.
+
+    Measured on 0.4.1, the listener's one request was whichever came first: a
+    favicon ended the login as a "timeout", an error without the login's
+    state ended it as a refusal, and a non-ASCII state raised TypeError. The
+    state is 32 random bytes, so a request without it is not the redirect
+    whatever else it says.
+    """
+    thread, outcome, port = _serve()
+
+    stray_status, _ = _visit(port, stray)
+    _visit(port, "/callback?code=the-code&state=the-state")
+    thread.join(timeout=5)
+
+    assert stray_status == 404
+    assert outcome == ["the-code"]
+
+
+def test_an_idle_connection_does_not_hold_the_listener() -> None:
+    """Measured on 0.4.1: one silent connection outlived a 1-second deadline.
+
+    It held the listener until the connection closed, which an idle one
+    never does; `login` waited with it.
+    """
+    thread, outcome, port = _serve(connection_timeout=0.3)
+    idle = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        _visit(port, "/callback?code=the-code&state=the-state")
+        thread.join(timeout=5)
+    finally:
+        idle.close()
 
     assert outcome == ["the-code"]
 
 
-def test_a_mismatched_state_is_refused() -> None:
-    """The CSRF check: a redirect this process did not start is not accepted.
+def test_a_login_nobody_completes_times_out_and_says_what_it_turned_away() -> None:
+    """A timeout that swallowed stray requests would hide why it waited."""
+    thread, outcome, port = _serve(timeout=0.5)
 
-    Without it, anyone able to reach the loopback listener during the seconds
-    it exists could feed in an authorization code of their choosing, and the
-    token minted from it would be for their account, not this one.
-    """
-    thread, outcome, port = _serve("the-state")
-
-    urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/?code=the-code&state=not-the-state", timeout=5
-    ).read()
+    _visit(port, "/favicon.ico")
     thread.join(timeout=5)
 
     assert isinstance(outcome[0], mcp_auth.McpAuthError)
-    assert "did not match" in str(outcome[0])
+    assert "timed out" in str(outcome[0])
+    assert "1 unrelated request(s)" in str(outcome[0])
 
 
 def test_an_authorization_error_is_reported_not_swallowed() -> None:
-    """A refusal upstream must not look like a timeout."""
-    thread, outcome, port = _serve("the-state")
+    """A refusal upstream must not look like a timeout -- or like success."""
+    thread, outcome, port = _serve()
 
-    urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/?error=access_denied&state=the-state", timeout=5
-    ).read()
+    status, page = _visit(port, "/callback?error=access_denied&state=the-state")
     thread.join(timeout=5)
 
     assert isinstance(outcome[0], mcp_auth.McpAuthError)
     assert "access_denied" in str(outcome[0])
+    assert status == 400
+    assert "authorized" not in page
+
+
+def test_an_error_description_arrives_without_control_characters() -> None:
+    """Measured on 0.4.1: a clear-screen escape reached the terminal intact."""
+    thread, outcome, port = _serve()
+
+    _visit(
+        port,
+        "/callback?error=access_denied&error_description=%1b%5b2J%1b%5bHfake"
+        "&state=the-state",
+    )
+    thread.join(timeout=5)
+
+    message = str(outcome[0])
+    assert "\x1b" not in message
+    assert "\\x1b[2J" in message
 
 
 def test_a_response_with_no_code_is_refused() -> None:
-    """A 200 that carried nothing usable is still a failure."""
-    thread, outcome, port = _serve("the-state")
+    """A redirect that carried nothing usable is still a failure."""
+    thread, outcome, port = _serve()
 
-    urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/?state=the-state", timeout=5
-    ).read()
+    _visit(port, "/callback?state=the-state")
     thread.join(timeout=5)
 
     assert isinstance(outcome[0], mcp_auth.McpAuthError)
     assert "no code" in str(outcome[0])
+
+
+@pytest.mark.parametrize(
+    ("iss", "required"),
+    [(_ELSEWHERE, False), (None, True)],
+    ids=["another-issuer", "missing-when-promised"],
+)
+def test_a_redirect_that_is_not_from_this_issuer_is_refused(
+    iss: str | None, required: bool
+) -> None:
+    """RFC 9207: a server that names itself lets a client refuse mix-ups."""
+    thread, outcome, port = _serve(iss_required=required)
+
+    query = "code=the-code&state=the-state" + (f"&iss={iss}" if iss else "")
+    _visit(port, f"/callback?{query}")
+    thread.join(timeout=5)
+
+    assert isinstance(outcome[0], mcp_auth.McpAuthError)
+    assert "issuer" in str(outcome[0])
+
+
+def test_the_listener_is_bound_before_the_browser_is_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on 0.4.1: a browser that came straight back was refused.
+
+    The listener was bound only after the browser had been sent, so a
+    browser already signed in reached a closed port -- and login then waited
+    out its whole deadline for a redirect that had already come and gone.
+    """
+    monkeypatch.setattr(mcp_auth, "LOGIN_TIMEOUT", 5.0)
+    issuer = _Issuer()
+    server = mcp_auth.discover(issuer.client(), _RESOURCE)
+    urls: list[str] = []
+
+    tokens = mcp_auth.authorize(
+        issuer.client(), server, "client-7", announce=lambda line: None, opener=_browser(urls)
+    )
+
+    assert tokens["access_token"] == "access-2"
+    assert issuer.forms[-1]["code"] == "the-code"
+    assert issuer.forms[-1]["resource"] == _RESOURCE
+
+
+def test_an_authorization_endpoint_with_a_query_keeps_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joined with a bare ``?``, the URL would have carried two."""
+    monkeypatch.setattr(mcp_auth, "LOGIN_TIMEOUT", 5.0)
+    issuer = _Issuer(endpoints={"authorization_endpoint": f"{_ISSUER}/authorize?prompt=consent"})
+    server = mcp_auth.discover(issuer.client(), _RESOURCE)
+    urls: list[str] = []
+
+    mcp_auth.authorize(
+        issuer.client(), server, "client-7", announce=lambda line: None, opener=_browser(urls)
+    )
+
+    (url,) = urls
+    assert url.count("?") == 1
+    query = dict(parse_qsl(urlsplit(url).query))
+    assert query["prompt"] == "consent"
+    assert query["code_challenge_method"] == "S256"
 
 
 def test_the_pkce_challenge_is_the_s256_of_the_verifier() -> None:
@@ -763,15 +1059,21 @@ def test_two_logins_do_not_share_a_verifier() -> None:
     assert mcp_auth._pkce_pair()[0] != mcp_auth._pkce_pair()[0]
 
 
-def test_the_token_store_is_owner_only(tmp_path: Path) -> None:
+# --- the token store ------------------------------------------------------
+
+
+def test_the_token_store_and_its_lock_are_owner_only(tmp_path: Path) -> None:
     """The minted token is the one credential this tool does write down."""
     target = tmp_path / "nested" / "tokens.json"
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(mcp_auth.paths, "token_store_path", lambda: target)
         mcp_auth.write_store({"refresh_token": FAKE_JWT})
+        with mcp_auth._store_lock():
+            pass
 
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE((target.parent / "tokens.json.lock").stat().st_mode) == 0o600
 
 
 def test_a_corrupt_token_store_reads_as_absent(tmp_path: Path) -> None:
@@ -784,90 +1086,518 @@ def test_a_corrupt_token_store_reads_as_absent(tmp_path: Path) -> None:
         assert mcp_auth.read_store() == {}
 
 
-class _FakeResponse:
-    """The two attributes ``_get_json`` reads."""
+def test_no_login_means_no_request_and_no_directory() -> None:
+    """Someone who never logged in is told so, and nothing is created."""
+    issuer = _Issuer()
 
-    def __init__(self, payload: Any, status_code: int = 200) -> None:
-        self.status_code = status_code
-        self._payload = payload
+    with pytest.raises(mcp_auth.McpAuthError, match="Run `wispr-export login`"):
+        mcp_auth.resolve_credential(issuer.client(), _RESOURCE)
 
-    def json(self) -> Any:
-        """Return the decoded document."""
-        return self._payload
-
-    @property
-    def text(self) -> str:
-        """Return the body, for the error path."""
-        return json.dumps(self._payload)
+    assert issuer.requests == []
+    assert not mcp_auth.paths.token_store_path().parent.exists()
 
 
-class _FakeClient:
-    """Serves a fixed map of URL to document."""
-
-    def __init__(self, documents: dict[str, Any]) -> None:
-        self.documents = documents
-
-    def get(self, url: str, **_: Any) -> _FakeResponse:
-        """Return the document registered for ``url``, or a 404."""
-        if url in self.documents:
-            return _FakeResponse(self.documents[url])
-        return _FakeResponse({"error": "not found"}, status_code=404)
+# --- discovery ------------------------------------------------------------
 
 
-_RESOURCE = "https://api.wisprflow.ai/connect/mcp"
-_PROTECTED = "https://api.wisprflow.ai/.well-known/oauth-protected-resource/connect/mcp"
+def test_discovery_accepts_the_measured_advertisement() -> None:
+    """The shape the live service answered with, so refusals are not vacuous."""
+    server = mcp_auth.discover(_Issuer().client(), _RESOURCE)
 
-
-def test_discovery_refuses_a_non_https_authorization_server() -> None:
-    """The resource document chooses where a token is exchanged.
-
-    PKCE and ``state`` protect the code in flight. Neither helps when the
-    issuer itself is the attacker, so the hop is checked rather than followed.
-    """
-    client = _FakeClient(
-        {_PROTECTED: {"authorization_servers": ["http://issuer.example"]}}
+    assert server == mcp_auth.AuthServer(
+        resource=_RESOURCE,
+        issuer=_ISSUER,
+        authorization_endpoint=f"{_ISSUER}/authorize",
+        token_endpoint=f"{_ISSUER}/token",
+        registration_endpoint=f"{_ISSUER}/register",
+        iss_in_callback=False,
     )
 
+
+def test_discovery_refuses_a_resource_document_that_names_another_resource() -> None:
+    """RFC 9728 section 3.3, and the value a token is scoped to.
+
+    Measured on 0.4.1: a document describing another resource was accepted,
+    and its value became the resource indicator the token was minted for.
+    """
+    issuer = _Issuer(resource="https://other.example.invalid/mcp")
+
+    with pytest.raises(mcp_auth.McpAuthError, match="describes"):
+        mcp_auth.discover(issuer.client(), _RESOURCE)
+
+
+def test_the_shipped_endpoint_accepts_only_the_shipped_issuer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resource document may not move this client to another issuer.
+
+    That issuer would receive the registration and every refresh token, so
+    the move needs the operator's consent.
+    """
+    issuer = _Issuer(issuer=_ELSEWHERE, resource=_RESOURCE)
+
+    with pytest.raises(mcp_auth.McpAuthError, match="WISPR_ALLOW_ENDPOINT_OVERRIDE"):
+        mcp_auth.discover(issuer.client(), _RESOURCE)
+
+    monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
+    assert mcp_auth.discover(issuer.client(), _RESOURCE).issuer == _ELSEWHERE
+
+
+def test_the_shipped_issuer_is_chosen_when_named_among_others() -> None:
+    """Listing another server first does not make it the one used."""
+    issuer = _Issuer(named=[_ELSEWHERE, _ISSUER])
+
+    assert mcp_auth.discover(issuer.client(), _RESOURCE).issuer == _ISSUER
+
+
+def test_discovery_refuses_a_non_https_authorization_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PKCE and ``state`` protect the code in flight, not a cleartext issuer."""
+    monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
+    issuer = _Issuer(resource=_STAGING, named=["http://issuer.example.invalid"])
+
     with pytest.raises(mcp_auth.McpAuthError, match="non-https"):
-        mcp_auth.discover(client, _RESOURCE)
+        mcp_auth.discover(issuer.client(), _STAGING)
 
 
 def test_discovery_refuses_metadata_that_names_another_issuer() -> None:
-    """RFC 8414 section 3.3: the issuer must match where it was fetched from.
-
-    Without the check, a document served at one issuer can name a different
-    one's endpoints and nothing notices.
-    """
-    client = _FakeClient(
-        {
-            _PROTECTED: {"authorization_servers": ["https://issuer.example"]},
-            "https://issuer.example/.well-known/oauth-authorization-server": {
-                "issuer": "https://somewhere-else.example",
-                "token_endpoint": "https://somewhere-else.example/token",
-            },
-        }
-    )
+    """RFC 8414 section 3.3: the issuer must match where it was fetched from."""
+    issuer = _Issuer()
+    issuer.metadata["issuer"] = "https://somewhere-else.example.invalid"
 
     with pytest.raises(mcp_auth.McpAuthError, match="claims issuer"):
-        mcp_auth.discover(client, _RESOURCE)
+        mcp_auth.discover(issuer.client(), _RESOURCE)
 
 
-def test_discovery_accepts_a_consistent_advertisement() -> None:
-    """The refusals above must not be refusing everything."""
-    client = _FakeClient(
-        {
-            _PROTECTED: {
-                "authorization_servers": ["https://issuer.example"],
-                "resource": _RESOURCE,
-            },
-            "https://issuer.example/.well-known/oauth-authorization-server": {
-                "issuer": "https://issuer.example",
-                "token_endpoint": "https://issuer.example/token",
-            },
-        }
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("token_endpoint", "https://elsewhere.example.invalid/token", "not"),
+        ("authorization_endpoint", f"http://{_ISSUER[8:]}/authorize", "https"),
+        ("registration_endpoint", "https://elsewhere.example.invalid/r", "not"),
+        ("token_endpoint", f"https://user@{_ISSUER[8:]}/token", "not"),
+        ("token_endpoint", "https://[bad", "not a URL"),
+        ("token_endpoint", None, "missing"),
+        ("authorization_endpoint", 7, "missing"),
+    ],
+    ids=["token-host", "http", "registration-host", "userinfo", "invalid", "absent", "number"],
+)
+def test_discovery_refuses_an_endpoint_the_issuer_does_not_own(
+    field: str, value: object, reason: str
+) -> None:
+    """Every advertised endpoint must be https on the issuer's own host.
+
+    Measured on 0.4.1: a token endpoint on another host and an authorization
+    endpoint over plain http were both followed, and a document without a
+    token endpoint raised KeyError at the first refresh.
+    """
+    issuer = _Issuer()
+    if value is None:
+        del issuer.metadata[field]
+    else:
+        issuer.metadata[field] = value
+
+    with pytest.raises(mcp_auth.McpAuthError, match=reason):
+        mcp_auth.discover(issuer.client(), _RESOURCE)
+
+
+def test_a_network_failure_during_discovery_is_an_auth_error_not_a_traceback() -> None:
+    """Measured on 0.4.1: a refused connection escaped as httpx.ConnectError."""
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(mcp_auth.McpAuthError, match="OAuth discovery failed"):
+        mcp_auth.discover(mcp_auth.open_client(network(down)), _RESOURCE)
+
+
+def test_an_oversized_metadata_document_is_refused() -> None:
+    """Measured on 0.4.1: 128 MiB of metadata peaked at 270 MiB before failing."""
+    squeeze = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    body = squeeze.compress(b" " * (4 << 20)) + squeeze.flush()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Encoding": "gzip"}, stream=httpx.ByteStream(body)
+        )
+
+    with pytest.raises(mcp_auth.McpAuthError, match="exceeded 1048576 bytes"):
+        mcp_auth.discover(mcp_auth.open_client(network(handler)), _RESOURCE)
+
+
+# --- binding --------------------------------------------------------------
+
+
+def test_an_overridden_endpoint_never_receives_the_stored_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on 0.4.1: the production token was handed out for any host.
+
+    With the endpoint overridden to staging, resolve_credential returned the
+    stored access token without a single check, and the MCP client sent it
+    there as a Bearer.
+    """
+    monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
+    _store()
+    issuer = _Issuer(resource=_STAGING)
+
+    with pytest.raises(mcp_auth.McpAuthError, match=r"is for https://api\.wisprflow\.ai"):
+        mcp_auth.resolve_credential(issuer.client(), _STAGING)
+
+    assert issuer.requests == []
+
+
+def test_a_store_written_before_binding_is_adopted_for_the_shipped_endpoint() -> None:
+    """Upgrading must not force a login where there is no doubt whose it is."""
+    _store(resource=None, issuer=f"{_ISSUER}/", expires_at=0)
+    issuer = _Issuer()
+
+    credential = mcp_auth.resolve_credential(issuer.client(), _RESOURCE)
+
+    assert credential.token == "access-2"
+    saved = mcp_auth.read_store()
+    assert saved["resource"] == _RESOURCE
+    assert saved["issuer"] == _ISSUER
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "stored_issuer"),
+    [(_RESOURCE, _ELSEWHERE), (_STAGING, _ISSUER)],
+    ids=["another-issuer", "another-endpoint"],
+)
+def test_a_store_written_before_binding_is_not_adopted_where_in_doubt(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, stored_issuer: str
+) -> None:
+    """Anything but the shipped pair asks for a login, and sends nothing."""
+    monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
+    _store(resource=None, issuer=stored_issuer)
+    issuer = _Issuer(resource=endpoint)
+
+    with pytest.raises(mcp_auth.McpAuthError, match="predates"):
+        mcp_auth.resolve_credential(issuer.client(), endpoint)
+
+    assert issuer.requests == []
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["refused", "overridden"])
+def test_a_refresh_token_is_never_sent_to_a_new_issuer(
+    monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    """The refresh token was minted by the stored issuer and goes nowhere else.
+
+    Without the override, discovery refuses the new issuer outright. With it,
+    the resource may name another server -- and the stored refresh token is
+    still not presented to it.
+    """
+    if override:
+        monkeypatch.setenv("WISPR_ALLOW_ENDPOINT_OVERRIDE", "1")
+    _store(expires_at=0)
+    issuer = _Issuer(issuer=_ELSEWHERE, resource=_RESOURCE)
+
+    with pytest.raises(mcp_auth.McpAuthError, match=r"mcp-auth\.wisprflow\.com|OVERRIDE"):
+        mcp_auth.resolve_credential(issuer.client(), _RESOURCE)
+
+    assert issuer.posts == []
+
+
+@pytest.mark.parametrize(
+    ("stored_issuer", "registrations", "client_id"),
+    [(_ELSEWHERE, 1, "client-1"), (_ISSUER, 0, "client-7")],
+    ids=["another-issuer", "same-issuer"],
+)
+def test_a_client_id_is_reused_only_at_the_issuer_that_registered_it(
+    monkeypatch: pytest.MonkeyPatch,
+    stored_issuer: str,
+    registrations: int,
+    client_id: str,
+) -> None:
+    """A client registered elsewhere is that server's, not this one's."""
+    monkeypatch.setattr(mcp_auth, "LOGIN_TIMEOUT", 5.0)
+    _store(issuer=stored_issuer)
+    issuer = _Issuer()
+
+    mcp_auth.login(issuer.client(), _RESOURCE, announce=lambda line: None, opener=_browser([]))
+
+    assert issuer.registered == registrations
+    assert issuer.forms[-1]["client_id"] == client_id
+    saved = mcp_auth.read_store()
+    assert (saved["client_id"], saved["issuer"], saved["resource"]) == (
+        client_id,
+        _ISSUER,
+        _RESOURCE,
     )
 
-    metadata = mcp_auth.discover(client, _RESOURCE)
 
-    assert metadata["token_endpoint"] == "https://issuer.example/token"
-    assert metadata["resource"] == _RESOURCE
+# --- tokens and refreshing ------------------------------------------------
+
+
+def test_a_fresh_login_does_not_inherit_the_previous_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Measured on 0.4.1: a login answered without one kept the old one.
+
+    That leaves a refresh token from an earlier grant -- possibly another
+    account's -- to be used by every later refresh.
+    """
+    monkeypatch.setattr(mcp_auth, "LOGIN_TIMEOUT", 5.0)
+    _store(refresh_token="refresh-from-an-earlier-login")
+    issuer = _Issuer(
+        token=lambda form: httpx.Response(
+            200, json={"access_token": "access-2", "expires_in": 604800}
+        )
+    )
+
+    mcp_auth.login(issuer.client(), _RESOURCE, announce=lambda line: None, opener=_browser([]))
+
+    assert "refresh_token" not in mcp_auth.read_store()
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [
+        ({"access_token": "access-2", "expires_in": 60}, "refresh-1"),
+        ({"access_token": "access-2", "refresh_token": "refresh-2"}, "refresh-2"),
+    ],
+    ids=["not-rotated", "rotated"],
+)
+def test_a_refresh_keeps_the_refresh_token_unless_it_was_rotated(
+    answer: dict[str, Any], kept: str
+) -> None:
+    """A refresh answered without a new one leaves the old one valid."""
+    _store(expires_at=0)
+    issuer = _Issuer(token=lambda form: httpx.Response(200, json=answer))
+
+    assert mcp_auth.resolve_credential(issuer.client(), _RESOURCE).token == "access-2"
+    assert issuer.forms[-1]["refresh_token"] == "refresh-1"
+    assert issuer.forms[-1]["resource"] == _RESOURCE
+    assert mcp_auth.read_store()["refresh_token"] == kept
+
+
+def test_a_token_saved_without_an_expiry_is_not_trusted_forever() -> None:
+    """Measured on 0.4.1: an access token with no expiry was used indefinitely."""
+    _store(expires_at=None)
+    issuer = _Issuer()
+
+    assert mcp_auth.resolve_credential(issuer.client(), _RESOURCE).token == "access-2"
+    assert len(issuer.posts) == 1
+
+
+@pytest.mark.parametrize(
+    ("expires_in", "lifetime"),
+    [
+        (604800, 604800.0),
+        ("60", 60.0),
+        (None, mcp_auth.ASSUMED_LIFETIME),
+        ("soon", mcp_auth.ASSUMED_LIFETIME),
+        (True, mcp_auth.ASSUMED_LIFETIME),
+        (-5, mcp_auth.ASSUMED_LIFETIME),
+        (float("nan"), mcp_auth.ASSUMED_LIFETIME),
+        (float("inf"), mcp_auth.ASSUMED_LIFETIME),
+        ([60], mcp_auth.ASSUMED_LIFETIME),
+    ],
+)
+def test_a_lifetime_is_read_defensively(expires_in: object, lifetime: float) -> None:
+    """Whatever the server sends, the store gets a finite expiry."""
+    assert mcp_auth._expires_at(expires_in, 1000.0) == 1000.0 + lifetime
+
+
+def test_a_refused_refresh_asks_for_a_login_but_a_server_error_does_not() -> None:
+    """Only a refusal means the grant is gone; a 503 means try later."""
+    _store(expires_at=0)
+    refused = _Issuer(token=lambda form: httpx.Response(400, json={"error": "invalid_grant"}))
+    with pytest.raises(mcp_auth.McpAuthError, match="no longer valid"):
+        mcp_auth.resolve_credential(refused.client(), _RESOURCE)
+
+    unavailable = _Issuer(token=lambda form: httpx.Response(503, text="try later"))
+    with pytest.raises(mcp_auth.McpAuthError, match="HTTP 503: try later"):
+        mcp_auth.resolve_credential(unavailable.client(), _RESOURCE)
+
+
+def test_a_network_failure_during_a_refresh_is_an_auth_error_not_a_traceback() -> None:
+    """Measured on 0.4.1: it escaped as ConnectError and ended the run."""
+    _store(expires_at=0)
+
+    def down(form: dict[str, str]) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(mcp_auth.McpAuthError, match="the token refresh failed"):
+        mcp_auth.resolve_credential(_Issuer(token=down).client(), _RESOURCE)
+
+
+def test_an_environment_token_is_never_refreshed() -> None:
+    """WISPR_MCP_TOKEN is the operator's to replace, not this tool's."""
+    issuer = _Issuer()
+
+    with pytest.raises(mcp_auth.McpAuthError, match="never refreshed"):
+        mcp_auth.renew_credential(
+            issuer.client(), _RESOURCE, McpCredential(FAKE_JWT, "environment")
+        )
+
+    assert issuer.requests == []
+
+
+def test_a_renewal_uses_a_token_another_run_already_refreshed() -> None:
+    """Re-read under the lock: the rotated token is spent once, not twice."""
+    _store(access_token="access-from-another-run")
+    issuer = _Issuer()
+
+    credential = mcp_auth.renew_credential(
+        issuer.client(), _RESOURCE, McpCredential(FAKE_JWT, "token store")
+    )
+
+    assert credential.token == "access-from-another-run"
+    assert issuer.requests == []
+
+
+def test_two_runs_refreshing_at_once_spend_the_refresh_token_once() -> None:
+    """Measured on 0.4.1: both sent the same refresh token.
+
+    A server that detects reuse is entitled to revoke the whole grant for
+    that. The second run now waits for the first and uses what it minted.
+    """
+    _store(expires_at=0)
+
+    def slow(form: dict[str, str]) -> httpx.Response:
+        time.sleep(0.3)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600,
+            },
+        )
+
+    issuer = _Issuer(token=slow)
+    tokens: list[str] = []
+    runs = [
+        threading.Thread(
+            target=lambda: tokens.append(
+                mcp_auth.resolve_credential(issuer.client(), _RESOURCE).token
+            )
+        )
+        for _ in range(2)
+    ]
+    for run in runs:
+        run.start()
+    for run in runs:
+        run.join(timeout=10)
+
+    assert tokens == ["access-2", "access-2"]
+    assert [form["refresh_token"] for form in issuer.forms] == ["refresh-1"]
+
+
+def test_an_unwritable_token_store_stops_before_the_refresh_token_is_spent() -> None:
+    """A rotated refresh token that cannot be saved is a grant thrown away."""
+    _store(expires_at=0)
+    directory = mcp_auth.paths.token_store_path().parent
+    issuer = _Issuer()
+    directory.chmod(0o500)
+    try:
+        with pytest.raises(mcp_auth.McpAuthError, match="cannot write"):
+            mcp_auth.resolve_credential(issuer.client(), _RESOURCE)
+    finally:
+        directory.chmod(0o700)
+
+    assert issuer.posts == []
+
+
+def test_tokens_that_cannot_be_saved_are_reported_as_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the save fails anyway, say what it cost rather than raise OSError."""
+    _store(expires_at=0)
+
+    def full(*args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mcp_auth, "write_json", full)
+
+    with pytest.raises(mcp_auth.McpAuthError, match="refresh token is lost"):
+        mcp_auth.resolve_credential(_Issuer().client(), _RESOURCE)
+
+
+# --- renewal inside a run -------------------------------------------------
+
+
+def test_a_rejected_access_token_is_renewed_once_and_the_call_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token revoked before its recorded expiry used to end the pass."""
+    renewals: list[McpCredential] = []
+
+    def renew(rejected: McpCredential) -> McpCredential:
+        renewals.append(rejected)
+        return McpCredential("access-2", "token store")
+
+    def reply(message: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": message["id"], "result": {"ok": True}}
+        )
+
+    server = _Server(reply)
+    original = server.__call__
+
+    def gate(request: httpx.Request) -> httpx.Response:
+        if request.headers["Authorization"] == f"Bearer {FAKE_JWT}" and json.loads(
+            request.content
+        )["method"] == "tools/call":
+            return httpx.Response(401)
+        return original(request)
+
+    monkeypatch.setattr(mcp_api, "MIN_INTERVAL", 0)
+    client = mcp_api.McpClient(
+        McpCredential(FAKE_JWT, "token store"),
+        endpoint="https://mcp.example.invalid/mcp",
+        transport=network(gate),
+        renew=renew,
+    ).__enter__()
+
+    assert client.call("get_account_info") == {"ok": True}
+    assert [credential.token for credential in renewals] == [FAKE_JWT]
+    assert client.failures == []
+
+
+def test_a_second_rejection_after_a_renewal_is_reported_not_looped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One renewal per request; a token that keeps being refused is a failure."""
+    renewals: list[McpCredential] = []
+
+    def renew(rejected: McpCredential) -> McpCredential:
+        renewals.append(rejected)
+        return McpCredential("access-2", "token store")
+
+    server = _Server(lambda message: httpx.Response(401))
+    monkeypatch.setattr(mcp_api, "MIN_INTERVAL", 0)
+    client = mcp_api.McpClient(
+        McpCredential(FAKE_JWT, "token store"),
+        endpoint="https://mcp.example.invalid/mcp",
+        transport=network(server),
+        renew=renew,
+    ).__enter__()
+
+    assert client.call("get_account_info") is None
+    assert len(renewals) == 1
+    assert "HTTP 401" in client.failures[0][1]
+
+
+def test_a_renewal_that_fails_is_the_calls_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reason reaches the operator; nothing escapes as a traceback."""
+    def renew(rejected: McpCredential) -> McpCredential:
+        raise mcp_auth.McpAuthError("the stored authorization is no longer valid")
+
+    server = _Server(lambda message: httpx.Response(401))
+    monkeypatch.setattr(mcp_api, "MIN_INTERVAL", 0)
+    client = mcp_api.McpClient(
+        McpCredential(FAKE_JWT, "token store"),
+        endpoint="https://mcp.example.invalid/mcp",
+        transport=network(server),
+        renew=renew,
+    ).__enter__()
+
+    assert client.call("get_account_info") is None
+    assert "could not be renewed" in client.failures[0][1]
+    assert "no longer valid" in client.failures[0][1]

@@ -395,9 +395,10 @@ being careful with.
 uv run wispr-export schema --source mcp
 ```
 
-`401` almost always means the stored token expired and the refresh failed. Run
-`wispr-export login` again. Everything else the server says is passed through
-verbatim, including the reason.
+A `401` in the middle of a run is renewed once from the stored refresh token;
+if that fails too, the grant is gone and the message says so. Run
+`wispr-export login` again. Everything else the server says is passed through,
+including the reason, with control characters shown as escapes.
 
 If the token store is confusing you, look at it — it is one small JSON file:
 
@@ -406,13 +407,27 @@ cat ~/.config/wispr-flow-exporter/mcp-token.json | python3 -c \
   'import json,sys; print(sorted(json.load(sys.stdin)))'
 ```
 
-It holds `client_id`, `issuer`, `access_token`, `refresh_token` and
-`expires_at`. `wispr-export logout` deletes it; the next `login` re-registers.
+It holds `client_id`, `issuer`, `resource`, `access_token`, `refresh_token`
+and `expires_at`. The tokens are bound to `resource` and `issuer`: a run
+against any other endpoint refuses them, before any request, and says to log
+in. **One login is kept at a time** — logging in against another endpoint
+replaces it. A store written before 0.5.0 has no `resource`; it is adopted for
+the shipped endpoint and issuer, and anything else asks for a login.
+`wispr-export logout` deletes it; the next `login` re-registers. The
+`mcp-token.json.lock` beside it serializes refreshes between runs and can be
+ignored.
 
 ### 2. Re-check the OAuth topology
 
-Every endpoint is discovered, never hardcoded, so a server that moves one is
-followed automatically. To see what it is advertising today:
+Every endpoint is discovered, never hardcoded — and checked before it is
+followed. The resource document must name the configured endpoint exactly, the
+shipped endpoint must name the issuer in `SHIPPED_ISSUERS` (`mcp_auth.py`), and
+every endpoint that issuer advertises must be https on its own host. A server
+that moves an endpoint within its host is followed automatically. One that
+moves to another issuer stops login and refresh with a message naming both
+hosts: check the new one as below, then update `DEFAULT_ISSUER` — or set
+`WISPR_ALLOW_ENDPOINT_OVERRIDE=1` to try it first. To see what it is
+advertising today:
 
 ```bash
 # What resource, and which authorization server?
@@ -426,8 +441,12 @@ Measured on the build this was written against:
 
 | fact | value |
 | --- | --- |
-| resource | `https://api.wisprflow.ai/connect/mcp` |
-| authorization server | `https://mcp-auth.wisprflow.com` |
+| resource | `https://api.wisprflow.ai/connect/mcp`, at both well-known URLs |
+| authorization server | `https://mcp-auth.wisprflow.com`, the only one named |
+| issuer's endpoints | authorization, token, registration and device all on `mcp-auth.wisprflow.com` |
+| RFC 9207 `iss` on the redirect | not advertised, so not required |
+| token lifetime | `expires_in` of seven days; refresh tokens rotate |
+| `401` | `WWW-Authenticate: Bearer resource_metadata=…` |
 | scopes | `openid offline_access` |
 | bearer method | header — and it takes **only** `Bearer`, unlike the REST API which takes only the bare token |
 | registration | dynamic, public client, no secret |
@@ -482,8 +501,13 @@ push/pull resource lists and the REST probe. Do not go looking a fourth time.
   token and must never refresh it. The MCP backend mints its own against a
   different issuer, where refreshing is safe *because it is not the app's
   session*. A test asserts the MCP modules cannot reference `read_access_token`,
-  `cloud_auth`, the Supabase issuer or `session.json` at all — so the minting
+  `cloud_auth`, the Supabase issuer or `session.json` at all, and another that
+  importing them in a fresh interpreter loads no cloud module — so the minting
   path cannot reach the borrowed one.
+- **A minted token goes only where it was minted for.** Never loosen the
+  resource and issuer binding in the token store, and never follow an
+  advertised endpoint off the issuer's host. Both decide who receives a
+  refresh token.
 - **The token never enters an archive.** It lives in `~/.config/`, and an
   archive stays copyable without carrying a credential.
 - **Local wins on transcripts.** MCP returns normalized plaintext with no

@@ -211,6 +211,70 @@ wrapped at 72 columns, US English.
   httpx client carrying a Bearer scheme the real one never sends, so no
   test saw the headers the service receives. Both clients now take an
   injected transport, and the tests open them exactly as a run does.
+- A stored MCP token is sent only to the endpoint it was minted for.
+  Measured on 0.4.1: with WISPR_MCP_ENDPOINT overridden to another host,
+  the stored production access token was handed to the MCP client
+  without a single check, to be sent there as a Bearer. The token store
+  now records the resource beside the issuer; a run against any other
+  endpoint refuses the tokens, before any request, and says to log in;
+  and a refresh token goes only to the issuer that minted it. A store
+  written by 0.4.x has no resource, and is adopted for the shipped
+  endpoint and issuer only -- anything else asks for a login.
+- OAuth discovery checks every hop instead of following it. Measured on
+  0.4.1: a resource document describing another resource was accepted,
+  and its value became the resource a token was scoped to; a token
+  endpoint on another host and an authorization endpoint over plain
+  http were both followed. The resource document must now name the
+  configured endpoint exactly, the shipped endpoint must name the
+  shipped issuer unless WISPR_ALLOW_ENDPOINT_OVERRIDE is set, and every
+  endpoint the issuer advertises must be https on its own host.
+- `wispr-export login` survives whatever can reach a loopback port.
+  Measured on 0.4.1: the listener acted on whichever request came
+  first, so a favicon request ended the login as a timeout, an error
+  without the login's state ended it as a refusal, a non-ASCII state
+  raised TypeError, and one idle connection held the listener past its
+  own deadline for as long as it stayed open. The port was also bound
+  only after the browser had been sent, so a browser already signed in
+  found nothing listening. The listener is now bound first, acts only on
+  /callback with this login's state, turns everything else away without
+  ending the login, drops a connection that sends nothing after ten
+  seconds, and checks RFC 9207's iss when the server promises it. Its
+  pages no longer claim success whatever happened.
+- Text from an authorization server or the login listener reaches the
+  terminal as text. Measured on 0.4.1: an error description of
+  \x1b[2J\x1b[H was printed intact, escape sequences and all. Every
+  diagnostic line now shows control characters and bidirectional
+  overrides as escapes, at the same sink that redacts credentials.
+- The minted token is handled as a grant, not a cache. Measured on
+  0.4.1: a login answered without a refresh token kept the previous
+  login's; an access token saved without an expiry was trusted forever;
+  and two runs refreshing at once both spent the same refresh token,
+  which a server that detects reuse may answer by revoking the grant. A
+  login now replaces the refresh token outright, a missing or malformed
+  lifetime is read as one hour, and refreshes are serialized across runs
+  by a lock beside the token store, so the second run uses what the
+  first one minted. A store that cannot be written stops a refresh
+  before the refresh token is spent.
+- A token the MCP server rejects mid-run is renewed once instead of
+  failing every remaining call. A token revoked, or rotated away by
+  another run, before its recorded expiry used to end the pass. A 401
+  now triggers one refresh and a retry; a second 401 fails as before,
+  and a token from WISPR_MCP_TOKEN is never refreshed.
+- OAuth requests fail as authorization errors, with a reason. Measured
+  on 0.4.1: a network failure during a refresh escaped as
+  httpx.ConnectError, metadata without a token endpoint raised KeyError
+  at the first refresh, and a 128 MiB metadata document peaked at 270
+  MiB before discovery gave up. Every OAuth request is now read under a
+  1 MiB cap. 0.4.0's entry said responses were capped on all three HTTP
+  clients; until now that was true of two. A refused refresh asks for a
+  login, and a server error no longer does.
+- Ctrl-C stops the run. Measured on 0.4.1: after Ctrl-C interrupted the
+  local pass, the run went on to contact both remote services. A remote
+  pass that failed unexpectedly also lost the other's work: an MCP pass
+  that raised discarded the cloud pass's watermarks and drift baseline,
+  because the save came after both. Remote passes are now skipped after
+  an interrupt, an interrupt during one stops the run with 130, and what
+  the passes recorded is saved however they end.
 
 0.4.1
 -----

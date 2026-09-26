@@ -247,8 +247,10 @@ uv run wispr-export logout   # deletes it
 ```
 
 The token lives in `~/.config/wispr-flow-exporter/`, deliberately outside the
-archive, so an archive you copy or share still carries no credential. See *On
-the internal API* below.
+archive, so an archive you copy or share still carries no credential. It is
+bound to the endpoint it was minted for: pointing the tool at another MCP
+endpoint needs another login, and the stored token is never sent there. See
+*On the internal API* below.
 
 Every `sync` pulls whatever it has not pulled yet: each entity carries its own
 watermark, so a run reads only what changed. Re-running with nothing changed

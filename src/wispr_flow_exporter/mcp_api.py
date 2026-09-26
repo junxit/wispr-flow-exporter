@@ -32,13 +32,13 @@ the REST ones are: the shapes are not a contract.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from . import USER_AGENT
 from .local_config import redact
-from .mcp_auth import McpCredential
+from .mcp_auth import McpAuthError, McpCredential
 from .transport import (
     ACCEPT_ENCODING,
     BACKOFF,
@@ -108,6 +108,10 @@ ALLOWED_METHODS = (
 
 class McpError(Exception):
     """An MCP call failed in a way the caller should report."""
+
+
+class _Renew(Exception):
+    """Leave a streaming block to renew a rejected token, then try again."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +226,9 @@ class McpClient:
         timeout: Per-request timeout in seconds.
         transport: An httpx transport to use instead of the network, for
             tests.
+        renew: Replaces a token the server rejects before its expiry. Called
+            at most once per request, and never for a token taken from the
+            environment, which the caller does not pass one for.
         failures: Calls that failed, with redacted reasons.
         results: What each attempted call returned.
         server: Server name, version and protocol from the handshake.
@@ -232,6 +239,7 @@ class McpClient:
     endpoint: str
     timeout: float = DEFAULT_TIMEOUT
     transport: Any = None
+    renew: Callable[[McpCredential], McpCredential] | None = None
     failures: list[tuple[str, str]] = field(default_factory=list)
     results: dict[str, ToolResult] = field(default_factory=dict)
     server: dict[str, Any] = field(default_factory=dict)
@@ -279,6 +287,24 @@ class McpClient:
             time.sleep(MIN_INTERVAL - elapsed)
         self._last_request = time.monotonic()
 
+    def _renewed(self) -> None:
+        """Swap in a fresh token after the server rejected the current one.
+
+        Raises:
+            McpError: The token could not be renewed.
+        """
+        if self.renew is None:  # pragma: no cover - the caller checks first
+            raise McpError("HTTP 401: the MCP authorization was rejected")
+        try:
+            credential = self.renew(self.credential)
+        except McpAuthError as error:
+            raise McpError(
+                "HTTP 401: the MCP authorization was rejected and could not be "
+                f"renewed: {error}"
+            ) from error
+        self.credential = credential
+        self._client.headers.update(credential.header())
+
     def _send(self, method: str, params: Any = None, *, notify: bool = False) -> Any:
         """Send one JSON-RPC message and return its result.
 
@@ -311,6 +337,7 @@ class McpClient:
         if self._session:
             headers["Mcp-Session-Id"] = self._session
 
+        renewed = False
         for attempt in range(MAX_RETRIES):
             self._pace()
             try:
@@ -326,6 +353,15 @@ class McpClient:
                         wait = retry_after(response.headers.get("Retry-After"))
                         raise Retry(wait if wait is not None else BACKOFF[attempt])
 
+                    if (
+                        response.status_code == 401
+                        and self.renew is not None
+                        and not renewed
+                    ):
+                        # A token can be rejected before its recorded expiry
+                        # -- revoked, or rotated by another run -- and that
+                        # used to end the pass. One renewal, then as before.
+                        raise _Renew
                     if response.status_code in (401, 403):
                         raise McpError(
                             f"HTTP {response.status_code}: the MCP authorization "
@@ -342,6 +378,10 @@ class McpClient:
                     raw = read_capped(response)
             except Retry as retry:
                 time.sleep(retry.wait)
+                continue
+            except _Renew:
+                renewed = True
+                self._renewed()
                 continue
             except ResponseRefused as error:
                 # This call's failure, not retried. It used to escape call()

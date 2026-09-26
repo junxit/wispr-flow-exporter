@@ -126,6 +126,24 @@ spoke.
   source scan alone passed through 0.4.1 while `mcp_api` took its retry
   constants from `cloud_api`, which loads `cloud_auth`.
 
+- **A minted token goes only where it was minted for.** The token store records
+  the resource each token was minted for and the issuer that minted it, and a
+  run against any other endpoint refuses the tokens — before any request —
+  rather than sending them there. Through 0.4.1 it recorded no resource, and
+  with `WISPR_MCP_ENDPOINT` overridden to another host the stored access token
+  was handed out without a check, to be sent there as a Bearer. A refresh token
+  goes only to the issuer that minted it, whatever the resource later names. A
+  store written by 0.4.x is adopted for the shipped endpoint and issuer only.
+
+  Discovery checks every hop rather than following it. The protected-resource
+  document must name the configured endpoint exactly (RFC 9728 §3.3); the
+  shipped endpoint must name the shipped issuer, `mcp-auth.wisprflow.com`,
+  unless `WISPR_ALLOW_ENDPOINT_OVERRIDE` is set; the issuer's metadata must
+  name itself (RFC 8414 §3.3); and every endpoint it advertises — authorization,
+  token, registration — must be https on the issuer's own host. Those decide
+  where this client registers, where the operator's browser is sent, and where
+  codes and refresh tokens go.
+
 - **Where the minted token lives.** `~/.config/wispr-flow-exporter/`
   (`XDG_CONFIG_HOME` when set), file `0600` in a directory `0700`. Deliberately
   **outside the archive**: an archive is the thing people copy to a backup drive
@@ -133,9 +151,21 @@ spoke.
   the one that mattered when there was no token store at all. `wispr-export
   logout` removes it. This is the only state this tool keeps outside an archive.
 
-  The login flow binds a one-shot HTTP listener on `127.0.0.1` — not `0.0.0.0` —
-  for the length of one browser round trip, and checks the `state` parameter
-  before using the code it receives.
+  Refreshes are serialized across runs by an advisory lock on
+  `mcp-token.json.lock` beside the store, and re-read the store once they hold
+  it: a refresh token that rotates can be spent once, and two runs refreshing
+  together would otherwise both spend it. Taking the lock also checks that the
+  store can be written, so a refresh token is never spent on tokens that could
+  not be kept.
+
+  The login flow binds an HTTP listener on `127.0.0.1` — not `0.0.0.0` — for
+  the length of one browser round trip, and binds it *before* the browser is
+  opened. It acts only on a request for `/callback` whose `state` matches,
+  compared in constant time as bytes; anything else is answered 404 and
+  ignored, so neither a stray request nor a forged `error` can end the login,
+  and a connection that sends nothing is dropped after ten seconds. When the
+  authorization server advertises RFC 9207 support, the redirect must also
+  name it as the issuer.
 
   Note that the two services want opposite header forms, and both were measured
   rather than assumed: the REST API rejects `Bearer` and takes the token bare,
@@ -179,16 +209,20 @@ spoke.
   date; a negative, non-finite or unreadable value means the client's own
   backoff, never an immediate retry.
 
-  The OAuth requests `login` and token refresh make, in `mcp_auth.py`, do not
-  go through this path yet and still read whole bodies. 0.4.0's changelog said
-  all three HTTP clients were capped; it was true of two.
+  The OAuth requests `login` and token refresh make go through the same
+  reader, under a 1 MiB cap, and any failure among them is an authorization
+  error with a reason rather than a traceback. 0.4.0's changelog said all
+  three HTTP clients were capped; until 0.5.0 it was true of two.
 
 - **Redaction is at the sink, not the source.** Every diagnostic stream — log
   lines, `--verbose` output, exception messages, the run summary — passes
   through one `redact()` before it is emitted, replacing JWTs,
   `sb-<ref>-auth-token` keys and `X-Amz-(Signature|Credential)` parameters.
   Redacting at the sink rather than at each call site is deliberate: a new code
-  path cannot forget to do it.
+  path cannot forget to do it. The same sink shows control characters and
+  bidirectional overrides as escapes (`printable()`), so text from a remote host
+  or the login listener cannot clear the screen, forge a line, or reorder what
+  the operator reads.
 
 - **Presigned URLs are credentials, not metadata.** `NoteImages.presignedGetUrl`
   is a signed object URL that grants read access to anyone holding it until

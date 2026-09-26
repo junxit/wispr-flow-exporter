@@ -723,3 +723,147 @@ def test_logout_with_nothing_stored_is_not_a_failure(
 
     assert code == EXIT_OK
     assert capsys.readouterr().out
+
+
+# --- the remote passes ----------------------------------------------------
+
+
+def _remote_passes(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[str],
+    *,
+    cloud: Callable[..., int] | None = None,
+    mcp: Callable[..., int] | None = None,
+) -> None:
+    """Replace the two remote passes, recording which ones ran.
+
+    Args:
+        monkeypatch: The test's patcher.
+        calls: Receives the name of each pass that ran.
+        cloud: What the cloud pass does; by default, nothing.
+        mcp: What the MCP pass does; by default, nothing.
+    """
+    from wispr_flow_exporter import cli
+
+    def run(name: str, action: Callable[..., int] | None) -> Callable[..., int]:
+        def remote(archive: Archive, *args: object, **kwargs: object) -> int:
+            calls.append(name)
+            return action(archive) if action else EXIT_OK
+
+        return remote
+
+    monkeypatch.setattr(cli, "_run_cloud", run("cloud", cloud))
+    monkeypatch.setattr(cli, "_run_mcp", run("mcp", mcp))
+
+
+def test_ctrl_c_in_the_local_pass_contacts_no_remote_service(
+    tmp_path: Path,
+    wispr_db: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Measured on 0.4.1: after Ctrl-C, both remote services were contacted.
+
+    The local pass stopped and saved, as designed, and then the run carried
+    on to the cloud and MCP passes as if nothing had been asked of it.
+    """
+    from wispr_flow_exporter import cli
+
+    data_dir = _data_dir(tmp_path, wispr_db)
+    calls: list[str] = []
+
+    def local(*args: object) -> int:
+        calls.append("local")
+        result = args[-1]
+        result.interrupted = True  # type: ignore[attr-defined]
+        return EXIT_OK
+
+    monkeypatch.setattr(cli, "_run_local", local)
+    _remote_passes(monkeypatch, calls)
+
+    assert main(["sync", "--data-dir", str(data_dir)]) == 130
+    assert calls == ["local"]
+    assert "not contacting cloud, mcp" in capsys.readouterr().out
+
+
+def _record_cloud_state(archive: Archive) -> int:
+    """Stand in for a cloud pass that recorded something.
+
+    Args:
+        archive: The run's archive.
+
+    Returns:
+        Success.
+    """
+    archive.source_state("wispr-cloud")["measured"] = True
+    return EXIT_OK
+
+
+def test_a_remote_pass_that_fails_does_not_discard_what_the_other_recorded(
+    tmp_path: Path, wispr_db: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured on 0.4.1: an MCP pass that raised lost the cloud pass's state.
+
+    The save came after both passes, so anything unexpected in the second
+    discarded the first's watermarks and drift baseline with it.
+    """
+    data_dir = _data_dir(tmp_path, wispr_db)
+    calls: list[str] = []
+
+    def explode(archive: Archive) -> int:
+        raise RuntimeError("an MCP pass failing in a way nobody foresaw")
+
+    _remote_passes(monkeypatch, calls, cloud=_record_cloud_state, mcp=explode)
+
+    with pytest.raises(RuntimeError):
+        main(["sync", "--data-dir", str(data_dir)])
+
+    assert calls == ["cloud", "mcp"]
+    state = Archive(root=tmp_path / "archive").source_state("wispr-cloud")
+    assert state.get("measured") is True
+
+
+def test_ctrl_c_in_a_remote_pass_keeps_what_was_recorded_and_stops(
+    tmp_path: Path, wispr_db: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interrupted is interrupted: saved, reported as 130, nothing further."""
+    data_dir = _data_dir(tmp_path, wispr_db)
+    calls: list[str] = []
+
+    def interrupted(archive: Archive) -> int:
+        _record_cloud_state(archive)
+        raise KeyboardInterrupt
+
+    _remote_passes(monkeypatch, calls, cloud=interrupted)
+
+    assert main(["sync", "--data-dir", str(data_dir)]) == 130
+    assert calls == ["cloud"]
+    state = Archive(root=tmp_path / "archive").source_state("wispr-cloud")
+    assert state.get("measured") is True
+
+
+def test_a_diagnostic_line_cannot_act_on_the_terminal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every line passes printable() at the sink, as it passes redact()."""
+    from wispr_flow_exporter import cli
+
+    cli._say("mcp", "failed: \x1b[2J\u202etxt.exe\nforged: line")
+
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "\u202e" not in out
+    assert out.count("\n") == 1
+    assert "\\x1b[2J\\u202etxt.exe\\nforged: line" in out
+
+
+def test_only_a_stored_token_gets_a_renewal() -> None:
+    """A token from the environment is the operator's to replace."""
+    from wispr_flow_exporter import cli
+    from wispr_flow_exporter.mcp_auth import DEFAULT_MCP_ENDPOINT, McpCredential
+
+    stored = McpCredential(FAKE_JWT, "token store")
+    environment = McpCredential(FAKE_JWT, "environment")
+
+    assert cli._renewer(DEFAULT_MCP_ENDPOINT, stored) is not None
+    assert cli._renewer(DEFAULT_MCP_ENDPOINT, environment) is None

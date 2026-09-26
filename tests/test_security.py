@@ -30,7 +30,7 @@ from conftest import (
 )
 
 from wispr_flow_exporter import paths
-from wispr_flow_exporter.local_config import Policy, redact
+from wispr_flow_exporter.local_config import Policy, printable, redact
 from wispr_flow_exporter.schema import EXPECTED
 from wispr_flow_exporter.secure_io import (
     DIR_MODE,
@@ -680,3 +680,26 @@ def test_a_permissive_umask_does_not_widen_the_archive(
             assert mode == (DIR_MODE if path.is_dir() else FILE_MODE)
     finally:
         os.umask(old)
+
+
+@pytest.mark.parametrize(
+    ("text", "shown"),
+    [
+        ("plain text — and more", "plain text — and more"),
+        ("\x1b[2J\x1b[H", "\\x1b[2J\\x1b[H"),
+        ("one\ntwo\rthree\tfour", "one\\ntwo\\rthree\\tfour"),
+        ("\x85next line", "\\x85next line"),
+        ("\u202egnp.exe", "\\u202egnp.exe"),
+        ("\u2066isolated\u2069", "\\u2066isolated\\u2069"),
+    ],
+    ids=["unchanged", "escape", "line-breaks", "c1", "override", "isolate"],
+)
+def test_printable_shows_what_would_act_on_a_terminal(text: str, shown: str) -> None:
+    """Escaped rather than dropped, so what arrived is still visible."""
+    assert printable(text) == shown
+
+
+def test_printable_marks_where_it_cut() -> None:
+    """A cap on what a remote host can make the operator read."""
+    assert printable("x" * 500, limit=10) == "x" * 9 + "…"
+    assert printable("short", limit=10) == "short"
