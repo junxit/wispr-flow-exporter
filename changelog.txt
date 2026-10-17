@@ -50,6 +50,13 @@ wrapped at 72 columns, US English.
   headers included, except the files changed since. They move with
   hatchling, by hand: a test fails on a hatchling bump until its
   requirements have been read again.
+- CI tests on Python 3.15 as well as 3.13 and 3.14, on Ubuntu and
+  macOS alike. requires-python, ">=3.13", already admitted 3.15, so
+  a supported version went untested. On CPython 3.15.0, locally, all
+  872 tests pass, the four live ones included; uv.lock already
+  resolved a 3.15 split, and every locked package has a wheel 3.15
+  installs on both runners -- mypy 2.4.0 and ast-serialize 0.12.1
+  among them -- so no dependency is built from source.
 
 0.6.1
 -----
