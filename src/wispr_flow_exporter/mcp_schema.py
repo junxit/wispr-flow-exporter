@@ -408,13 +408,15 @@ def detect_mcp_drift(
 # Read from a live handshake. A mismatch is not an error -- see the
 # classification above -- but it is always reported. Refresh with
 # `wispr-export schema --source mcp`; MAINTENANCE.md has the procedure.
-# Taken 2026-09-26 with the constraint-form digest, against the same server
-# version and tool count as the algorithm-1 pin it replaces.
+# Taken 2026-10-17. The server now advertises 17 tools: four new ones (folders,
+# folder meetings, enriched participants, participant contacts), one gone
+# (get_meeting_attendee_emails, which nothing called), and search_meetings
+# with new optional filters beside the four arguments this tool sends.
 MCP_PIN = McpPin(
     server="wispr-meetings",
     version="1",
     protocol_version="2025-06-18",
-    tool_count=14,
-    sha256="99f0c03d5dfbcc0d54c50d1e420491fd2a20555dd3ec3acab8e36e1b8cf62edd",
+    tool_count=17,
+    sha256="adc2406dd4aa6bd710b9bf64e7b83cc142bcdf648e5e3da888456a13de168c5f",
     algorithm=2,
 )

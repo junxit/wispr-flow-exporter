@@ -18,8 +18,8 @@ exceptional, so a design that had to be updated before it could read a new
 column would be permanently out of date, and an archive that stopped when it
 fell behind would be useless on the one day it was needed.
 
-Column lists were read from a live installation of Wispr Flow v1.6.957 at
-migration 157.
+Column lists were read from a live installation of Wispr Flow v1.6.1174 at
+migration 174.
 """
 
 from __future__ import annotations
@@ -83,8 +83,9 @@ class SchemaPin:
         count: Number of rows in ``SequelizeMeta``.
         latest: Lexicographically greatest migration name. A label, not a
             version: names are date-prefixed but do not arrive in date order
-            -- 1.6.957 shipped three dated before the previous pin's latest --
-            which is why neither this nor the count is trusted alone.
+            -- 1.6.957 shipped three dated before the previous pin's latest,
+            and 1.6.1174 three more -- which is why neither this nor the count
+            is trusted alone.
         sha256: Digest over every migration name, sorted and newline-joined.
             This catches the case the other two miss -- a migration replaced
             without changing either the count or the maximum.
@@ -114,9 +115,9 @@ def pin_from_migrations(names: Iterable[str]) -> SchemaPin:
 # Read from a live installation. A mismatch is not an error -- see the drift
 # classification in sqlite_source -- but it is always reported.
 MIGRATION_PIN = SchemaPin(
-    count=157,
-    latest="20260922130000-add-folders-member-count.js",
-    sha256="bc316f91725a0436a06dd212416e2f12f972d0cb5bf169d53e26bebb96793dbe",
+    count=174,
+    latest="20261014120000-add-calendar-event-series-key.js",
+    sha256="2a7b82e867d701611a84a818bfb6b11bf4feb045f77907270963b82efa517f20",
 )
 
 
@@ -347,6 +348,15 @@ EXPECTED: Mapping[str, TableSpec] = {
             # _MEETING_TIMESTAMPS. Content rather than churn: how long a meeting
             # recorded is a fact about the meeting, so it stays in the digest.
             "recordedMs",
+            # From the eight Meetings migrations between 1.6.957 and 1.6.1174,
+            # in the order the database reports them.
+            "candidateSummary", "candidateSummaryMetadata", "currentJobId",
+            "pendingJobRequest", "summaryFeedback", "summaryReadyEventId",
+            "notifiedSummaryReadyEventId", "summaryReady", "transcriptReady",
+            "speakerAssignments", "serverModifiedAt",
+            "speakerMapDraftTranscriptAt", "documentDraftTranscriptAt",
+            "identityContacts", "orgInsights", "orgInsightsPendingPush",
+            "speakerAssignmentEdits", "speakerRoomLabelEdits",
         ),
         # Every column a meeting's documents are built from. Losing one does not
         # make a renderer raise -- they are defensive -- it makes them render
@@ -405,6 +415,12 @@ EXPECTED: Mapping[str, TableSpec] = {
             "prereadContent", "prereadSummary", "participantNames",
             "participants", "colorId", "selfResponseStatus",
             "prereadDispatchedAt", "connectorKey",
+            # From 20260929120000-add-calendar-event-notetaker-controls and the
+            # two after it: whether the owner organizes the event, the
+            # notetaker's per-event choices, a second conference link, and the
+            # recurring series an occurrence belongs to.
+            "selfIsOrganizer", "notetakerCalendarNotice", "notetakerAutoShare",
+            "alternateConferenceUrl", "seriesKey",
         ),
         required=frozenset({"externalId", "title", "startAtUtc"}),
         volatile=frozenset({"syncedAt", "notifiedAt", "prereadDispatchedAt"}),
@@ -603,6 +619,9 @@ EXPECTED: Mapping[str, TableSpec] = {
             # From 20260922120000-add-shared-notes-meeting-id: which meeting a
             # shared note came from, and how it was shared.
             "meetingId", "via",
+            # From 20260928130000-add-shared-notes-copy-identity: the calendar
+            # occurrence and recorded length of the meeting it copies.
+            "eventKey", "recordedMs",
         ),
         volatile=frozenset({"searchableContent"}),
         timestamps=_SEQUELIZE_TIMES,
@@ -743,6 +762,11 @@ EXPECTED: Mapping[str, TableSpec] = {
         columns=(
             "id", "ownerUserId", "name", "description", "isOwner",
             "createdAt", "modifiedAt", "meetingCount", "memberCount",
+            # From 20260930120000-add-folders-grants and
+            # 20261005120000-add-folders-sharing-blocked: whom a folder is
+            # shared with, how this account reaches it, and whether sharing is
+            # blocked.
+            "grants", "accessVia", "sharingBlocked",
         ),
         timestamps=_SEQUELIZE_TIMES,
     ),
@@ -755,8 +779,27 @@ EXPECTED: Mapping[str, TableSpec] = {
     "FolderMeetings": _spec(
         pk=("folderId", "meetingId"),
         layout=Layout.SNAPSHOT,
-        columns=("folderId", "meetingId", "slug", "addedByUserId", "addedAt"),
+        columns=(
+            "folderId", "meetingId", "slug", "addedByUserId", "addedAt",
+            # From 20260928120000-add-folder-meetings-copy-identity, as on
+            # SharedNotes.
+            "eventKey", "recordedMs",
+        ),
         timestamps={"addedAt": TimestampKind.SEQUELIZE},
+    ),
+    # From 20261007120000-create-usage-outbox. Declared so drift is measured
+    # against it; until it has a layout of its own it is archived exactly as an
+    # undeclared table would be.
+    "UsageOutbox": _spec(
+        pk="transcriptEntityId",
+        layout=Layout.SNAPSHOT,
+        columns=(
+            "transcriptEntityId", "ownerUserId", "numWords", "duration",
+            "speechDuration", "timestamp", "timezoneOffsetMinutes", "app",
+            "platform", "transcriptCommand", "numWordsCorrected",
+            "numDictionaryReplacements", "status", "appVersion",
+            "needsUploading", "attempts", "createdAt", "updatedAt",
+        ),
     ),
     "SequelizeMeta": _spec(
         pk="name",
