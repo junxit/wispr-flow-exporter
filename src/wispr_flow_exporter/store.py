@@ -109,6 +109,29 @@ def content_hash(spec: TableSpec, data: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def digest_scheme(spec: TableSpec) -> str:
+    """Fingerprint the declarations a record's digest depends on.
+
+    :func:`content_hash` skips the volatile columns, and the payload it hashes
+    is shaped by which columns are decoded as JSON, redacted as credentials or
+    referenced as blobs. Change any of those and every stored digest goes
+    stale at once -- not because a record moved, but because the rule did.
+
+    Args:
+        spec: The table's declaration.
+
+    Returns:
+        A short hex digest of those declarations.
+    """
+    rule = {
+        "volatile": sorted(spec.volatile),
+        "json_columns": sorted(spec.json_columns),
+        "credentials": sorted(spec.credentials),
+        "blobs": sorted(spec.blobs),
+    }
+    return hashlib.sha256(json.dumps(rule).encode("utf-8")).hexdigest()[:16]
+
+
 def row_identity(spec: TableSpec, row: Mapping[str, Any]) -> str:
     """Name a row for retention: by its key, or by its content when keyless.
 
@@ -675,6 +698,30 @@ class Archive:
             return
         marks = self.source_state(source).setdefault("watermarks", {})
         marks[entity] = {"column": column, "value": value}
+
+    def digest_scheme(self, source: str, entity: str) -> str | None:
+        """Return the declaration fingerprint an entity's digests were taken under.
+
+        Args:
+            source: Backend name.
+            entity: Archive directory name.
+
+        Returns:
+            The fingerprint from :func:`digest_scheme`, or ``None`` for an
+            archive that predates recording it.
+        """
+        found = self.source_state(source).get("digest_schemes", {}).get(entity)
+        return found if isinstance(found, str) else None
+
+    def set_digest_scheme(self, source: str, entity: str, scheme: str) -> None:
+        """Record the declaration fingerprint an entity's digests are taken under.
+
+        Args:
+            source: Backend name.
+            entity: Archive directory name.
+            scheme: The fingerprint from :func:`digest_scheme`.
+        """
+        self.source_state(source).setdefault("digest_schemes", {})[entity] = scheme
 
     def artifact_cursor(self, source: str, key: str) -> dict[str, Any]:
         """Return the recorded fingerprints of one meeting's artifacts.

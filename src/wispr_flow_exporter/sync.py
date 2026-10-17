@@ -75,6 +75,7 @@ from .store import (
     Archive,
     UnsafeArchivePathError,
     content_hash,
+    digest_scheme,
     entity_name,
     row_identity,
     row_order,
@@ -514,7 +515,17 @@ def sync_meetings(
     now = _now()
 
     by_id = {item.meeting_id: item for item in files_source.discover_meetings(wispr.meetings)}
-    since = None if options.full else archive.watermark(SOURCE_LOCAL, entity)
+    # Every stored digest was taken under some declaration. When it changes --
+    # a re-pin declaring a column volatile or JSON -- they all go stale at
+    # once, and verify --deep reported a healthy archive's every meeting as a
+    # mismatch until each happened to change upstream. So a changed
+    # declaration re-reads every meeting once; what is really unchanged is
+    # left as it is, and only the index learns the new digests.
+    scheme = digest_scheme(spec)
+    rehash = archive.digest_scheme(SOURCE_LOCAL, entity) != scheme
+    since = (
+        None if options.full or rehash else archive.watermark(SOURCE_LOCAL, entity)
+    )
     live = source.keys("Meetings")
     wanted = _needs_reading(archive, entity, live, readable=MEETING_DIR_RE.match)
     failed = False
@@ -570,6 +581,8 @@ def sync_meetings(
         archive.set_watermark(
             SOURCE_LOCAL, entity, "modifiedAt", source.max_value("Meetings", "modifiedAt")
         )
+        if not options.dry_run:
+            archive.set_digest_scheme(SOURCE_LOCAL, entity, scheme)
     return counts
 
 

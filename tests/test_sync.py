@@ -343,6 +343,41 @@ def test_a_refine_job_and_an_edit_push_are_not_content(
     assert not (fresh.root / "superseded").exists()
 
 
+def test_a_changed_declaration_rehashes_every_meeting_once(
+    scene: Callable[..., tuple],
+) -> None:
+    """A re-pin that declares a column volatile or JSON stales every digest.
+
+    Measured on a scratch copy of an archive last written by 0.5.1: after the
+    1.6.1174 declarations, verify --deep reported all five of its meetings as
+    digest mismatches, and an ordinary sync re-read none of them. A pass that
+    finds its declaration changed re-reads every meeting once, and writes only
+    the index and the journal when nothing else differs.
+    """
+    from wispr_flow_exporter.verify import verify_archive
+
+    archive, resolved, _ = scene()
+    _run(archive, resolved)
+    # As an archive written under an older declaration looks: a digest that no
+    # longer matches, and no record of the rule it was computed under.
+    archive.put("meetings", MEETING_A, content_hash="hashed-under-0.5.1")
+    archive.source_state(SOURCE_LOCAL).pop("digest_schemes", None)
+    archive.save()
+    before = _snapshot(archive.root)
+
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved)
+
+    assert result.counts["meetings"].scanned == 1
+    assert verify_archive(fresh, deep=True).stale_hashes == []
+    after = _snapshot(fresh.root)
+    assert {path for path in after if after[path] != before.get(path)} == {
+        "index.json",
+        ".sync-state.json",
+    }
+    assert _run(Archive(root=archive.root), resolved).counts["meetings"].scanned == 0
+
+
 def test_a_candidate_summary_is_archived_and_kept_when_cleared(
     scene: Callable[..., tuple],
 ) -> None:

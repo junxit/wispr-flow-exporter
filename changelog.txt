@@ -80,6 +80,15 @@ wrapped at 72 columns, US English.
   and learned-preferences (422). CLIENT_PIN now covers 20 endpoints.
   On the account they were probed with, both new ones held no records
   yet.
+- Declaring meetings differently no longer leaves verify --deep
+  reporting a healthy archive as broken. Every stored digest is taken
+  under some declaration, and this release declares twelve more
+  Meetings columns volatile and seven more JSON. Measured on a scratch
+  copy of an archive last written by 0.5.1, verify --deep then
+  reported all five meetings as digest mismatches, and an ordinary
+  sync re-read none of them. The archive now records the declaration
+  its meeting digests were taken under, and a sync that finds it
+  changed re-reads every meeting once, rewriting only what differs.
 
 0.5.1
 -----
