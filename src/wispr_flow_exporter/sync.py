@@ -769,10 +769,11 @@ def _meeting_documents(
 ) -> dict[str, str]:
     """Render every document a meeting's directory holds, writing none of them.
 
-    A pure function of the meeting row and its transcript files, shared by
-    sync and by render, which both pass the archive's own copies -- see
-    :func:`_archived_artifacts`. One builder fed one input is what makes
-    re-rendering produce exactly what a sync would have.
+    A pure function of the meeting row and its transcript files, and of
+    ``raw/audio.json`` beside them when the archive points at a recording it
+    does not hold. Shared by sync and by render, which both pass the archive's
+    own copies -- see :func:`_archived_artifacts`. One builder fed one input is
+    what makes re-rendering produce exactly what a sync would have.
 
     Args:
         record: The meeting row, with its soft-deletion state.
@@ -848,6 +849,7 @@ def _meeting_documents(
         soft_deleted=record.soft_deleted,
         transcript_deleted_upstream=data.get("transcriptDeletedAt") is not None,
         unresolved_tokens=unresolved,
+        audio_pointer=_audio_pointer(artifacts),
     )
     return documents
 
@@ -2190,3 +2192,27 @@ def _archived_artifacts(key: str, directory: Path) -> MeetingArtifacts:
         observations=_archived(directory / "raw" / "speakers.observations.ndjson"),
         audio=_archived(directory / "media" / "upload.ogg"),
     )
+
+
+def _audio_pointer(artifacts: MeetingArtifacts | None) -> dict[str, Any] | None:
+    """Read what the archive records about a recording it does not hold.
+
+    In link mode, or for a recording over the size cap, sync writes
+    ``raw/audio.json`` in place of the file. Sync never deletes that record,
+    so an archive synced in link mode and later in copy mode holds both, and
+    then the copy is the recording.
+
+    Args:
+        artifacts: The archive's copies, as :func:`_archived_artifacts` names
+            them, whose ``directory`` is the meeting's ``raw/``.
+
+    Returns:
+        The record, or ``None`` when the archive holds the recording itself or
+        no record of one.
+    """
+    if artifacts is None or artifacts.audio is not None:
+        return None
+    record = read_json(artifacts.directory / "audio.json", None)
+    if not isinstance(record, dict) or record.get("archived") is not False:
+        return None
+    return record

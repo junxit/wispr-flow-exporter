@@ -2159,6 +2159,105 @@ def test_skip_mode_records_nothing_at_all(scene: Callable[..., tuple]) -> None:
     assert not (directory / "raw" / "audio.json").exists()
 
 
+def _pointer_lines(hub: str) -> list[str]:
+    """Return the hub's list items naming a recording it does not hold.
+
+    Args:
+        hub: A meeting.md document.
+
+    Returns:
+        The matching lines.
+    """
+    return [line for line in hub.splitlines() if line.startswith("- Source recording, not")]
+
+
+def test_the_hub_names_a_recording_the_archive_only_points_at(
+    scene: Callable[..., tuple],
+) -> None:
+    """Link mode's recording is in meeting.md: why, how big, which, and where.
+
+    0.6.1 stopped linking a media/upload.ogg the archive does not hold, which
+    was right, but it left such a recording unmentioned in the hub at all.
+    """
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(2048))
+    _run(archive, resolved, audio="link")
+
+    fresh = Archive(root=archive.root)
+    directory = archive.root / fresh.entry("meetings", MEETING_A)["path"]
+    record = json.loads((directory / "raw" / "audio.json").read_text(encoding="utf-8"))
+    hub = (directory / "meeting.md").read_text(encoding="utf-8")
+    [line] = _pointer_lines(hub)
+    assert 'recording_not_archived: "link mode"' in hub
+    assert "(link mode)" in line and "2,052 bytes" in line
+    assert record["sha256"] in line and record["source_path"] in line
+    assert "[`raw/audio.json`](raw/audio.json)" in line
+    assert "media/upload.ogg" not in hub
+    assert "audio" not in fresh.entry("meetings", MEETING_A)["artifacts"]
+
+
+def test_the_hub_says_why_a_recording_over_the_cap_was_not_copied(
+    scene: Callable[..., tuple],
+) -> None:
+    """The size cap leaves the same pointer, and the hub gives its reason."""
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(4096))
+    _run(archive, resolved, max_audio_mb=0)
+
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    hub = (directory / "meeting.md").read_text(encoding="utf-8")
+    [line] = _pointer_lines(hub)
+    assert 'recording_not_archived: "over max_audio_mb"' in hub
+    assert "(over max_audio_mb)" in line and "4,100 bytes" in line
+
+
+def test_sync_and_render_agree_on_a_recording_kept_as_a_pointer(
+    scene: Callable[..., tuple],
+) -> None:
+    """Both build the mention from raw/audio.json, after upstream deletes the file too.
+
+    The pointer outlives the recording it names -- Wispr Flow garbage-collects
+    meeting audio -- so the mention has to outlive it in both writers.
+    """
+    archive, resolved, db = scene(audio_bytes=b"OggS" + bytes(2048))
+    _run(archive, resolved, audio="link")
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    (resolved.meetings / MEETING_A / "upload.ogg").unlink()
+    _update(
+        db,
+        'UPDATE "Meetings" SET "summary" = ?, "modifiedAt" = ? WHERE "id" = ?',
+        ("Revised summary.", "2026-08-22 09:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved, audio="link")
+
+    assert len(_pointer_lines((directory / "meeting.md").read_text(encoding="utf-8"))) == 1
+    before = _snapshot(archive.root)
+    results = rerender(Archive(root=archive.root), SyncOptions())
+    assert results["meetings"].written == 0
+    assert _snapshot(archive.root) == before
+
+
+def test_a_copied_recording_outranks_the_pointer_link_mode_left(
+    scene: Callable[..., tuple],
+) -> None:
+    """After a switch to copy mode the archive holds both; the hub names the copy.
+
+    Sync never deletes raw/audio.json -- it records what an earlier run chose
+    -- so the copy has to win wherever the hub is built.
+    """
+    archive, resolved, _ = scene(audio_bytes=b"OggS" + bytes(2048))
+    _run(archive, resolved, audio="link")
+    _run(Archive(root=archive.root), resolved, full=True)
+
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    assert (directory / "raw" / "audio.json").is_file()
+    assert (directory / "media" / "upload.ogg").is_file()
+    hub = (directory / "meeting.md").read_text(encoding="utf-8")
+    assert "[`media/upload.ogg`](media/upload.ogg)" in hub
+    assert not _pointer_lines(hub) and "recording_not_archived" not in hub
+    before = _snapshot(archive.root)
+    assert rerender(Archive(root=archive.root), SyncOptions())["meetings"].written == 0
+    assert _snapshot(archive.root) == before
+
+
 # --- binary columns, one opt-in each --------------------------------------
 
 _PNG = b"\x89PNG\r\n\x1a\n" + bytes(8)

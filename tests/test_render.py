@@ -283,6 +283,40 @@ def test_meeting_hub_links_only_the_artifacts_that_exist() -> None:
     assert "finalized: true" in document
 
 
+def test_a_recording_kept_as_a_pointer_cannot_break_the_hub() -> None:
+    """raw/audio.json is a file on disk like any other, so nothing in it is trusted.
+
+    A value that is not what sync writes is left out, and the path is code
+    no backtick inside it can close.
+    """
+    document = render_meeting(
+        {},
+        meeting_id=MEETING_A,
+        title=TITLE_PLAIN,
+        created_at=WHEN,
+        ended_at=None,
+        modified_at=None,
+        participants=[],
+        speaker_names=[],
+        artifacts=[],
+        summary_resolved="",
+        audio_pointer={
+            "archived": False,
+            "reason": "link\nmode",
+            "source_path": "/data/`meetings`/x\n## Injected/upload.ogg",
+            "bytes": True,
+            "sha256": "not-a-digest",
+        },
+    )
+
+    [line] = [line for line in document.splitlines() if line.startswith("- Source recording")]
+    assert 'recording_not_archived: "link mode"' in document
+    assert "``/data/`meetings`/x ## Injected/upload.ogg``" in line
+    assert not any(line.startswith("## Injected") for line in document.splitlines())
+    assert "not-a-digest" not in document
+    assert "bytes" not in line
+
+
 def test_a_deleted_transcript_is_announced_as_the_reason_this_exists() -> None:
     """Wispr dropped its copy; the archive still has one. That is the point."""
     document = render_meeting(

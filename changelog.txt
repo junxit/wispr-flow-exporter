@@ -57,6 +57,27 @@ wrapped at 72 columns, US English.
   resolved a 3.15 split, and every locked package has a wheel 3.15
   installs on both runners -- mypy 2.4.0 and ast-serialize 0.12.1
   among them -- so no dependency is built from source.
+- A meeting's hub names a recording the archive points at but does not
+  hold. In link mode, or for audio over WISPR_MAX_AUDIO_MB, sync writes
+  raw/audio.json -- where the recording was, its size and its SHA-256
+  -- in place of a copy, and since 0.6.1 meeting.md lists only what the
+  archive holds, so such a recording went unmentioned. The hub now
+  gives it one line, with the reason, the size, the hash, where it was
+  last seen and a link to raw/audio.json, and its front matter gains
+  recording_not_archived, "link mode" or "over max_audio_mb". Sync and
+  render both read the record from the archive, so neither rewrites
+  the other's file, and a copy the archive holds outranks a record an
+  earlier link-mode run left beside it. `artifacts` still lists only
+  what the archive holds. Measured against 0.6.1 on the same synthetic
+  meeting, in link mode, over the cap and in copy mode: no file, and
+  no key in any JSON file, that 0.6.1 wrote is missing, and the one
+  difference beyond run timestamps is the hub's two new lines. On
+  archives 0.6.1 wrote, a sync rewrote nothing -- it rebuilds only the
+  meetings that changed -- and the first `wispr-export render`
+  rewrote each such meeting.md once; a second wrote nothing. An archive
+  with no such record is untouched: on a private scratch copy of a
+  real copy-mode archive, which holds none, render wrote nothing under
+  0.6.1 or under this change.
 
 0.6.1
 -----

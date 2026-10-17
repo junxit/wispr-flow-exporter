@@ -22,6 +22,7 @@ no source access at all -- which is what ``wispr-export render`` exists for.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -112,6 +113,26 @@ def inline(text: Any, *, fallback: str = "") -> str:
         return fallback
     flattened = " ".join(text.split())
     return flattened or fallback
+
+
+def code(text: str) -> str:
+    """Show text as inline code that nothing inside it can close.
+
+    A fixed pair of backticks ends at the first backtick in the text, and
+    everything after it becomes Markdown. So the fence is one backtick longer
+    than the longest run inside, and padded with a space where the text starts
+    or ends with one -- the CommonMark rule for code that contains backticks.
+
+    Args:
+        text: The text, which :func:`inline` flattens to one line first.
+
+    Returns:
+        A code span.
+    """
+    flat = inline(text)
+    fence = "`" * (max((len(run) for run in re.findall("`+", flat)), default=0) + 1)
+    pad = " " if flat.startswith("`") or flat.endswith("`") else ""
+    return f"{fence}{pad}{flat}{pad}{fence}"
 
 
 def format_offset(offset: timedelta | None) -> str:
@@ -286,6 +307,38 @@ def render_summary(
     return front + "\n" + body, unresolved
 
 
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _pointer_line(pointer: Mapping[str, Any]) -> str:
+    """Describe a recording the archive points at but does not hold.
+
+    Each field is checked before it is shown: ``raw/audio.json`` is a file on
+    disk like any other, and a value that is not what sync writes is left out
+    rather than trusted.
+
+    Args:
+        pointer: The record sync wrote to ``raw/audio.json``.
+
+    Returns:
+        One list item.
+    """
+    reason = inline(pointer.get("reason"))
+    facts = []
+    size = pointer.get("bytes")
+    if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+        facts.append(f"{size:,} bytes")
+    digest = pointer.get("sha256")
+    if isinstance(digest, str) and SHA256_RE.fullmatch(digest):
+        facts.append(f"SHA-256 `{digest}`")
+    source = inline(pointer.get("source_path"))
+    if source:
+        facts.append(f"last seen at {code(source)}")
+    head = "- Source recording, not in this archive" + (f" ({reason})" if reason else "")
+    listed = ": " + ", ".join(facts) if facts else ""
+    return f"{head}{listed}. See [`raw/audio.json`](raw/audio.json)."
+
+
 def render_meeting(
     data: Mapping[str, Any],
     *,
@@ -301,6 +354,7 @@ def render_meeting(
     soft_deleted: bool = False,
     transcript_deleted_upstream: bool = False,
     unresolved_tokens: int = 0,
+    audio_pointer: Mapping[str, Any] | None = None,
 ) -> str:
     """Render the hub document that links a meeting's other files.
 
@@ -319,10 +373,14 @@ def render_meeting(
         transcript_deleted_upstream: Whether Wispr Flow deleted a transcript
             this archive still holds.
         unresolved_tokens: Speaker tokens that could not be resolved.
+        audio_pointer: What ``raw/audio.json`` records about a recording the
+            archive does not hold, in link mode or over the size cap. Ignored
+            when ``artifacts`` includes the recording itself.
 
     Returns:
         The Markdown document.
     """
+    pointer = audio_pointer if "audio" not in artifacts else None
     front = yaml_block(
         {
             "id": meeting_id,
@@ -338,6 +396,9 @@ def render_meeting(
             "import_source": data.get("importSource"),
             "refine_status": data.get("refineStatus"),
             "artifacts": list(artifacts),
+            "recording_not_archived": (
+                (inline(pointer.get("reason")) or True) if pointer is not None else None
+            ),
             "finalized": bool(data.get("finalized")),
             "deleted": soft_deleted,
             "transcript_deleted_upstream": transcript_deleted_upstream,
@@ -381,7 +442,7 @@ def render_meeting(
     if isinstance(notes, str) and notes.strip():
         lines += ["## Notes", "", "See [`notes.md`](notes.md).", ""]
 
-    if artifacts:
+    if artifacts or pointer is not None:
         lines += ["## Transcripts", ""]
         if "refined" in artifacts:
             lines.append("- [`transcript.refined.md`](transcript.refined.md) — canonical, speakers named")
@@ -389,6 +450,8 @@ def render_meeting(
             lines.append("- [`transcript.live.md`](transcript.live.md) — verbatim live pass, channel-labeled")
         if "audio" in artifacts:
             lines.append("- [`media/upload.ogg`](media/upload.ogg) — source recording")
+        elif pointer is not None:
+            lines.append(_pointer_line(pointer))
         lines.append("")
 
     lines += ["## Raw", "", "Verbatim source payloads are in [`raw/`](raw/).", ""]

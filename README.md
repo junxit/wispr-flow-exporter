@@ -367,7 +367,7 @@ connection trusts. Set them in the real environment if you need them; see
 | `WISPR_SYNC_SOURCE` | `all` | `all`, `local`, `cloud`, `mcp`, `both`, `auto`. `all` is local plus every remote backend that has a credential; `local` and `auto` never touch the network |
 | `WISPR_ARCHIVE_DIR` | `./archive` | Where the archive is written; `--archive-dir` on every command that touches one |
 | `WISPR_ENTITIES` | `all` | Comma list of entities to archive; the default for `--only` |
-| `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip` |
+| `WISPR_AUDIO` | `copy` | `copy`, `link`, `skip`. In `link` mode, and for audio over the cap, `raw/audio.json` records where the recording was, its size and its SHA-256 in place of a copy, and `meeting.md` names it |
 | `WISPR_MAX_AUDIO_MB` | `512` | Record, rather than copy, audio larger than this; `--max-audio-mb` |
 | `WISPR_RECHECK_DAYS` | `14` | Trailing days re-read for edits made in place; `--recheck-days` |
 | `WISPR_INCLUDE_AUDIO_BLOBS` | `0` | Dictation audio blobs |
