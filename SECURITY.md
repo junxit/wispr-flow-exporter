@@ -408,8 +408,11 @@ security updates are enabled on the repository.
 
 CI is pinned the same way: every workflow action to a commit, the uv it
 installs to an exact version, and its runners to a named OS release rather
-than a `-latest` label. Dependabot keeps the actions current; uv and the
-runners move by hand.
+than a `-latest` label. Dependabot keeps the actions current; uv, the runners
+and osv-scanner move by hand. osv-scanner is its release binary, pinned by
+version and by the SHA-256 the release publishes, and checked before it runs:
+the action that ran it before was pinned to a commit, but that commit ran a
+container image by tag, and a tag can be moved.
 
 No CI checkout keeps its GitHub token: nothing after a checkout talks to
 GitHub, and a persisted token is readable by every later step, the test suite

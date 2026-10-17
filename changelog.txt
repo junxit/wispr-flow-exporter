@@ -23,6 +23,20 @@ wrapped at 72 columns, US English.
   workflow, three credential persistence and two cache poisoning, and
   now reports none; actionlint 1.7.12 reported nothing before or
   after.
+- CI's dependency audit runs an osv-scanner pinned by checksum, not a
+  container image pinned by tag. The osv-scanner action was pinned to
+  a commit, but at that commit its action.yml runs
+  ghcr.io/google/osv-scanner-action:v2.7.0, and a tag can be moved to
+  another image. The job now downloads the 2.7.0 release's linux_amd64
+  binary -- the same version, built by the same release from the same
+  source -- and checks it against the SHA-256 that release publishes,
+  kept in ci.yml, before it scans uv.lock. Checked with GNU sha256sum:
+  a changed binary or checksum stops the step before the scanner runs.
+  A query the OSV database never answers exits 127 and fails the job,
+  as it did. One case that passed now fails: the action's wrapper
+  turned "no lockfile found" into success. Dependabot tracks neither
+  the version nor the checksum, so both move by hand, as uv and the
+  runners do.
 
 0.6.1
 -----
