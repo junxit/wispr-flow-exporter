@@ -89,6 +89,14 @@ wrapped at 72 columns, US English.
   sync re-read none of them. The archive now records the declaration
   its meeting digests were taken under, and a sync that finds it
   changed re-reads every meeting once, rewriting only what differs.
+- A meeting the MCP server lists with a transcript but holds no text
+  for no longer fails every sync. Measured on 1.6.1174: a finalized
+  meeting whose local refined.ndjson was an empty file came back from
+  get_meeting as an empty string -- no envelope, no marker -- and the
+  pass reported "a reply's envelope or marker was not recognized",
+  exiting 1 on every run and asking again on each. It is now recorded
+  as empty_transcript_upstream, like a transcript neither side has,
+  and not asked for again until the meeting changes.
 
 0.5.1
 -----

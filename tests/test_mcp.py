@@ -1409,6 +1409,32 @@ def test_a_transcript_whose_ranges_cannot_be_followed_is_not_recovered(
     assert len(server.requested("get_meeting")) <= 2
 
 
+def test_an_empty_transcript_upstream_is_recorded_not_failed(tmp_path: Path) -> None:
+    """Measured on 1.6.1174: a finalized meeting with nothing transcribed.
+
+    Its local refined.ndjson was an empty file, and the server listed it with
+    has_transcript true and answered with an empty string -- no envelope, no
+    marker. That is the server holding no text, not a reply this cannot read,
+    but it was reported as unrecognized, failing every sync and asked again on
+    each one.
+    """
+    archive = Archive(root=tmp_path / "archive")
+    directory = _local(archive, MEETING_A)
+    (directory / "raw" / "refined.ndjson").write_bytes(b"")
+    server = _Wispr([_meeting(MEETING_A)], transcripts={MEETING_A: ""}, envelope=False)
+    problems: list[str] = []
+
+    counts = sync_mcp(archive, server, SyncOptions(), problems)
+
+    assert (counts.failed, problems) == (0, [])
+    state = archive.entries("meetings")[MEETING_A]["mcp"]
+    assert (state["filled"], state["reason"]) == (False, "empty_transcript_upstream")
+    assert not (directory / "transcript.mcp.md").exists()
+    again = _Wispr([_meeting(MEETING_A)], transcripts={MEETING_A: ""}, envelope=False)
+    sync_mcp(archive, again, SyncOptions())
+    assert again.requested("get_meeting") == []
+
+
 def test_offsets_that_disagree_with_the_text_are_rendered_but_not_trusted(
     tmp_path: Path,
 ) -> None:

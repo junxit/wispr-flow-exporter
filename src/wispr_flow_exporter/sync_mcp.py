@@ -789,6 +789,12 @@ def _fetch_ranges(
         raw = _range_text(payload, view)
         if raw is None:
             return stopped("a reply carried no text for the requested range")
+        if raw == "" and start == 0:
+            # Measured on 1.6.1174: a meeting listed with a transcript, whose
+            # reply holds an empty string -- no envelope, no marker. The server
+            # has no text for it, which is an answer rather than a reply this
+            # cannot read.
+            return Assembled("", (), first, True)
         split = _split_range(raw, view)
         if split is None:
             return stopped("a reply's envelope or marker was not recognized")
@@ -1024,11 +1030,15 @@ def _fill_gap(
     existing: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
     if (
         not options.full
-        and existing.get("filled")
+        and (
+            existing.get("filled")
+            or existing.get("reason") == "empty_transcript_upstream"
+        )
         and existing.get("modified_at") == modified
         and existing.get("assembly") == ASSEMBLY_VERSION
     ):
-        # Already recovered, by this assembly, and nothing moved upstream.
+        # Already recovered -- or found empty -- by this assembly, and nothing
+        # moved upstream.
         # Transcripts are the expensive calls; this is the guard that keeps a
         # re-run cheap as well as byte-identical. One assembled by the old
         # splicer is fetched again, once; --full fetches any of them again.
@@ -1046,6 +1056,22 @@ def _fill_gap(
         # whatever an earlier run recovered is left exactly as it was.
         counts.failed += 1
         problems.append(f"transcript of {meeting_id} incomplete: {assembled.reason}")
+        return
+    if not assembled.text:
+        # Listed with a transcript and holding no text: recorded like one
+        # neither side has, and not asked for again until the meeting changes.
+        _decorate(
+            archive,
+            meeting_id,
+            {
+                "has_transcript": True,
+                "filled": False,
+                "reason": "empty_transcript_upstream",
+                "assembly": ASSEMBLY_VERSION,
+                "modified_at": modified,
+            },
+        )
+        counts.unchanged += 1
         return
 
     title = str(record.get("title") or entry.get("title") or "")
