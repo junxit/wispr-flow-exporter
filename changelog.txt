@@ -10,6 +10,27 @@ wrapped at 72 columns, US English.
 
 0.6.0
 -----
+- Upgrading from 0.5.1 needs no migration, and moves or deletes
+  nothing. Measured on a private scratch copy of a real archive,
+  brought current by 0.5.1 first: the first 0.6.0 sync re-read all
+  five meetings once -- the rule their digests are taken under changed
+  -- and wrote seven files: index.json, .sync-state.json, the day's
+  UsageOutbox shard, one meeting's raw/meeting.json, whose queued job
+  request became JSON, and the summary.md, transcript.refined.md and
+  meeting.md of the one meeting whose hand-named speaker is now named.
+  A second sync wrote nothing, and verify --deep found the archive
+  consistent. A first `wispr-export render` then rewrote one
+  meeting.md -- the list of a meeting's transcripts and audio, which
+  sync and render already build differently in 0.5.1 -- and a second
+  wrote nothing.
+- On the real archive itself, last written a month before, the first
+  0.6.0 sync wrote 50 files and removed none, and verify --deep found
+  it consistent. Once the empty transcript described below was
+  recorded, a sync with every backend wrote nothing.
+- An archive synced by 0.5.1 after Wispr Flow 1.6.1174 arrived holds
+  the usage outbox as 0.5.1 archived it, in tables/UsageOutbox.ndjson.
+  0.6.0 neither updates that file nor deletes it, and any row only it
+  holds stays there.
 - Re-pinned against Wispr Flow 1.6.1174 at migration 174, seventeen
   migrations past 1.6.957/157, with nothing removed. New: the
   UsageOutbox table; eighteen columns on Meetings, five on
