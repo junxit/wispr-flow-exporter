@@ -343,6 +343,40 @@ def test_a_refine_job_and_an_edit_push_are_not_content(
     assert not (fresh.root / "superseded").exists()
 
 
+def test_a_candidate_summary_is_archived_and_kept_when_cleared(
+    scene: Callable[..., tuple],
+) -> None:
+    """A candidate model's alternative summary is content, not bookkeeping.
+
+    The app clears it once its side-by-side comparison resolves. Declared
+    volatile, it was measured never reaching raw/meeting.json and never being
+    kept; as content it is archived when it appears and filed when it goes.
+    """
+    archive, resolved, db = scene()
+    _run(archive, resolved)
+    _update(
+        db,
+        'UPDATE "Meetings" SET "candidateSummary" = ?, "modifiedAt" = ? WHERE "id" = ?',
+        ("An alternative summary.", "2026-08-23 08:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved)
+    raw = archive.root / archive.entry("meetings", MEETING_A)["path"] / "raw" / "meeting.json"
+    assert json.loads(raw.read_text(encoding="utf-8"))["candidateSummary"] == (
+        "An alternative summary."
+    )
+
+    _update(
+        db,
+        'UPDATE "Meetings" SET "candidateSummary" = NULL, "modifiedAt" = ? WHERE "id" = ?',
+        ("2026-08-24 08:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved)
+    kept = _superseded(archive.root, "meetings", MEETING_A)
+    assert [entry["payload"]["candidateSummary"] for entry in kept] == [  # type: ignore[index]
+        "An alternative summary."
+    ]
+
+
 def test_speaker_assignments_are_archived_as_json(
     scene: Callable[..., tuple],
 ) -> None:

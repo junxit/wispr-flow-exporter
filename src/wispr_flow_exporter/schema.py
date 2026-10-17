@@ -404,11 +404,10 @@ EXPECTED: Mapping[str, TableSpec] = {
             "speakerRoomLabelEdits",
             "speakerMapDraftTranscriptAt",
             "documentDraftTranscriptAt",
-            # A candidate model's alternative summary, offered for a
-            # side-by-side comparison and cleared when that resolves. It is
-            # never copied into summary.
-            "candidateSummary",
-            "candidateSummaryMetadata",
+            # Not candidateSummary or its metadata. They are a candidate
+            # model's alternative summary of this meeting, which the app
+            # clears once a side-by-side comparison resolves: content upstream
+            # empties, so it is archived when it appears and kept when it goes.
         },
         timestamps=_MEETING_TIMESTAMPS,
         soft_delete=("isDeleted",),
