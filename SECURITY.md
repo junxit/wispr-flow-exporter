@@ -400,7 +400,10 @@ override belong in the real environment, where someone put them on purpose.
 ## Dependencies
 
 Every dependency is pinned exactly in `pyproject.toml`, the build backend
-included, and everything they pull in is pinned in `uv.lock`. The lock is
+included, and everything they pull in is pinned in `uv.lock`. So is what the
+build backend runs with: hatchling's own requirements are pinned with uv's
+build constraints -- by version, not by hash, since uv 0.13.1 checks build
+dependency hashes only as an experimental feature. The lock is
 scanned against the OSV database by CI on every push and pull request, plus
 weekly on a schedule, so a newly published advisory surfaces even when nothing
 changes. Dependabot opens update pull requests weekly, and its alerts and

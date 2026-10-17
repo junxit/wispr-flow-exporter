@@ -37,6 +37,20 @@ dev = [
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# And what hatchling runs with. Its own requirements are ranges, so every build
+# -- `uv build`, and the editable build inside every `uv sync` -- resolved them
+# afresh. These are the versions both resolved the day they were pinned. They
+# move with hatchling, by hand: tests/test_packaging.py fails on a hatchling
+# bump until they have been read again from its METADATA.
+build-constraint-dependencies = [
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.7.0",
+    "tomlkit==0.15.2",
+    "trove-classifiers==2026.9.21.13",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/wispr_flow_exporter"]
 

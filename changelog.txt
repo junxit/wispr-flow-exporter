@@ -37,6 +37,19 @@ wrapped at 72 columns, US English.
   turned "no lockfile found" into success. Dependabot tracks neither
   the version nor the checksum, so both move by hand, as uv and the
   runners do.
+- A build runs the same code every time. hatchling was pinned, but its
+  own requirements -- packaging, pathspec, pluggy, tomlkit and
+  trove-classifiers -- are ranges, and every build resolved them
+  afresh: `uv build`, and the editable build inside every `uv sync`,
+  CI's included. uv's build constraints now pin them to the versions
+  both resolved on 2026-10-17 with the index refreshed, and uv.lock
+  records them. The output does not move: v0.6.1's tree built with
+  these pins gives a wheel and sdist byte-identical to its
+  unconstrained build, this tree's wheel is byte-identical to
+  v0.6.1's, and its sdist matches v0.6.1's member for member, tar
+  headers included, except the files changed since. They move with
+  hatchling, by hand: a test fails on a hatchling bump until its
+  requirements have been read again.
 
 0.6.1
 -----
