@@ -374,6 +374,8 @@ Archived. Every status observed against the live service.
 | `history_stats` | `/history/stats` | 200 |
 | `history_context_stats` | `/history/context-stats` | 200 |
 | `voice_profile` | `/llm/voice_profile/latest` | 200 |
+| `folders` | `/api/v1/folders` | 200, first probed on 1.6.1174 |
+| `voice_prompt_transforms` | `/api/v1/transform/transforms-voice-prompts` | 200, first probed on 1.6.1174 |
 
 Probed and deliberately **not** archived, with the reason recorded in
 `CANDIDATES`:
@@ -388,6 +390,10 @@ Probed and deliberately **not** archived, with the reason recorded in
 | `/api/v1/calendar/events/batch` | 422 | needs a request body |
 | `/api/v1/user_context` | 204 | empty |
 | `/api/v1/me/active-cost-center` | 404 | not a route |
+| `/api/v1/connectors` | 200 | which integrations are connected, and whether each needs re-authorizing: account status rather than content, with fields that flip on their own (1.6.1174) |
+| `/api/v1/folders/meeting-rules` | 404 | not a `GET` route on this account (1.6.1174) |
+| `/api/v1/skills` | 404 | not a `GET` route on this account (1.6.1174) |
+| `/api/v1/learned-preferences` | 422 | needs parameters (1.6.1174) |
 
 
 ---

@@ -69,7 +69,7 @@ in the file it writes.
 All three are confirmed against a live account. For the cloud backend that meant
 finding out it had never worked: it sent `Authorization: Bearer <token>`, and
 the service accepts only the bare token, so every one of its nine endpoints
-returned `401`. It also had four wrong paths. Both are fixed, and 18 endpoints
+returned `401`. It also had four wrong paths. Both are fixed, and 20 endpoints
 are archived with their real status recorded. What that confirmation mostly
 established, though, is what the sync API *cannot* do — the next section.
 

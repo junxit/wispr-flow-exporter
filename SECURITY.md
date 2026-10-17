@@ -248,13 +248,16 @@ spoke.
   This filter is **column-keyed and applies to the local backend only** — the
   cloud backend archives each response verbatim, by design, so a credential in
   a response body would be archived with it. That is stated rather than fixed
-  because it was measured: every one of the 18 archived endpoints was probed on
-  a real account against app 1.6.897 and scanned recursively for
+  because it was measured: every one of the 18 endpoints archived through 0.5.x
+  was probed on a real account against app 1.6.897 and scanned recursively for
   credential-shaped keys. What exists is `conferenceUrl`, `photoUrl` and
   `connectorKey`; there is no token, signature or presigned URL anywhere in the
   set. Note that a `conferenceUrl` is a join link, which is its own kind of
   bearer capability — it is content you asked to archive, not a leak, but it is
-  worth knowing it is in there.
+  worth knowing it is in there. The two added in 0.6.0, `folders` and
+  `voice_prompt_transforms`, held no records on the account they were probed
+  with on 1.6.1174, so their records have not been seen yet; scan them the
+  same way once an account has some.
 
 - **Screen context is excluded by default.** `History` and `FlowLensHistory`
   each carry `screenshot`, `axText` and `axHTML`: a bitmap and a full

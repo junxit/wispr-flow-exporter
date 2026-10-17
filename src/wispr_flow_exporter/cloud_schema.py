@@ -330,6 +330,6 @@ def detect_cloud_drift(
 # `wispr-export schema --source cloud`; MAINTENANCE.md has the procedure.
 CLIENT_PIN = ClientPin(
     app_version="1.6.1174",
-    count=18,
-    sha256="926960a4f81461ba363213ee8cc02ad35835d0d18cf8166e5b9d036694e319bc",
+    count=20,
+    sha256="9db1c1c9ff1c607f1dad45e094880902525d0f109f21f394b0507155344e6a53",
 )

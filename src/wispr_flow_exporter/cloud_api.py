@@ -146,6 +146,13 @@ ENDPOINTS: Mapping[str, Endpoint] = {
     "history_stats": Endpoint("/history/stats"),
     "history_context_stats": Endpoint("/history/context-stats"),
     "voice_profile": Endpoint("/llm/voice_profile/latest"),
+    # First probed on 1.6.1174. The account's folders, as the server holds
+    # them; the local backend archives the same folders from its own tables,
+    # as the dictionary is archived from both sides.
+    "folders": Endpoint("/api/v1/folders"),
+    # First probed on 1.6.1174. The voice-prompt transforms this account wrote,
+    # and its team's, as dictionary_team is archived beside the personal one.
+    "voice_prompt_transforms": Endpoint("/api/v1/transform/transforms-voice-prompts"),
 }
 
 # Paths read from the bundle and probed, but deliberately not archived. Kept so
@@ -173,6 +180,19 @@ CANDIDATES: Mapping[str, Endpoint] = {
     # Answers 204 with no body on this account.
     "user_context": Endpoint("/api/v1/user_context", expected_status=204),
     "cost_center": Endpoint("/api/v1/me/active-cost-center", expected_status=404),
+    # The four below were first probed on 1.6.1174. Answers: which integrations
+    # are connected, and whether each needs re-authorizing -- account status
+    # rather than content, and fields that flip on their own, as with
+    # registered_devices.
+    "connectors": Endpoint("/api/v1/connectors"),
+    "folder_meeting_rules": Endpoint(
+        "/api/v1/folders/meeting-rules", expected_status=404
+    ),
+    "skills": Endpoint("/api/v1/skills", expected_status=404),
+    # Needs parameters this tool does not send.
+    "learned_preferences": Endpoint(
+        "/api/v1/learned-preferences", expected_status=422
+    ),
 }
 
 # Prefixes an endpoint's path may begin with. Narrow on purpose: the bundle

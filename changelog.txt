@@ -65,6 +65,21 @@ wrapped at 72 columns, US English.
   the speaker stays unnamed rather than taking the next source's name.
   The same order covers the map 1.6.1174 rebuilds from
   speakerAssignments, which has no consensus at all.
+- Two more cloud endpoints are archived: folders, the account's
+  folders as the server holds them, and voice_prompt_transforms, the
+  voice-prompt transforms the account and its team wrote. Scanning the
+  1.6.1174 bundle for read-only routes found thirty without a path
+  parameter that this tool had never probed. Ten are enterprise and
+  contact routes it may never request; the rest of the unasked --
+  payment, promotions, a referral leaderboard, enterprise statistics,
+  account status and infrastructure -- were left alone. Each of the six
+  that looked like the account's own data was asked once: folders and
+  the transforms answered 200; connectors answered too, but holds
+  integration status that flips on its own, so it is recorded as a
+  candidate with that reason, beside meeting-rules and skills (404)
+  and learned-preferences (422). CLIENT_PIN now covers 20 endpoints.
+  On the account they were probed with, both new ones held no records
+  yet.
 
 0.5.1
 -----
