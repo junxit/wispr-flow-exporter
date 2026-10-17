@@ -23,6 +23,20 @@ wrapped at 72 columns, US English.
   and search_meetings with new optional filters beside the four
   arguments this tool sends, so its pin moves too. All four live tests
   pass again.
+- A refine job no longer rewrites the meeting it runs on. Of the
+  eighteen columns 1.6.1174 added to Meetings, twelve are the app's own
+  bookkeeping, according to its code: a fresh currentJobId and
+  pendingJobRequest for every processing request, ready flags reset
+  when a job starts, serverModifiedAt from every server snapshot, and
+  speaker-edit buffers nulled once pushed. Measured before this change,
+  each of those rewrote raw/meeting.json, and a nulled buffer filed a
+  superseded copy as if upstream had deleted content. They are declared
+  churn now -- archived, but counted neither as change nor as loss --
+  and so are candidateSummary and its metadata, a candidate model's
+  alternative summary that the app clears once a side-by-side
+  comparison resolves. Eight JSON columns, among them
+  speakerAssignments, identityContacts, summaryFeedback and
+  Folders.grants, are archived as JSON rather than as escaped text.
 
 0.5.1
 -----

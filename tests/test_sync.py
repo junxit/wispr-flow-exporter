@@ -289,6 +289,74 @@ def test_a_volatile_column_alone_does_not_rewrite(
     assert fresh.watermark(SOURCE_LOCAL, "meetings") == "2026-08-23 08:00:00.000 +00:00"
 
 
+def test_a_refine_job_and_an_edit_push_are_not_content(
+    scene: Callable[..., tuple],
+) -> None:
+    """What 1.6.1174 does to a row in the background, without anyone editing it.
+
+    Read from the app's own code: a refine request writes a fresh
+    currentJobId and pendingJobRequest and resets the two ready flags, every
+    server snapshot moves serverModifiedAt, and a pushed speaker edit is nulled
+    from its buffer. Before these columns were declared volatile, each of those
+    rewrote raw/meeting.json, and the emptied buffer filed a superseded copy
+    as if upstream had deleted content.
+    """
+    archive, resolved, db = scene(
+        [
+            _meeting_row(
+                currentJobId="job-1",
+                pendingJobRequest=json.dumps(
+                    {"id": "job-1", "pending": True, "targetStopSeq": 1}
+                ),
+                speakerAssignmentEdits=json.dumps({"2": "p-2"}),
+                serverModifiedAt="2026-08-21T21:33:32.711Z",
+                summaryReady=1,
+                transcriptReady=1,
+            )
+        ]
+    )
+    _run(archive, resolved)
+    before = _snapshot(archive.root)
+
+    _update(
+        db,
+        'UPDATE "Meetings" SET "currentJobId" = ?, "pendingJobRequest" = ?, '
+        '"speakerAssignmentEdits" = NULL, "serverModifiedAt" = ?, '
+        '"summaryReady" = 0, "transcriptReady" = 0, "modifiedAt" = ? '
+        'WHERE "id" = ?',
+        (
+            "job-2",
+            json.dumps({"id": "job-2", "pending": False, "targetStopSeq": 2}),
+            "2026-08-23T08:00:00.000Z",
+            "2026-08-23 08:00:00.000 +00:00",
+            MEETING_A,
+        ),
+    )
+    fresh = Archive(root=archive.root)
+    result = _run(fresh, resolved)
+
+    assert result.counts["meetings"].scanned == 1, "the row must be re-read"
+    assert result.counts["meetings"].written == 0
+    after = _snapshot(fresh.root)
+    del before[".sync-state.json"], after[".sync-state.json"]
+    assert after == before
+    assert not (fresh.root / "superseded").exists()
+
+
+def test_speaker_assignments_are_archived_as_json(
+    scene: Callable[..., tuple],
+) -> None:
+    """A JSON column lands in raw/meeting.json as JSON, not as escaped text."""
+    assignments = {"2": {"user": None, "dom": "p-2", "mic": None, "llm": None}}
+    archive, resolved, _ = scene(
+        [_meeting_row(speakerAssignments=json.dumps(assignments))]
+    )
+    _run(archive, resolved)
+
+    raw = archive.root / archive.entry("meetings", MEETING_A)["path"] / "raw" / "meeting.json"
+    assert json.loads(raw.read_text(encoding="utf-8"))["speakerAssignments"] == assignments
+
+
 # --- relocation and tombstones -------------------------------------------
 
 

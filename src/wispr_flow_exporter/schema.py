@@ -249,6 +249,7 @@ _PUSH_FLAGS = frozenset(
         "speakerMapPendingPush",
         "notesPendingPush",
         "summaryPendingPush",
+        "orgInsightsPendingPush",
     }
 )
 
@@ -257,8 +258,9 @@ _PUSH_FLAGS = frozenset(
 # background sync that only flips `synced` also moves modifiedAt -- and if the
 # digest counted it, every such sync would rewrite the record even though not
 # one word of its content moved. The watermark still reads these columns; the
-# content digest deliberately does not.
-_TOUCH_TIMES = frozenset({"modifiedAt", "updatedAt", "syncedAt"})
+# content digest deliberately does not. serverModifiedAt is the server's own,
+# taken from every snapshot the app pulls.
+_TOUCH_TIMES = frozenset({"modifiedAt", "updatedAt", "syncedAt", "serverModifiedAt"})
 
 _CHURN = _PUSH_FLAGS | _TOUCH_TIMES
 
@@ -275,6 +277,7 @@ _MEETING_TIMESTAMPS: Mapping[str, TimestampKind] = {
     "liveTranscriptUploadedAt": TimestampKind.EPOCH_MS,
     "serverRefinedUploadedAt": TimestampKind.BARE_ISO,
     "refinedFetchedThroughAt": TimestampKind.BARE_ISO,
+    "serverModifiedAt": TimestampKind.ISO_Z,
 }
 
 # Sequelize-managed DATETIME columns are all written the same way, so the
@@ -384,11 +387,40 @@ EXPECTED: Mapping[str, TableSpec] = {
             "liveTranscriptUploadedAt",
             "serverRefinedUploadedAt",
             "refinedFetchedThroughAt",
+            # A refine job's bookkeeping, as 1.6.1174's own code writes it: a
+            # fresh currentJobId and pendingJobRequest on every request, ready
+            # flags reset when a job starts and set from the server's snapshot,
+            # and the summary-ready notification's de-duplication.
+            "currentJobId",
+            "pendingJobRequest",
+            "summaryReady",
+            "transcriptReady",
+            "summaryReadyEventId",
+            "notifiedSummaryReadyEventId",
+            # Edit buffers and the transcript revision they were drafted
+            # against, nulled once pushed. The edits themselves land in
+            # speakerAssignments and speakerMap, which are content.
+            "speakerAssignmentEdits",
+            "speakerRoomLabelEdits",
+            "speakerMapDraftTranscriptAt",
+            "documentDraftTranscriptAt",
+            # A candidate model's alternative summary, offered for a
+            # side-by-side comparison and cleared when that resolves. It is
+            # never copied into summary.
+            "candidateSummary",
+            "candidateSummaryMetadata",
         },
         timestamps=_MEETING_TIMESTAMPS,
         soft_delete=("isDeleted",),
         date_column="createdAt",
-        json_columns=frozenset({"participantNames", "speakerMap", "avatarPick"}),
+        json_columns=frozenset(
+            {
+                "participantNames", "speakerMap", "avatarPick",
+                "pendingJobRequest", "candidateSummaryMetadata", "summaryFeedback",
+                "speakerAssignments", "speakerAssignmentEdits",
+                "speakerRoomLabelEdits", "identityContacts",
+            }
+        ),
     ),
     "Notes": _spec(
         pk="id",
@@ -769,6 +801,7 @@ EXPECTED: Mapping[str, TableSpec] = {
             "grants", "accessVia", "sharingBlocked",
         ),
         timestamps=_SEQUELIZE_TIMES,
+        json_columns=frozenset({"grants"}),
     ),
     # From 20260909120002-create-folder-meetings-table -- dated a week before
     # the migration that was latest at the previous pin, and shipped after it.
