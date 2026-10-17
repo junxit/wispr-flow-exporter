@@ -10,6 +10,16 @@ wrapped at 72 columns, US English.
 
 0.6.2
 -----
+- Upgrading from 0.6.1 needs no migration, and moves or deletes
+  nothing. Measured on a private scratch copy of a real archive,
+  brought current by 0.6.1 first: the first 0.6.2 sync rewrote
+  index.json and .sync-state.json, changing only the tool_version each
+  records; a render, a second sync and a second render wrote nothing,
+  and verify --deep found the archive consistent. That archive is in
+  copy mode and holds no raw/audio.json. One that holds a recording
+  only as raw/audio.json -- link mode, or audio over the size cap --
+  needs `wispr-export render` once, which rewrites each such
+  meeting.md, as measured in the entry on the hub below.
 - CI no longer leaves its GitHub token in the checkout, or restores a
   cache on the run a release waits on. Every checkout persisted its
   token in .git/config, where each later step could read it -- the
