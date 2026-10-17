@@ -1383,6 +1383,68 @@ def test_a_hard_deleted_row_of_a_sharded_table_is_kept(
     assert [e["row"]["id"] for e in _ndjson(day / "2026-08-30.removed.ndjson")] == ["p-2"]  # type: ignore[index]
 
 
+def _usage(identifier: str, spoken: str) -> dict[str, object]:
+    """Build a UsageOutbox row, as 1.6.1174 queues a never-store dictation.
+
+    Args:
+        identifier: The dictation's transcriptEntityId.
+        spoken: Its Sequelize timestamp.
+
+    Returns:
+        The row.
+    """
+    return {
+        "transcriptEntityId": identifier,
+        "ownerUserId": "owner-1",
+        "numWords": 12,
+        "duration": 4.5,
+        "timestamp": spoken,
+        "app": "Notes",
+        "appVersion": "1.6.1174",
+        "needsUploading": 1,
+        "attempts": 0,
+        "createdAt": spoken,
+        "updatedAt": spoken,
+    }
+
+
+def test_the_usage_outbox_is_kept_as_a_dated_log(scene: Callable[..., tuple]) -> None:
+    """Under never-store, the outbox is the only local record of a dictation.
+
+    Wispr Flow uploads each row, marks it and sweeps it, so a day keeps its
+    swept rows in its ledger. The upload bookkeeping -- needsUploading,
+    attempts, updatedAt -- moves without the dictation changing, and rewrites
+    nothing.
+    """
+    rows = [
+        _usage("u-1", "2026-10-07 09:00:00.000 +00:00"),
+        _usage("u-2", "2026-10-07 10:00:00.000 +00:00"),
+    ]
+    archive, resolved, db = scene(rows=[], tables={"UsageOutbox": rows})
+    _run(archive, resolved)
+    day = archive.root / "tables" / "UsageOutbox" / "2026" / "10"
+    assert [row["transcriptEntityId"] for row in _ndjson(day / "2026-10-07.ndjson")] == ["u-1", "u-2"]
+    before = _snapshot(archive.root)
+
+    _update(
+        db,
+        'UPDATE "UsageOutbox" SET "needsUploading" = 0, "attempts" = 1, '
+        '"updatedAt" = ? WHERE "transcriptEntityId" = ?',
+        ("2026-10-07 10:05:00.000 +00:00", "u-1"),
+    )
+    _run(Archive(root=archive.root), resolved)
+    after = _snapshot(archive.root)
+    del before[".sync-state.json"], after[".sync-state.json"]
+    assert after == before
+
+    _delete(db, "UsageOutbox", "transcriptEntityId", "u-1")
+    _run(Archive(root=archive.root), resolved)
+
+    assert [row["transcriptEntityId"] for row in _ndjson(day / "2026-10-07.ndjson")] == ["u-2"]
+    ledger = _ndjson(day / "2026-10-07.removed.ndjson")
+    assert [entry["row"]["transcriptEntityId"] for entry in ledger] == ["u-1"]  # type: ignore[index]
+
+
 def test_a_sharded_day_emptied_upstream_is_kept(scene: Callable[..., tuple]) -> None:
     """A day no row lands on any more is revisited, not forgotten with stale rows."""
     rows = [

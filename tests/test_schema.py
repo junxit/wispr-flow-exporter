@@ -129,7 +129,7 @@ def test_unbounded_tables_are_sharded() -> None:
     A heavy dictation user produces thousands of History rows a day. A
     directory or a file each is a filesystem-hostile archive.
     """
-    for table in ("History", "Polish", "InstructHistory", "FlowLensHistory"):
+    for table in ("History", "Polish", "InstructHistory", "FlowLensHistory", "UsageOutbox"):
         assert EXPECTED[table].layout is Layout.SHARD
         assert EXPECTED[table].date_column is not None
 

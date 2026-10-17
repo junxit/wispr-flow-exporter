@@ -820,12 +820,16 @@ EXPECTED: Mapping[str, TableSpec] = {
         ),
         timestamps={"addedAt": TimestampKind.SEQUELIZE},
     ),
-    # From 20261007120000-create-usage-outbox. Declared so drift is measured
-    # against it; until it has a layout of its own it is archived exactly as an
-    # undeclared table would be.
+    # From 20261007120000-create-usage-outbox. Under the never-store local data
+    # policy, 1.6.1174 routes each dictation here instead of History: usage
+    # only -- words, durations, app, platform, time -- and no text. Rows are
+    # uploaded, marked and then swept, within about a day, so this is the only
+    # local per-dictation record such an account has, and it does not last.
+    # Sharded by when the dictation was spoken, a day keeps what the sweep
+    # removes in its ledger; the upload bookkeeping is churn.
     "UsageOutbox": _spec(
         pk="transcriptEntityId",
-        layout=Layout.SNAPSHOT,
+        layout=Layout.SHARD,
         columns=(
             "transcriptEntityId", "ownerUserId", "numWords", "duration",
             "speechDuration", "timestamp", "timezoneOffsetMinutes", "app",
@@ -833,6 +837,9 @@ EXPECTED: Mapping[str, TableSpec] = {
             "numDictionaryReplacements", "status", "appVersion",
             "needsUploading", "attempts", "createdAt", "updatedAt",
         ),
+        volatile=_CHURN | {"attempts"},
+        timestamps={**_SEQUELIZE_TIMES, "timestamp": TimestampKind.SEQUELIZE},
+        date_column="timestamp",
     ),
     "SequelizeMeta": _spec(
         pk="name",

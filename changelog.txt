@@ -37,6 +37,19 @@ wrapped at 72 columns, US English.
   comparison resolves. Eight JSON columns, among them
   speakerAssignments, identityContacts, summaryFeedback and
   Folders.grants, are archived as JSON rather than as escaped text.
+- Dictations under the never-store policy are archived as a dated
+  usage log. 1.6.1174 routes each one to the new UsageOutbox table
+  instead of History -- words, durations, app, platform and time,
+  never text -- then uploads it and sweeps it within about a day. On
+  the account this was measured against, History held no rows and the
+  outbox one, its rowids showing eight earlier rows already gone.
+  Archived as an undeclared table, the outbox was a single snapshot
+  rewritten whenever an upload flipped a flag, with swept rows piling
+  into one ledger. It is now sharded by the day a dictation was
+  spoken, under tables/UsageOutbox/YYYY/MM/; upload bookkeeping is
+  churn, and each day keeps the rows the sweep removes in its own
+  ledger. An account that keeps History has an empty outbox and sees
+  no change.
 
 0.5.1
 -----
