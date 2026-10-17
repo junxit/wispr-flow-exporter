@@ -114,6 +114,14 @@ activity, most-used and most-removed words. Five endpoints' worth, archived
 under `cloud/`. It is not what you said. It is the only surviving evidence that
 you said it.
 
+One finer trace exists locally, briefly. Since Wispr Flow 1.6.1174, a
+`never_store` account queues each dictation's usage — word counts, durations,
+app, platform and time, never text — in a `UsageOutbox` table while it uploads
+it, and sweeps the row within about a day. A sync archives every row it sees as
+a dated log under `tables/UsageOutbox/`, and keeps it after the sweep. A
+dictation queued and swept between two syncs is not captured, so sync at least
+daily if you want every one.
+
 Meetings, notes and todos are not readable from the cloud either — the app syncs
 all three through write methods this tool does not issue. The local store is
 their primary route; the MCP backend reaches meetings and notes, and is the only
@@ -283,6 +291,7 @@ archive/
   notes/images/<note uuid>/     # pasted images, with --include-images
   dictation/media/  tables/FlowLensHistory/media/  # dictation audio and
                                 # screenshots, each with its own opt-in
+  tables/UsageOutbox/2026/10/   # never_store dictations' usage, a file a day
   …/<file>.removed.ndjson       # rows upstream deleted, beside the file they left
   superseded/<kind>/<key>/      # payloads a later version held less than
   cloud/                        # one verbatim response per endpoint
