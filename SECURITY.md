@@ -402,6 +402,11 @@ scanned against the OSV database by CI on every push and pull request, plus
 weekly on a schedule, so a newly published advisory surfaces even when nothing
 changes. Dependabot opens update pull requests weekly.
 
+CI is pinned the same way: every workflow action to a commit, the uv it
+installs to an exact version, and its runners to a named OS release rather
+than a `-latest` label. Dependabot keeps the actions current; uv and the
+runners move by hand.
+
 The dependency set is deliberately small. The store is SQLite and NDJSON, both of
 which the standard library reads, so the local export path pulls in nothing that
 parses untrusted bytes in C beyond the `sqlite3` module Python already ships.
