@@ -10,6 +10,16 @@ wrapped at 72 columns, US English.
 
 0.6.1
 -----
+- Upgrading from 0.6.0 needs no migration, and moves or deletes
+  nothing. Run `wispr-export render` once afterwards: a sync rebuilds
+  only the meetings that changed, so a hub 0.6.0's sync wrote without
+  a recording the archive holds keeps that gap until then. Measured on
+  a private scratch copy of a real archive last written by 0.6.0: the
+  first render rewrote that one meeting.md, adding the recording's
+  link, and updated index.json and .sync-state.json; a second render
+  wrote nothing. A sync that then re-read every meeting changed no
+  document -- only index.json, where that meeting's artifact list
+  gained its recording -- and a render after it wrote nothing.
 - A meeting's hub document lists what the archive holds, whether sync
   or render wrote it. Sync built meeting.md from Wispr Flow's own
   directory and render from the archive's copies, and the two stop
