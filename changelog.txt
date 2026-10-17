@@ -10,6 +10,20 @@ wrapped at 72 columns, US English.
 
 0.5.1
 -----
+- Upgrading from 0.5.0 needs no migration. No code in the package
+  changed -- `git diff v0.5.0 -- src/` is empty -- so an archive is
+  written exactly as before; what moves is the set of versions `uv
+  sync` installs, and `uv run` installs them on its next run. The one
+  difference a run can show is a .env line with only a comment after
+  its =, described below: where WISPR_ARCHIVE_DIR was written that way,
+  0.5.0 archived into a directory named after the comment and 0.5.1
+  archives into ./archive. Before the first sync, this lists any such
+  line: `grep -nE 'WISPR_[A-Z_]+=[[:blank:]]+#' .env`.
+- The pins still describe Wispr Flow 1.6.957 at migration 157. Against
+  1.6.1174 at migration 174, three of the four live tests fail, as they
+  do on 0.5.0, and `wispr-export schema --source local` reports
+  additive drift: nothing the tool needs has gone. The re-pin
+  MAINTENANCE.md describes is separate work.
 - Every dependency is pinned to an exact version: httpx and
   python-dotenv at runtime, pytest, ruff and mypy for development, and
   hatchling, which `uv sync` builds the project with. The first five
