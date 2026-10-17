@@ -403,12 +403,19 @@ Every dependency is pinned exactly in `pyproject.toml`, the build backend
 included, and everything they pull in is pinned in `uv.lock`. The lock is
 scanned against the OSV database by CI on every push and pull request, plus
 weekly on a schedule, so a newly published advisory surfaces even when nothing
-changes. Dependabot opens update pull requests weekly.
+changes. Dependabot opens update pull requests weekly, and its alerts and
+security updates are enabled on the repository.
 
 CI is pinned the same way: every workflow action to a commit, the uv it
 installs to an exact version, and its runners to a named OS release rather
 than a `-latest` label. Dependabot keeps the actions current; uv and the
 runners move by hand.
+
+No CI checkout keeps its GitHub token: nothing after a checkout talks to
+GitHub, and a persisted token is readable by every later step, the test suite
+and every package it imports included. The uv cache is skipped on tag pushes,
+so the run a release waits on installs every package fresh against `uv.lock`'s
+hashes rather than from a cache another run wrote.
 
 The dependency set is deliberately small. The store is SQLite and NDJSON, both of
 which the standard library reads, so the local export path pulls in nothing that

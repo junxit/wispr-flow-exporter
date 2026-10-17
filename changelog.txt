@@ -8,6 +8,22 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.6.2
+-----
+- CI no longer leaves its GitHub token in the checkout, or restores a
+  cache on the run a release waits on. Every checkout persisted its
+  token in .git/config, where each later step could read it -- the
+  test suite and every package it imports among them -- and none of
+  them needs it. The uv cache was restored on every run, tag pushes
+  included; it now follows setup-uv's "auto", which v10.3.0 turns off
+  for tag pushes and for release, pull_request_target and
+  workflow_run events, so a tag's run installs fresh against
+  uv.lock's hashes while branch, pull request and scheduled runs keep
+  caching. zizmor 1.31.1 --offline reported five findings on the
+  workflow, three credential persistence and two cache poisoning, and
+  now reports none; actionlint 1.7.12 reported nothing before or
+  after.
+
 0.6.1
 -----
 - Upgrading from 0.6.0 needs no migration, and moves or deletes

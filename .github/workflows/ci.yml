@@ -26,6 +26,16 @@ permissions:
 # they move by hand. Unpinned, setup-uv installed whichever uv was newest that
 # day -- the last run on main got 0.13.0 -- and a -latest label changes OS
 # when GitHub moves it: ubuntu-latest becomes Ubuntu 26.04 in November 2026.
+#
+# No checkout keeps its token. Nothing after a checkout talks to GitHub, and a
+# persisted token sits in .git/config for every later step to read -- the test
+# suite and every package it imports included.
+#
+# The uv cache is skipped on tag pushes. setup-uv's "auto" turns it off for
+# tag, release, pull_request_target and workflow_run events, so the run a
+# release waits on installs everything fresh against uv.lock's hashes rather
+# than from a cache another run wrote. Branch, pull request and scheduled runs
+# still cache.
 
 jobs:
   test:
@@ -44,12 +54,14 @@ jobs:
         python-version: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.1"
-          enable-cache: true
+          enable-cache: auto
           python-version: ${{ matrix.python-version }}
 
       - name: Sync (locked)
@@ -63,12 +75,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.1"
-          enable-cache: true
+          enable-cache: auto
           python-version: "3.13"
 
       - name: Sync (locked)
@@ -88,6 +102,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # osv-scanner reads uv.lock natively and queries the OSV database.
       # Fails the job if any pinned dependency has a known advisory.
