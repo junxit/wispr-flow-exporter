@@ -7,6 +7,7 @@ resolution-markers = [
 ]
 
 [manifest]
+constraints = [{ name = "ast-serialize", specifier = "==0.12.1" }]
 build-constraints = [
     { name = "packaging", specifier = "==26.3" },
     { name = "pathspec", specifier = "==1.1.1" },

@@ -40,3 +40,18 @@ def test_hatchlings_own_dependencies_are_pinned_exactly() -> None:
 
     assert declared["build-system"]["requires"] == [HATCHLING]
     assert set(pinned) == HATCHLING_REQUIRES
+
+
+def test_ast_serialize_is_held_where_a_resolver_can_see_it() -> None:
+    """This project stays on ast-serialize 0.12.1, though mypy accepts up to 1.0.
+
+    0.12.x carries the fixes for python/mypy#22085 and #22090, and 0.13.x
+    changes how ``type: ignore`` comments parse, for a mypy not yet released.
+    Held only by uv.lock, any relock or grouped update could move it. Held as
+    a constraint, a mypy that needs 0.13 fails to resolve on the pull request
+    that bumps it -- the signal to move both together.
+    """
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+    constraints = declared.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+
+    assert "ast-serialize==0.12.1" in constraints

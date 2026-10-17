@@ -50,6 +50,12 @@ build-constraint-dependencies = [
     "tomlkit==0.15.2",
     "trove-classifiers==2026.9.21.13",
 ]
+# mypy 2.4.0 accepts any ast-serialize below 1.0. 0.12.x carries the fixes for
+# python/mypy#22085 and #22090; 0.13.x changes how `type: ignore` comments
+# parse, for a mypy not yet released. Held here rather than only in uv.lock, so
+# no relock moves it, and a mypy that needs 0.13 fails to resolve on the pull
+# request that bumps it: then move both together.
+constraint-dependencies = ["ast-serialize==0.12.1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wispr_flow_exporter"]

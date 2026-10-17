@@ -50,6 +50,16 @@ wrapped at 72 columns, US English.
   headers included, except the files changed since. They move with
   hatchling, by hand: a test fails on a hatchling bump until its
   requirements have been read again.
+- ast-serialize, which mypy brings in, is held at 0.12.1 in
+  pyproject.toml rather than only in uv.lock. mypy 2.4.0, still the
+  newest release on 2026-10-17, accepts any ast-serialize below 1.0,
+  and 0.13.1 shipped that day. 0.12 carries the fixes for
+  python/mypy#22085 and #22090; 0.13 changes how `type: ignore`
+  comments parse, for a mypy not yet released. Held only by the lock,
+  `uv lock --upgrade` would have moved it. As a uv constraint, a mypy
+  release that needs 0.13 fails to resolve on the pull request that
+  bumps it: the signal to move both together. Development only: the
+  wheel's METADATA is byte-identical to 0.6.1's.
 - CI tests on Python 3.15 as well as 3.13 and 3.14, on Ubuntu and
   macOS alike. requires-python, ">=3.13", already admitted 3.15, so
   a supported version went untested. On CPython 3.15.0, locally, all
