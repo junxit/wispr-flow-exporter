@@ -19,6 +19,17 @@ wrapped at 72 columns, US English.
   to the 1.32.4 that resolved today, it builds the same wheel and
   sdist, file for file, apart from the pins in their metadata. A
   version now changes only in a commit that bumps it.
+- python-dotenv 1.2.4, anyio 4.15.1 and idna 3.20. One change shows: a
+  .env line with nothing but a comment after its = now leaves the
+  setting at its default. Measured on 1.2.3, which read the comment as
+  the value: `WISPR_ARCHIVE_DIR= # default` archived into a directory
+  named "# default", and the same form for WISPR_AUDIO,
+  WISPR_INCLUDE_IMAGES or WISPR_API_BASE was refused before the run
+  began. `KEY=value # note` is unchanged, a comment with no space
+  before it is still a value (`KEY=#c` sets "#c"), and .env.example
+  keeps every comment on a line of its own, so a copy of it reads the
+  same. anyio now brings typing-extensions on Pythons before 3.15, the
+  one package a runtime install adds.
 
 0.5.0
 -----

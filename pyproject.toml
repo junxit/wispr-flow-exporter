@@ -16,7 +16,7 @@ dependencies = [
     # included: each is a version the suite has passed on, and a new one
     # arrives only in a commit that bumps it. uv.lock pins what they pull in.
     "httpx==0.28.1",
-    "python-dotenv==1.2.3",
+    "python-dotenv==1.2.4",
 ]
 
 [project.scripts]

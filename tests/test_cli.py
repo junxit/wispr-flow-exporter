@@ -715,6 +715,34 @@ def test_the_real_environment_can_still_consent(
     assert _config(argparse.Namespace()).api_base == "https://staging.example"
 
 
+def test_a_dotenv_comment_after_an_empty_value_means_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``KEY= # note`` leaves the setting at its default.
+
+    Measured on python-dotenv 1.2.3, which read the comment as the value:
+    WISPR_ARCHIVE_DIR archived into a directory named "# default", and the
+    other three settings were refused before the run began.
+    """
+    from wispr_flow_exporter.cli import DEFAULT_API_BASE, _config
+
+    monkeypatch.delenv("WISPR_ARCHIVE_DIR")
+    (tmp_path / ".env").write_text(
+        "WISPR_ARCHIVE_DIR= # default\n"
+        "WISPR_AUDIO= # copy\n"
+        "WISPR_INCLUDE_IMAGES= # off\n"
+        "WISPR_API_BASE= # shipped\n",
+        encoding="utf-8",
+    )
+
+    config = _config(argparse.Namespace())
+
+    assert config.archive_dir == (tmp_path / "archive").resolve()
+    assert config.audio == "copy"
+    assert config.include_images is False
+    assert config.api_base == DEFAULT_API_BASE
+
+
 def test_logout_with_nothing_stored_is_not_a_failure(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
