@@ -653,7 +653,9 @@ def _archive_meeting(
         "created_at": created.isoformat() if created else None,
         "modified_at": data.get("modifiedAt"),
         "content_hash": digest,
-        "artifacts": list(artifacts.present) if artifacts else [],
+        # What the archive holds, as the hub document lists it -- not what
+        # Wispr Flow's directory happens to hold this run.
+        "artifacts": list(_archived_artifacts(key, destination).present),
         "transcript_deleted_upstream": transcript_deleted or None,
         "render_stale": True if counts.held_back > held else None,
         "source": SOURCE_LOCAL,
@@ -754,7 +756,10 @@ def _write_meeting_files(
                     },
                 )
 
-    for name, text in _meeting_documents(record, artifacts).items():
+    # Rendered from the copies just written, never from Wispr Flow's directory,
+    # so a sync and a later render build the same documents.
+    archived = _archived_artifacts(record.key, destination)
+    for name, text in _meeting_documents(record, archived).items():
         wrote |= _write_markdown(destination / name, text, options, counts)
     return wrote
 
@@ -765,9 +770,9 @@ def _meeting_documents(
     """Render every document a meeting's directory holds, writing none of them.
 
     A pure function of the meeting row and its transcript files, shared by
-    sync -- which passes the files in Wispr Flow's directory -- and by render,
-    which passes the verbatim copies already in the archive. One builder is
-    what makes re-rendering produce exactly what a sync would have.
+    sync and by render, which both pass the archive's own copies -- see
+    :func:`_archived_artifacts`. One builder fed one input is what makes
+    re-rendering produce exactly what a sync would have.
 
     Args:
         record: The meeting row, with its soft-deletion state.
@@ -2035,16 +2040,7 @@ def _rerender_meetings(archive: Archive, options: SyncOptions) -> SyncCounts:
             counts.failed += 1
             continue
 
-        artifacts = MeetingArtifacts(
-            meeting_id=key,
-            directory=directory / "raw",
-            refined=_archived(directory / "raw" / "refined.ndjson"),
-            live=_archived(directory / "raw" / "live.ndjson"),
-            observations=_archived(
-                directory / "raw" / "speakers.observations.ndjson"
-            ),
-            audio=_archived(directory / "media" / "upload.ogg"),
-        )
+        artifacts = _archived_artifacts(key, directory)
         # The soft-deletion state comes from the payload. Building the record
         # without it made every re-render strip "deleted: true" and its banner
         # from a meeting Wispr Flow had tombstoned.
@@ -2168,3 +2164,29 @@ def _archived(path: Path) -> Path | None:
         The path, or ``None``.
     """
     return path if path.is_file() else None
+
+
+def _archived_artifacts(key: str, directory: Path) -> MeetingArtifacts:
+    """Name a meeting's transcripts and audio as the archive holds them.
+
+    The one input sync and render both build a meeting's documents from. Sync
+    used to pass Wispr Flow's own directory instead, which stops matching the
+    moment the app deletes something the archive kept. Measured on a real
+    archive: a recording Wispr Flow had deleted, which sync left out of
+    meeting.md and render put back, each rewriting the other's file.
+
+    Args:
+        key: The meeting id.
+        directory: The meeting's directory in the archive.
+
+    Returns:
+        The archive's copies, each ``None`` when it holds none.
+    """
+    return MeetingArtifacts(
+        meeting_id=key,
+        directory=directory / "raw",
+        refined=_archived(directory / "raw" / "refined.ndjson"),
+        live=_archived(directory / "raw" / "live.ndjson"),
+        observations=_archived(directory / "raw" / "speakers.observations.ndjson"),
+        audio=_archived(directory / "media" / "upload.ogg"),
+    )

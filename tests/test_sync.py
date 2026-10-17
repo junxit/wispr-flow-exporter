@@ -1257,6 +1257,35 @@ def test_re_rendering_a_fresh_archive_writes_nothing(scene: Callable[..., tuple]
     assert all(counts.written == 0 and not counts.failed for counts in results.values())
 
 
+def test_sync_and_render_agree_after_upstream_deletes_the_audio(
+    scene: Callable[..., tuple],
+) -> None:
+    """The hub lists what the archive holds, whichever of the two wrote it.
+
+    Measured on a real archive: Wispr Flow had deleted a recording the
+    archive had copied. Sync built meeting.md from Wispr Flow's directory and
+    left the recording out; render built it from the archive's copies and put
+    it back -- so each rewrote the other's file whenever it ran.
+    """
+    archive, resolved, db = scene(audio_bytes=b"OggS-fixture")
+    _run(archive, resolved)
+    directory = archive.root / archive.entry("meetings", MEETING_A)["path"]
+    (resolved.meetings / MEETING_A / "upload.ogg").unlink()
+    _update(
+        db,
+        'UPDATE "Meetings" SET "summary" = ?, "modifiedAt" = ? WHERE "id" = ?',
+        ("Revised summary.", "2026-08-22 09:00:00.000 +00:00", MEETING_A),
+    )
+    _run(Archive(root=archive.root), resolved)
+
+    assert "media/upload.ogg" in (directory / "meeting.md").read_text(encoding="utf-8")
+    assert "audio" in Archive(root=archive.root).entry("meetings", MEETING_A)["artifacts"]
+    before = _snapshot(archive.root)
+    results = rerender(Archive(root=archive.root), SyncOptions())
+    assert results["meetings"].written == 0
+    assert _snapshot(archive.root) == before
+
+
 def test_a_soft_deleted_meeting_keeps_its_flag_when_re_rendered(
     scene: Callable[..., tuple],
 ) -> None:

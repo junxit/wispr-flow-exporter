@@ -8,6 +8,21 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.6.1
+-----
+- A meeting's hub document lists what the archive holds, whether sync
+  or render wrote it. Sync built meeting.md from Wispr Flow's own
+  directory and render from the archive's copies, and the two stop
+  agreeing the moment the app deletes something the archive kept.
+  Measured on a real archive: one meeting's recording, deleted by
+  Wispr Flow and kept here, which sync left out of meeting.md and
+  render put back, each rewriting the other's file. Both now build
+  from the archive's copies, and so does the index's list of a
+  meeting's artifacts. In link mode, or for a recording over the size
+  cap, the hub no longer links a media/upload.ogg the archive does not
+  hold; raw/audio.json still records where the recording was, its size
+  and its hash.
+
 0.6.0
 -----
 - Upgrading from 0.5.1 needs no migration, and moves or deletes
