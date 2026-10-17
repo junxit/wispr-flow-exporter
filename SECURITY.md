@@ -396,10 +396,11 @@ override belong in the real environment, where someone put them on purpose.
 
 ## Dependencies
 
-Dependencies are pinned in `uv.lock` and scanned against the OSV database by CI
-on every push and pull request, plus weekly on a schedule, so a newly published
-advisory surfaces even when nothing changes. Dependabot opens update pull
-requests weekly.
+Every dependency is pinned exactly in `pyproject.toml`, the build backend
+included, and everything they pull in is pinned in `uv.lock`. The lock is
+scanned against the OSV database by CI on every push and pull request, plus
+weekly on a schedule, so a newly published advisory surfaces even when nothing
+changes. Dependabot opens update pull requests weekly.
 
 The dependency set is deliberately small. The store is SQLite and NDJSON, both of
 which the standard library reads, so the local export path pulls in nothing that
