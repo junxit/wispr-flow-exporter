@@ -251,6 +251,14 @@ class Person:
     origin: str | None = None
 
 
+# The order Wispr Flow's own resolver reads an assignment in, from 1.6.1174's
+# code: a hand edit first, then the meeting platform's own labels, the
+# microphone's owner and the model's guess, with consensus last. Reading
+# consensus alone left a speaker the owner had named by hand unnamed here --
+# measured on a real account, four of 28 summary mentions stayed literal tokens.
+ASSIGNMENT_SOURCES = ("user", "dom", "mic", "llm", "consensus")
+
+
 @dataclass(slots=True)
 class SpeakerMap:
     """A parsed ``Meetings.speakerMap``, covering the refined namespace only.
@@ -275,6 +283,13 @@ class SpeakerMap:
         ``{"1": "Some Name"}`` mapping, and a bare string. Anything else --
         including a list where a mapping was expected -- yields an empty map
         rather than raising from several frames down inside a sync pass.
+
+        An assignment names its person through several sources, and they are
+        read in the app's own order -- see :data:`ASSIGNMENT_SOURCES`. The
+        first one that names anyone decides, even when that person is missing
+        from ``people``: the app then shows no name rather than trying the
+        next source. 1.6.1174 rebuilds the map from ``speakerAssignments``
+        with no ``consensus`` at all, which the same order covers.
 
         Args:
             value: The raw ``speakerMap`` column, JSON text or already decoded.
@@ -310,7 +325,16 @@ class SpeakerMap:
         if isinstance(raw_assignments, dict):
             for speaker_id, entry in raw_assignments.items():
                 person_id = (
-                    entry.get("consensus") if isinstance(entry, dict) else entry
+                    next(
+                        (
+                            entry[source]
+                            for source in ASSIGNMENT_SOURCES
+                            if entry.get(source) is not None
+                        ),
+                        None,
+                    )
+                    if isinstance(entry, dict)
+                    else entry
                 )
                 if not isinstance(person_id, str):
                     continue

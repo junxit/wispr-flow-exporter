@@ -50,6 +50,19 @@ wrapped at 72 columns, US English.
   churn, and each day keeps the rows the sweep removes in its own
   ledger. An account that keeps History has an empty outbox and sees
   no change.
+- Speakers are named the way Wispr Flow names them. An assignment can
+  name its person through several sources, and the app reads them in
+  order: a hand edit first, then the meeting platform's own labels, the
+  microphone's owner and the model's guess, with consensus last. This
+  tool read consensus alone, so a speaker the owner had named by hand
+  stayed unnamed. Measured on the account this was written against,
+  four of the 28 speaker mentions in its summaries stayed literal
+  <@speaker:N> tokens, all four that speaker's; all 28 now resolve, and
+  none that resolved before changes. As in the app, the first source
+  that names anyone decides: if that person is missing from the map,
+  the speaker stays unnamed rather than taking the next source's name.
+  The same order covers the map 1.6.1174 rebuilds from
+  speakerAssignments, which has no consensus at all.
 
 0.5.1
 -----

@@ -198,6 +198,67 @@ def test_speaker_map_parses_a_flat_legacy_shape() -> None:
     assert speakers.name_for(2) == THIRD
 
 
+def test_a_hand_assigned_speaker_is_named_without_consensus() -> None:
+    """The case measured on 1.6.1174: named by hand, with no consensus.
+
+    Wispr Flow names that speaker. Reading consensus alone left them unnamed
+    in the transcript, and their summary mentions as literal tokens.
+    """
+    assignment = {"consensus": None, "user": "p-2", "dom": None, "mic": None, "llm": None}
+    speakers = SpeakerMap.parse(
+        {"people": PEOPLE_MAP["people"], "assignments": {"2": assignment}}
+    )
+    assert speakers.name_for(2) == SECOND
+
+
+def test_a_hand_edit_overrides_consensus() -> None:
+    """``user`` is read first, as in the app's own resolver."""
+    speakers = SpeakerMap.parse(
+        {
+            "people": PEOPLE_MAP["people"],
+            "assignments": {"1": {"consensus": "p-1", "user": "p-2"}},
+        }
+    )
+    assert speakers.name_for(1) == SECOND
+
+
+def test_a_source_naming_a_stranger_does_not_fall_through() -> None:
+    """The first source that names anyone decides, even when nobody matches.
+
+    The app shows no name rather than trying the next source. Trying it here
+    would attribute words to a person Wispr Flow does not show for them.
+    """
+    speakers = SpeakerMap.parse(
+        {
+            "people": PEOPLE_MAP["people"],
+            "assignments": {"1": {"dom": "p-9", "consensus": "p-1"}},
+        }
+    )
+    assert speakers.name_for(1) is None
+
+
+def test_speaker_map_parses_the_shape_built_from_speaker_assignments() -> None:
+    """1.6.1174 rebuilds speakerMap from speakerAssignments, without consensus.
+
+    People are keyed by voice and source, and each assignment names its
+    sources directly.
+    """
+    speakers = SpeakerMap.parse(
+        {
+            "people": {
+                "voice-1-mic": {"name": OWNER, "origin": "self"},
+                "voice-2-dom": {"name": SECOND, "origin": "platform"},
+            },
+            "assignments": {
+                "1": {"user": None, "dom": None, "mic": "voice-1-mic", "llm": None},
+                "2": {"user": None, "dom": "voice-2-dom", "mic": None, "llm": None},
+            },
+            "rooms": [],
+        }
+    )
+    assert (speakers.name_for(1), speakers.name_for(2)) == (OWNER, SECOND)
+
+
 @pytest.mark.parametrize(
     "value",
     [None, "", "not json", [1, 2, 3], '["not", "a", "mapping"]', 42],
