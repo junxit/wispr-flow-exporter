@@ -10,6 +10,16 @@ wrapped at 72 columns, US English.
 
 0.6.3
 -----
+- Upgrading from 0.6.2 needs no migration, and moves or deletes
+  nothing. Measured on a private scratch copy of a real archive,
+  brought current by 0.6.2 first: the first 0.6.3 sync rewrote
+  index.json and .sync-state.json, changing only the tool_version each
+  records; a render, a second sync and a second render wrote nothing,
+  and verify --deep found the archive consistent. That machine runs
+  Wispr Flow 1.6.1264, newer than the 1.6.1174 the declaration
+  describes, so every sync there, 0.6.2's included, reports additive
+  drift: a new Meetings.serverRecordingLive column, already archived
+  in the two meetings synced since.
 - certifi, the CA bundle httpx verifies every cloud and MCP connection
   against, moves from 2026.7.22 to 2026.10.23, the fix for
   GHSA-6q48-6c7w-9gw2 (PYSEC-2026-4320, critical). 2026.7.22 still
