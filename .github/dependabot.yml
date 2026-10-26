@@ -19,8 +19,8 @@ updates:
     # lock pins was never proposed: certifi, which httpx brings in, was still
     # 2026.7.22 six days after GHSA-6q48-6c7w-9gw2 was fixed in 2026.10.19,
     # with no pull request and no alert. For uv, "all" adds the dependencies
-    # of direct dependencies. ast-serialize, held in pyproject.toml, fails to
-    # resolve when proposed; that is the hold working.
+    # of direct dependencies. For ast-serialize, held in pyproject.toml, the
+    # first run reported "No update possible"; that is the hold working.
     allow:
       - dependency-type: "all"
     commit-message:

@@ -17,11 +17,11 @@ wrapped at 72 columns, US English.
   was never proposed, and for GHSA-6q48-6c7w-9gw2 it raised no alert
   either, though its dependency graph listed certifi 2026.7.22 from
   uv.lock. CI's OSV scan is what failed. dependabot.yml now allows
-  "all", which for uv adds the dependencies of direct dependencies. On
-  2026-10-26 two locked packages had newer releases: ruff, already
-  covered, and ast-serialize, which pyproject.toml holds, so it fails
-  to resolve when proposed. SECURITY.md now names the OSV scan as the
-  check to rely on.
+  "all", which for uv adds the dependencies of direct dependencies.
+  Its first run on that, the day it landed, checked all 21 locked
+  packages instead of six, proposed ruff 0.17.2, and for ast-serialize,
+  which pyproject.toml holds, reported "No update possible". SECURITY.md
+  now names the OSV scan as the check to rely on.
 - CI's setup-uv moves from 10.3.0 to 10.3.2, pinned to 07a047e6, the
   commit upstream's v10.3.2 tag points at. 10.3.1 keeps cache error
   class names in the save-cache bundle and 10.3.2 adds known checksums
