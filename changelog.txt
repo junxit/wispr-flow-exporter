@@ -8,6 +8,26 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.6.3
+-----
+- certifi, the CA bundle httpx verifies every cloud and MCP connection
+  against, moves from 2026.7.22 to 2026.10.23, the fix for
+  GHSA-6q48-6c7w-9gw2 (PYSEC-2026-4320, critical). 2026.7.22 still
+  trusted emSign ECC Root CA - G3, and eight eMudhra intermediates
+  under it have compromised private keys: a holder of one can issue a
+  certificate for any host, and an attacker on-path could have read
+  the credentials both remote backends send. The new bundle drops that
+  root and two more, emSign Root CA - C1 and emSign ECC Root CA - C3,
+  and adds none. api.wisprflow.ai, which chains to Amazon Root CA 1,
+  and mcp-auth.wisprflow.com, which chains to Google Trust Services,
+  both still verify against it. The local backend opens no connection
+  and was never exposed. CI's dependency audit caught it on
+  2026-10-25, on a Dependabot pull request, and again on the weekly
+  run: osv-scanner failed on uv.lock while tests, lint and types
+  passed. Dependabot itself raised no alert, and its version updates
+  cover only direct dependencies, so it never proposed the bump. A
+  clone takes the fix with `git pull` and `uv sync`.
+
 0.6.2
 -----
 - Upgrading from 0.6.1 needs no migration, and moves or deletes
