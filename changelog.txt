@@ -10,6 +10,16 @@ wrapped at 72 columns, US English.
 
 0.6.4
 -----
+- Upgrading from 0.6.3 needs no migration, and moves or deletes
+  nothing. Measured on a private scratch copy of a real archive,
+  brought current by 0.6.3 first: the first 0.6.4 sync re-read all six
+  meetings once, as a changed declaration does, and wrote none of
+  them. It rewrote index.json, changing the tool_version and the
+  content_hash of the two meetings archived since Wispr Flow 1.6.1264,
+  whose digest had covered serverRecordingLive, and .sync-state.json,
+  changing the tool_version and the meetings' digest scheme. A render,
+  a second sync and a second render wrote nothing, and verify --deep
+  found the archive consistent.
 - Dependabot proposes updates for every package uv.lock pins, not only
   the six pyproject.toml names. Its version updates covered direct
   dependencies alone -- the job definition on 2026-10-25 reads
