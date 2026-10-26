@@ -8,6 +8,21 @@ now needs the evidence, not the plan -- "two consecutive runs differed in
 exactly one path" is worth more than "improved caching". Prose, hard-
 wrapped at 72 columns, US English.
 
+0.6.4
+-----
+- Dependabot proposes updates for every package uv.lock pins, not only
+  the six pyproject.toml names. Its version updates covered direct
+  dependencies alone -- the job definition on 2026-10-25 reads
+  "dependency-type":"direct" -- so certifi, which only the lock pins,
+  was never proposed, and for GHSA-6q48-6c7w-9gw2 it raised no alert
+  either, though its dependency graph listed certifi 2026.7.22 from
+  uv.lock. CI's OSV scan is what failed. dependabot.yml now allows
+  "all", which for uv adds the dependencies of direct dependencies. On
+  2026-10-26 two locked packages had newer releases: ruff, already
+  covered, and ast-serialize, which pyproject.toml holds, so it fails
+  to resolve when proposed. SECURITY.md now names the OSV scan as the
+  check to rely on.
+
 0.6.3
 -----
 - Upgrading from 0.6.2 needs no migration, and moves or deletes

@@ -406,8 +406,13 @@ build constraints -- by version, not by hash, since uv 0.13.1 checks build
 dependency hashes only as an experimental feature. The lock is
 scanned against the OSV database by CI on every push and pull request, plus
 weekly on a schedule, so a newly published advisory surfaces even when nothing
-changes. Dependabot opens update pull requests weekly, and its alerts and
-security updates are enabled on the repository.
+changes. That scan is the check to rely on. Dependabot's alerts and security
+updates are enabled on the repository, but for GHSA-6q48-6c7w-9gw2, a critical
+advisory against the certifi `uv.lock` pinned, it raised no alert, though its
+dependency graph listed that version; the scan failed the first CI run after
+the advisory was published, and 0.6.3 carried the fix. Dependabot opens update
+pull requests weekly for every package in `uv.lock`, not only those
+`pyproject.toml` names.
 
 CI is pinned the same way: every workflow action to a commit, the uv it
 installs to an exact version, and its runners to a named OS release rather
