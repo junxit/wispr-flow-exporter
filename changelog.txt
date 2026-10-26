@@ -28,6 +28,25 @@ wrapped at 72 columns, US English.
   for uv 0.13.5; CI still installs uv 0.13.1. Dependabot proposed it
   in pull request #8, whose only failure was the certifi advisory
   0.6.3 fixed. zizmor 1.31.1 --offline reports no findings.
+- The declarations describe Wispr Flow 1.6.1264, so a sync on it no
+  longer reports drift; on 0.6.3 every local and cloud sync reported
+  additive drift there. The app applied two migrations dated before
+  the previous pin's latest, so the count moved to 176 and the latest
+  name did not. One adds Meetings.serverRecordingLive, which it calls
+  a "local-only mirror of the server recording lease, written by
+  pull": set from the server's is_recording, reset when a recording
+  stops, and now declared as churn. The other backfills
+  latestRecordingStopSeq and refinePipelineRanThroughStopSeq, which
+  were churn already. Declaring a column churn changes the meetings'
+  digest scheme, so the first sync re-reads every meeting once. All 20
+  cloud endpoints answered as recorded; calendar gained derivedTraits
+  and history_stats weekly_word_limits, archived verbatim like every
+  other field, and on a scratch copy a first cloud sync wrote 5 files
+  and a second none. The MCP server, wispr-meetings 1, matched its
+  pin, and its OAuth metadata matched MAINTENANCE.md's table. Of the
+  67 GET routes in the 1.6.1264 bundle, 26 are declared or were
+  probed; the rest need a record's id, or serve billing, enterprise
+  administration or other people's data.
 
 0.6.3
 -----

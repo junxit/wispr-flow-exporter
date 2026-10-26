@@ -52,7 +52,7 @@ disk, in formats you can still read in ten years.
 | Meeting audio | yes, while the app still has it | no | no |
 | Transcript fidelity | raw turns, speakers, timestamps | — | normalized plaintext only |
 | Stability | app schema, ~20 migrations/month | undocumented, unversioned | versioned, but no stability promise |
-| Confirmed live | yes | yes, on app 1.6.897, 1.6.957 and 1.6.1174 | yes, on `wispr-meetings` 1 |
+| Confirmed live | yes | yes, on app 1.6.897, 1.6.957, 1.6.1174 and 1.6.1264 | yes, on `wispr-meetings` 1 |
 
 The local backend is the primary one and is fully functional on its own. The two
 remote backends are reached only when you ask for them, and each announces
@@ -306,7 +306,7 @@ archive/
 ```
 
 Both backends record the Wispr Flow build that produced the archive
-(`prefs.version`, `1.6.1174` here), because a future reader looking at these
+(`prefs.version`, `1.6.1264` here), because a future reader looking at these
 files otherwise has no way to tell which client wrote them.
 
 Frontmatter is Obsidian-friendly: `aliases` so `[[` autocomplete finds a meeting
@@ -562,8 +562,9 @@ Wispr Flow's own data, so uninstalling it leaves the app exactly as it was.
   the cloud backend remains.
 - `SequelizeMeta` lists every applied migration, so it is a usable schema pin —
   as a whole set. Names are dated but not applied in date order (1.6.957
-  and 1.6.1174 each shipped three dated before the previous pin's latest), so
-  the pin digests every name rather than trusting the count or the latest one.
+  and 1.6.1174 each shipped three dated before the previous pin's latest, and
+  1.6.1264 two that left it unchanged), so the pin digests every name rather
+  than trusting the count or the latest one.
 - The archive lives on a filesystem that supports POSIX modes; `0600` is a
   documented guarantee.
 

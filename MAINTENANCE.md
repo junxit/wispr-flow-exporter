@@ -14,7 +14,8 @@ the price of reaching data that is otherwise unreachable.** Read it when
 something stops working, or after Wispr Flow updates.
 
 Everything below was measured against **app 1.6.897** on macOS, and every
-endpoint status was measured again on **1.6.957** and **1.6.1174**, unchanged.
+endpoint status was measured again on **1.6.957**, **1.6.1174** and
+**1.6.1264**, unchanged.
 Nothing in it is inferred from documentation, because there is none.
 
 ---
@@ -350,7 +351,7 @@ make a change pass, stop.
 
 ---
 
-## Measured endpoint table (app 1.6.897, unchanged on 1.6.957 and 1.6.1174)
+## Measured endpoint table (app 1.6.897, unchanged on 1.6.957, 1.6.1174 and 1.6.1264)
 
 Archived. Every status observed against the live service.
 

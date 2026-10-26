@@ -18,8 +18,8 @@ exceptional, so a design that had to be updated before it could read a new
 column would be permanently out of date, and an archive that stopped when it
 fell behind would be useless on the one day it was needed.
 
-Column lists were read from a live installation of Wispr Flow v1.6.1174 at
-migration 174.
+Column lists were read from a live installation of Wispr Flow v1.6.1264 at
+migration 176.
 """
 
 from __future__ import annotations
@@ -84,8 +84,8 @@ class SchemaPin:
         latest: Lexicographically greatest migration name. A label, not a
             version: names are date-prefixed but do not arrive in date order
             -- 1.6.957 shipped three dated before the previous pin's latest,
-            and 1.6.1174 three more -- which is why neither this nor the count
-            is trusted alone.
+            1.6.1174 three more, and 1.6.1264 two that left it unchanged --
+            which is why neither this nor the count is trusted alone.
         sha256: Digest over every migration name, sorted and newline-joined.
             This catches the case the other two miss -- a migration replaced
             without changing either the count or the maximum.
@@ -115,9 +115,9 @@ def pin_from_migrations(names: Iterable[str]) -> SchemaPin:
 # Read from a live installation. A mismatch is not an error -- see the drift
 # classification in sqlite_source -- but it is always reported.
 MIGRATION_PIN = SchemaPin(
-    count=174,
+    count=176,
     latest="20261014120000-add-calendar-event-series-key.js",
-    sha256="2a7b82e867d701611a84a818bfb6b11bf4feb045f77907270963b82efa517f20",
+    sha256="d5f858c58327dca13dde42973be7e3cfa075b15fc36872dd4be49fca3fcc61a9",
 )
 
 
@@ -360,6 +360,10 @@ EXPECTED: Mapping[str, TableSpec] = {
             "speakerMapDraftTranscriptAt", "documentDraftTranscriptAt",
             "identityContacts", "orgInsights", "orgInsightsPendingPush",
             "speakerAssignmentEdits", "speakerRoomLabelEdits",
+            # From the two Meetings migrations between 1.6.1174 and 1.6.1264.
+            # The other backfills latestRecordingStopSeq and
+            # refinePipelineRanThroughStopSeq, both churn, and adds no column.
+            "serverRecordingLive",
         ),
         # Every column a meeting's documents are built from. Losing one does not
         # make a renderer raise -- they are defensive -- it makes them render
@@ -381,6 +385,12 @@ EXPECTED: Mapping[str, TableSpec] = {
             "uploadDeferred",
             "latestRecordingStopSeq",
             "refinePipelineRanThroughStopSeq",
+            # The server's recording lease, which 1.6.1264's migration calls a
+            # "local-only mirror ... written by pull": set from is_recording
+            # on every pull, and reset to false when a recording stops here.
+            # Whether a meeting is being recorded right now, not a fact about
+            # the meeting.
+            "serverRecordingLive",
             "audioUploadedAt",
             "submitAcceptedAt",
             "speakerArtifactUploadedAt",

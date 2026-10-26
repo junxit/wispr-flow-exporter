@@ -92,8 +92,8 @@ class Endpoint:
 # are incompatible, and the zero-bytes invariant already makes a full re-fetch
 # free on disk. The parameter names are recorded so the choice stays visible.
 # Every status below was measured against the live service -- on app 1.6.897,
-# and again on 1.6.957 and 1.6.1174, where each answered as declared -- not
-# inferred from the bundle. MAINTENANCE.md has the procedure for re-measuring.
+# and again on 1.6.957, 1.6.1174 and 1.6.1264, where each answered as declared
+# -- not inferred from the bundle. MAINTENANCE.md has the procedure for re-measuring.
 ENDPOINTS: Mapping[str, Endpoint] = {
     "user_profile": Endpoint("/api/v1/user/profile"),
     "user_preferences": Endpoint("/api/v1/user/preferences"),
