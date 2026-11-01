@@ -24,17 +24,17 @@ wispr-export = "wispr_flow_exporter.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest==9.1.1",
+    "pytest==9.2.0",
     # Dev-only. The runtime dependency set stays at two: a local-only run still
     # loads nothing but the standard library.
-    "ruff==0.17.2",
-    "mypy==2.4.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
 ]
 
 [build-system]
 # `uv sync` builds the project with this, so unpinned, every install was built
 # with whichever hatchling was newest that day.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.uv]
